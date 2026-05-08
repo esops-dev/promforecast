@@ -65,8 +65,10 @@ jobs:
 
       - name: Install Trivy
         run: |
+          mkdir -p "$HOME/.local/bin"
           curl -sSfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
-            | sh -s -- -b /usr/local/bin
+            | sh -s -- -b "$HOME/.local/bin"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Trivy scan (release)
         run: |
@@ -78,8 +80,8 @@ jobs:
             --exit-code 0 \
             ghcr.io/${{ github.repository }}@${{ steps.build.outputs.digest }}
 
-      - uses: github/codeql-action/upload-sarif@v3
-        if: always()
+      - uses: github/codeql-action/upload-sarif@v4
+        if: always() && hashFiles('trivy-release.sarif') != ''
         with:
           sarif_file: trivy-release.sarif
 

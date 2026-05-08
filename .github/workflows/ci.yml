@@ -115,8 +115,10 @@ jobs:
 
       - name: Install Trivy
         run: |
+          mkdir -p "$HOME/.local/bin"
           curl -sSfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
-            | sh -s -- -b /usr/local/bin
+            | sh -s -- -b "$HOME/.local/bin"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Trivy scan
         # exit-code 0: report findings via SARIF, do not fail the PR on CVEs
@@ -130,7 +132,7 @@ jobs:
             --exit-code 0 \
             promforecast:ci
 
-      - uses: github/codeql-action/upload-sarif@v3
-        if: always()
+      - uses: github/codeql-action/upload-sarif@v4
+        if: always() && hashFiles('trivy-results.sarif') != ''
         with:
           sarif_file: trivy-results.sarif
