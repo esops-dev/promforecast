@@ -1,0 +1,39 @@
+# Umbrella values for promforecast-stack.
+# Toggles each subchart. Override subchart values under their respective keys.
+
+victoria-metrics-single:
+  enabled: true
+  server:
+    # IMPORTANT: forecasts are written with future timestamps. Without this
+    # flag VictoriaMetrics will silently drop them. Tune higher than your
+    # longest configured forecast horizon.
+    extraArgs:
+      futureRetention: "24h"
+    persistentVolume:
+      enabled: true
+      size: 20Gi
+    retentionPeriod: "12"   # months
+    resources:
+      requests:
+        cpu: 200m
+        memory: 512Mi
+
+promforecast:
+  enabled: true
+  config:
+    datasource:
+      url: http://promforecast-stack-victoria-metrics-single-server:8428/
+      timeout: 30s
+      auth:
+        type: none
+
+# Bundled dashboards / alerts toggles. Off by default; enable explicitly so
+# users on shops with their own asset pipelines aren't surprised.
+dashboards:
+  enabled: false
+  labels:
+    grafana_dashboard: "1"
+
+prometheusRules:
+  enabled: false
+  labels: {}

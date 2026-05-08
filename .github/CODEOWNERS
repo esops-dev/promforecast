@@ -1,0 +1,25 @@
+# Code owners for promforecast.
+#
+# Last matching pattern wins. The catch-all assigns review on every PR;
+# specific patterns scope review for sensitive areas.
+#
+# https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+
+*                                  @dj-wasabi
+
+# Build, release, and supply-chain plumbing — review every change.
+/.github/                          @dj-wasabi
+/Makefile                          @dj-wasabi
+/forecaster/Dockerfile             @dj-wasabi
+/forecaster/pyproject.toml         @dj-wasabi
+
+# Output metric names are part of the public API.
+/forecaster/src/promforecast/exporter.py  @dj-wasabi
+
+# Security-sensitive surfaces.
+/forecaster/src/promforecast/leader.py    @dj-wasabi
+/forecaster/src/promforecast/source.py    @dj-wasabi
+/SECURITY.md                              @dj-wasabi
+
+# Helm charts ship to end users — schema changes are breaking.
+/charts/                           @dj-wasabi

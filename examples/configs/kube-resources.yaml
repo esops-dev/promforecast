@@ -1,0 +1,27 @@
+# Forecast Kubernetes resource usage from kube-state-metrics and kubelet.
+
+datasource:
+  url: http://victoriametrics:8428/
+
+defaults:
+  lookback: 14d
+  step: 5m
+  horizon: 24h
+  models: [AutoARIMA, SeasonalNaive]
+  season_length: 288
+
+groups:
+  - name: kube_resources
+    priority: 5
+    queries:
+      - id: pod_cpu_usage_cores
+        promql: |
+          sum by (namespace) (rate(container_cpu_usage_seconds_total{container!="",pod!=""}[5m]))
+
+      - id: pod_memory_working_set_bytes
+        promql: |
+          sum by (namespace) (container_memory_working_set_bytes{container!="",pod!=""})
+
+      - id: persistentvolumeclaim_used_bytes
+        promql: |
+          sum by (namespace, persistentvolumeclaim) (kubelet_volume_stats_used_bytes)

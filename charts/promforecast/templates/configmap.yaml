@@ -1,0 +1,10 @@
+{{- if not .Values.existingConfigMap }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "promforecast.fullname" . }}
+  labels: {{- include "promforecast.labels" . | nindent 4 }}
+data:
+  config.yaml: |
+    {{- toYaml .Values.config | nindent 4 }}
+{{- end }}

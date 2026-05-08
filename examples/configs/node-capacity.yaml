@@ -1,0 +1,40 @@
+# Forecast node CPU and filesystem usage from cluster-level node-exporter
+# metrics. Drop into the forecaster's config — adjust the datasource URL
+# and any label matchers to suit your environment.
+
+datasource:
+  url: http://victoriametrics:8428/
+  timeout: 30s
+  auth:
+    type: none
+
+server:
+  listen: ":9091"
+  refresh_interval: 1h
+
+defaults:
+  lookback: 14d
+  step: 5m
+  horizon: 24h
+  models: [AutoARIMA, SeasonalNaive]
+  season_length: 288
+  confidence_levels: [80, 95]
+  evaluate: true
+  emit_deviation: true
+  emit_quality: true
+
+groups:
+  - name: node_capacity
+    priority: 10
+    queries:
+      - id: node_cpu_busy_pct
+        promql: |
+          100 - (avg by (instance) (rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100)
+
+      - id: node_filesystem_avail_bytes
+        promql: |
+          node_filesystem_avail_bytes{fstype!~"tmpfs|overlay|squashfs"}
+
+      - id: node_memory_used_bytes
+        promql: |
+          node_memory_MemTotal_bytes - node_memory_MemAvailable_bytes

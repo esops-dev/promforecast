@@ -1,0 +1,66 @@
+name: Bug report
+description: Something is broken or behaving unexpectedly.
+labels: [bug, triage]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug report. Please include
+        enough context that we can reproduce the issue without going back
+        and forth.
+
+  - type: input
+    id: release
+    attributes:
+      label: promforecast release
+      description: Output of the forecaster's `--version` flag, or the chart appVersion.
+      placeholder: e.g. 0.1.0
+    validations:
+      required: true
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      options:
+        - Forecaster (Python)
+        - Helm chart (promforecast)
+        - Helm chart (promforecast-stack)
+        - Dashboards
+        - Example PrometheusRules
+        - Documentation
+        - Build / CI
+    validations:
+      required: true
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: Describe the actual behaviour, with logs / metrics output if relevant.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect to happen?
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: A minimal config snippet plus the commands you ran is ideal.
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Kubernetes version, TSDB and version, Python version (if running outside the container).
+    validations:
+      required: false

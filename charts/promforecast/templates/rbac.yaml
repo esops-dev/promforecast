@@ -1,0 +1,25 @@
+{{- if and .Values.rbac.create .Values.highAvailability.enabled }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "promforecast.fullname" . }}
+  labels: {{- include "promforecast.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "promforecast.fullname" . }}
+  labels: {{- include "promforecast.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "promforecast.fullname" . }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "promforecast.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}

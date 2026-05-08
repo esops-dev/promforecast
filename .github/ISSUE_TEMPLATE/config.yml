@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Question / discussion
+    url: https://github.com/esops-dev/promforecast/discussions
+    about: Ask questions and discuss design in GitHub Discussions.
+  - name: Security report
+    url: https://github.com/esops-dev/promforecast/security/advisories/new
+    about: Report a vulnerability privately. Do not open a public issue.
