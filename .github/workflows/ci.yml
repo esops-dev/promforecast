@@ -1,0 +1,134 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Lint (ruff + mypy)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: forecaster
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v3
+        with:
+          python-version: "3.12"
+          enable-cache: true
+          cache-dependency-glob: "forecaster/pyproject.toml"
+
+      - run: uv sync --all-extras
+
+      - name: ruff check
+        run: uv run ruff check .
+
+      - name: ruff format --check
+        run: uv run ruff format --check .
+
+      - name: mypy --strict
+        run: uv run mypy --strict src
+
+  test:
+    name: Test (pytest)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: forecaster
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v3
+        with:
+          python-version: "3.12"
+          enable-cache: true
+          cache-dependency-glob: "forecaster/pyproject.toml"
+
+      - run: uv sync --all-extras
+      - run: uv run pytest --cov=promforecast --cov-report=xml
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage
+          path: forecaster/coverage.xml
+          if-no-files-found: ignore
+
+  chart-lint:
+    name: Lint Helm charts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: latest
+
+      - name: helm dependency update
+        run: |
+          helm dependency update charts/promforecast
+          helm dependency update charts/promforecast-stack
+
+      - name: helm lint
+        run: |
+          helm lint charts/promforecast
+          helm lint charts/promforecast-stack
+
+      - name: Install kubeconform
+        run: |
+          curl -sSLo kubeconform.tar.gz \
+            https://github.com/yannh/kubeconform/releases/latest/download/kubeconform-linux-amd64.tar.gz
+          tar xf kubeconform.tar.gz
+          sudo install kubeconform /usr/local/bin/
+
+      - name: kubeconform
+        run: |
+          helm template charts/promforecast       | kubeconform -strict -summary -ignore-missing-schemas
+          helm template charts/promforecast-stack | kubeconform -strict -summary -ignore-missing-schemas
+
+  container:
+    name: Build container image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: forecaster
+          push: false
+          load: true
+          tags: promforecast:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Install Trivy
+        run: |
+          mkdir -p "$HOME/.local/bin"
+          curl -sSfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
+            | sh -s -- -b "$HOME/.local/bin"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Trivy scan
+        # exit-code 0: report findings to the job log, do not fail the PR on
+        # CVEs in upstream base images. Tighten once we control the image
+        # surface. SARIF upload to Code Scanning is intentionally not wired
+        # up — it requires GitHub Advanced Security on private repos.
+        run: |
+          trivy image \
+            --format table \
+            --severity HIGH,CRITICAL \
+            --ignore-unfixed \
+            --exit-code 0 \
+            promforecast:ci

@@ -1,0 +1,33 @@
+# Forecast user-facing KPIs (request rate, error budget, latency).
+# Replace the metric names and labels with whatever your services expose.
+
+datasource:
+  url: http://victoriametrics:8428/
+
+defaults:
+  lookback: 28d
+  step: 5m
+  horizon: 24h
+  models: [AutoARIMA, AutoETS, SeasonalNaive]
+  season_length: 288
+  auto_select: true
+  fallback_model: SeasonalNaive
+  fallback_mape_threshold: 30
+
+groups:
+  - name: business_kpis
+    priority: 1
+    queries:
+      - id: http_requests_per_second
+        promql: |
+          sum by (service) (rate(http_requests_total[5m]))
+
+      - id: http_5xx_per_second
+        promql: |
+          sum by (service) (rate(http_requests_total{status=~"5.."}[5m]))
+
+      - id: http_request_p95_seconds
+        promql: |
+          histogram_quantile(0.95,
+            sum by (service, le) (rate(http_request_duration_seconds_bucket[5m]))
+          )

@@ -1,0 +1,95 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "promforecast.fullname" . }}
+  labels: {{- include "promforecast.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  strategy:
+    {{- toYaml .Values.strategy | nindent 4 }}
+  selector:
+    matchLabels: {{- include "promforecast.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "promforecast.selectorLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}{{- toYaml . | nindent 8 }}{{- end }}
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- with .Values.podAnnotations }}{{- toYaml . | nindent 8 }}{{- end }}
+    spec:
+      serviceAccountName: {{ include "promforecast.serviceAccountName" . }}
+      securityContext: {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      {{- with .Values.image.pullSecrets }}
+      imagePullSecrets: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: forecaster
+          image: {{ include "promforecast.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - --config=/etc/promforecast/config.yaml
+          ports:
+            - name: http
+              containerPort: 9091
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 30
+          resources: {{- toYaml .Values.resources | nindent 12 }}
+          securityContext: {{- toYaml .Values.securityContext | nindent 12 }}
+          env:
+            {{- if .Values.highAvailability.enabled }}
+            - name: PROMFORECAST_HA_ENABLED
+              value: "true"
+            - name: PROMFORECAST_POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: PROMFORECAST_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: PROMFORECAST_REDIS_ADDRESS
+              value: {{ .Values.highAvailability.redis.address | quote }}
+            {{- if .Values.highAvailability.redis.existingSecret }}
+            - name: PROMFORECAST_REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.highAvailability.redis.existingSecret }}
+                  key: {{ .Values.highAvailability.redis.secretKey }}
+            {{- end }}
+            {{- end }}
+            {{- with .Values.extraEnv }}{{- toYaml . | nindent 12 }}{{- end }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/promforecast
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+            {{- with .Values.extraVolumeMounts }}{{- toYaml . | nindent 12 }}{{- end }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "promforecast.configMapName" . }}
+        - name: tmp
+          emptyDir: {}
+        {{- with .Values.extraVolumes }}{{- toYaml . | nindent 8 }}{{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity: {{- toYaml . | nindent 8 }}
+      {{- end }}

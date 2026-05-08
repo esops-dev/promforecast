@@ -1,0 +1,80 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: promforecast-rules
+  labels:
+    role: alert-rules
+    app.kubernetes.io/part-of: promforecast
+spec:
+  groups:
+    - name: promforecast.operational
+      interval: 1m
+      rules:
+        - alert: ForecastStale
+          expr: time() - forecast_last_run_timestamp_seconds > 7200
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "promforecast hasn't refreshed group {{ $labels.group }} in over 2h"
+            description: |
+              The forecaster has not produced a successful run for group
+              {{ $labels.group }} in over 2 hours. Check pod logs and
+              datasource availability.
+
+        - alert: ForecastModelDegraded
+          expr: forecast_accuracy_mape > 30
+          for: 24h
+          labels:
+            severity: warning
+          annotations:
+            summary: "Forecast accuracy degraded for {{ $labels.id }} (MAPE > 30%)"
+            description: |
+              Backtest MAPE for {{ $labels.id }} model {{ $labels.model }}
+              has exceeded 30% for 24h. Consider retraining, switching
+              models, or extending the lookback window.
+
+        - alert: ForecastFallbackPersistent
+          expr: count by (group) (forecast_quality_score{model_fallback="true"}) > 0
+          for: 6h
+          labels:
+            severity: info
+          annotations:
+            summary: "Auto-select keeps falling back for group {{ $labels.group }}"
+            description: |
+              At least one series in {{ $labels.group }} has been falling
+              back to the configured fallback model for 6h. The configured
+              models are likely a poor fit for this data.
+
+    - name: promforecast.deviation
+      interval: 1m
+      rules:
+        - alert: ForecastDeviation
+          # Gated on quality so poor forecasts don't fire false positives.
+          expr: forecast_deviation_outside_band == 1 and on (id, group) forecast_quality_score > 0.6
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Actual {{ $labels.id }} is outside its forecast band"
+            description: |
+              {{ $labels.id }} (group {{ $labels.group }}) has been outside
+              its forecast confidence band for 15m. Quality score for this
+              series is above 0.6, so the deviation is likely meaningful.
+
+    - name: promforecast.capacity.examples
+      interval: 5m
+      rules:
+        # Replace the metric and threshold with your own; this is a
+        # template — do not deploy as-is without tuning.
+        - alert: NodeFilesystemForecastedFull
+          expr: node_filesystem_avail_bytes_forecast{horizon="24h"} < 0
+          for: 30m
+          labels:
+            severity: warning
+          annotations:
+            summary: "{{ $labels.instance }}:{{ $labels.mountpoint }} forecast to fill within 24h"
+            description: |
+              The 24h forecast for free space on {{ $labels.instance }}
+              ({{ $labels.mountpoint }}) is below zero. Provision capacity
+              or clean up.

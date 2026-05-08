@@ -1,0 +1,121 @@
+# Default values for promforecast.
+# Single-replica by default. Multi-replica HA mode requires
+# `highAvailability.enabled: true` and a Redis backend.
+
+image:
+  repository: ghcr.io/esops-dev/promforecast
+  tag: ""           # defaults to the chart appVersion
+  pullPolicy: IfNotPresent
+  pullSecrets: []
+
+# Single replica is intentional — the in-process scheduler is per-process.
+# Set highAvailability.enabled to opt into leader election + Redis cache.
+replicaCount: 1
+strategy:
+  type: Recreate
+
+highAvailability:
+  enabled: false
+  redis:
+    address: ""     # e.g. redis-master.redis.svc:6379
+    existingSecret: ""
+    secretKey: password
+
+# Forecaster YAML config. Either inline below, or set existingConfigMap.
+existingConfigMap: ""
+config:
+  datasource:
+    url: http://victoria-metrics-single-server:8428/
+    timeout: 30s
+    auth:
+      type: none
+
+  server:
+    listen: ":9091"
+    refresh_interval: 1h
+    reload:
+      enabled: true
+      watch_configmap: true
+
+  safety:
+    max_series_per_query: 500
+    max_total_series: 5000
+    series_overflow: drop_lowest_priority
+    fit_timeout: 60s
+    query_timeout: 30s
+
+  defaults:
+    lookback: 14d
+    step: 5m
+    horizon: 24h
+    models: [AutoARIMA, SeasonalNaive]
+    season_length: 288
+    confidence_levels: [80, 95]
+    min_points: 200
+    evaluate: true
+    auto_select: false
+    fallback_model: SeasonalNaive
+    fallback_mape_threshold: 50
+    emit_deviation: true
+    emit_quality: true
+
+  groups: []
+
+service:
+  type: ClusterIP
+  port: 9091
+  annotations: {}
+
+serviceMonitor:
+  enabled: false
+  namespace: ""
+  interval: 60s
+  scrapeTimeout: 30s
+  labels: {}
+  relabelings: []
+  metricRelabelings: []
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    cpu: "2"
+    memory: 1Gi
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: [ALL]
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+rbac:
+  # Required when highAvailability.enabled is true (Lease API).
+  create: true
+
+networkPolicy:
+  enabled: false
+  egress: []
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+podAnnotations: {}
+podLabels: {}
+
+extraEnv: []
+extraVolumes: []
+extraVolumeMounts: []
