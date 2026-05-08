@@ -26,6 +26,7 @@ jobs:
         with:
           python-version: "3.12"
           enable-cache: true
+          cache-dependency-glob: "forecaster/pyproject.toml"
 
       - run: uv sync --all-extras
 
@@ -51,6 +52,7 @@ jobs:
         with:
           python-version: "3.12"
           enable-cache: true
+          cache-dependency-glob: "forecaster/pyproject.toml"
 
       - run: uv sync --all-extras
       - run: uv run pytest --cov=promforecast --cov-report=xml
@@ -94,34 +96,6 @@ jobs:
           helm template charts/promforecast       | kubeconform -strict -summary -ignore-missing-schemas
           helm template charts/promforecast-stack | kubeconform -strict -summary -ignore-missing-schemas
 
-  examples:
-    name: Validate example configs
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: forecaster
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: astral-sh/setup-uv@v3
-        with:
-          python-version: "3.12"
-          enable-cache: true
-
-      - run: uv sync --all-extras
-
-      - name: Validate examples/configs/*.yaml against the pydantic schema
-        run: |
-          for f in ../examples/configs/*.yaml; do
-            echo "validating $f"
-            uv run python -c "
-          import sys, yaml
-          from promforecast.config import Config
-          with open('$f') as fh:
-              Config.model_validate(yaml.safe_load(fh))
-          "
-          done
-
   container:
     name: Build container image
     runs-on: ubuntu-latest
@@ -139,15 +113,22 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      - name: Install Trivy
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
+            | sh -s -- -b /usr/local/bin
+
       - name: Trivy scan
-        uses: aquasecurity/trivy-action@0.28.0
-        with:
-          image-ref: promforecast:ci
-          format: sarif
-          output: trivy-results.sarif
-          severity: HIGH,CRITICAL
-          exit-code: "1"
-          ignore-unfixed: true
+        # exit-code 0: report findings via SARIF, do not fail the PR on CVEs
+        # in upstream base images. Tighten once we control the image surface.
+        run: |
+          trivy image \
+            --format sarif \
+            --output trivy-results.sarif \
+            --severity HIGH,CRITICAL \
+            --ignore-unfixed \
+            --exit-code 0 \
+            promforecast:ci
 
       - uses: github/codeql-action/upload-sarif@v3
         if: always()

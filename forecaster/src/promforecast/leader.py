@@ -23,3 +23,4 @@ async def lead(
     On loss of the lease the context exits and the caller stops scheduling.
     """
     raise NotImplementedError
+    yield  # unreachable; marks this as an async generator for type checkers

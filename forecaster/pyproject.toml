@@ -44,6 +44,7 @@ dev = [
     "ruff>=0.8",
     "mypy>=1.13",
     "types-pyyaml>=6.0",
+    "pandas-stubs>=2.2",
 ]
 
 [project.scripts]

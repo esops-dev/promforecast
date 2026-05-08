@@ -30,9 +30,7 @@ def validate_metric_name(name: str) -> None:
             f"metric name {name!r} contains a colon; colons are reserved for recording rules"
         )
     if not _METRIC_NAME_RE.match(name):
-        raise InvalidMetricNameError(
-            f"metric name {name!r} does not match Prometheus naming regex"
-        )
+        raise InvalidMetricNameError(f"metric name {name!r} does not match Prometheus naming regex")
 
 
 class Exporter:
