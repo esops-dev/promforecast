@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1.7
 
 # ---------- Builder ----------
-FROM python:3.14-slim AS builder
+FROM python:3.13-slim AS builder
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -11,12 +11,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /build
 
 RUN apt-get update \
- && apt-get install -y --no-install-recommends \
-        build-essential \
-        gfortran \
-        libopenblas-dev \
-        liblapack-dev \
-        pkg-config \
+ && apt-get install -y --no-install-recommends build-essential \
  && rm -rf /var/lib/apt/lists/*
 
 COPY pyproject.toml ./
@@ -26,7 +21,7 @@ RUN pip install --upgrade pip build \
  && pip wheel --wheel-dir /wheels .
 
 # ---------- Runtime ----------
-FROM python:3.14-slim AS runtime
+FROM python:3.13-slim AS runtime
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1

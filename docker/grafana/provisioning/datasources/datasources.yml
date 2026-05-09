@@ -6,7 +6,6 @@ datasources:
     access: proxy
     uid: victoriametrics
     url: http://victoriametrics:8428
-    isDefault: true
     editable: true
     jsonData:
       httpMethod: POST
@@ -17,6 +16,7 @@ datasources:
     access: proxy
     uid: prometheus
     url: http://prometheus:9090
+    isDefault: true
     editable: true
     jsonData:
       httpMethod: POST
