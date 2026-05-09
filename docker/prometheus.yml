@@ -2,8 +2,8 @@
 #
 # Scrapes node-exporter and the forecaster, then remote_writes everything
 # into VictoriaMetrics so the forecaster has a long-term TSDB to query.
-# Production Prometheus is never the forecaster's read source — see
-# design principle #1 in CLAUDE.md.
+# Production Prometheus is never the forecaster's read source — all
+# forecaster reads go through the long-term TSDB instead.
 
 global:
   scrape_interval: 15s

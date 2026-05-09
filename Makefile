@@ -65,7 +65,7 @@ chart-lint: chart-deps ## helm lint + kubeconform on rendered manifests.
 	helm template $(CHART_DIR)/promforecast-stack | kubeconform -strict -summary -ignore-missing-schemas
 
 # values.schema.json is hand-authored alongside values.yaml so it can express
-# constraints (enums, ranges, the v0.1 single-replica cap) that a generator
+# constraints (enums, ranges, the current single-replica cap) that a generator
 # can't infer from a sample. Keep them in sync manually when adding fields.
 
 # ---------- Local dev ----------

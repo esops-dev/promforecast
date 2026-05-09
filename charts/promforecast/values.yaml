@@ -53,6 +53,7 @@ config:
     confidence_levels: [80, 95]
     min_points: 200
     evaluate: true
+    accuracy_horizons: [1h, 6h, 24h]
     auto_select: false
     fallback_model: SeasonalNaive
     fallback_mape_threshold: 50

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from promforecast.exporter import Exporter, ForecastPoint, GroupSnapshot
+import math
+
+from promforecast.exporter import AccuracyPoint, Exporter, ForecastPoint, GroupSnapshot
 
 
 def test_render_empty_is_well_formed() -> None:
@@ -60,6 +62,64 @@ def test_render_increments_failures() -> None:
     assert "# TYPE forecast_failures_total counter" in body
     assert 'forecast_failures_total{group="g",reason="query_error"} 2.0' in body
     assert 'forecast_failures_total{group="g",reason="fit_error"} 1.0' in body
+
+
+def test_render_emits_accuracy_metrics_per_horizon() -> None:
+    exporter = Exporter()
+    exporter.update(
+        GroupSnapshot(
+            group="g",
+            accuracy_points=[
+                AccuracyPoint(
+                    labels={
+                        "id": "m",
+                        "group": "g",
+                        "model": "AutoARIMA",
+                        "horizon": "1h",
+                        "instance": "host-a",
+                    },
+                    mape=12.0,
+                    mase=0.8,
+                ),
+                AccuracyPoint(
+                    labels={
+                        "id": "m",
+                        "group": "g",
+                        "model": "AutoARIMA",
+                        "horizon": "24h",
+                        "instance": "host-a",
+                    },
+                    mape=25.0,
+                    mase=1.2,
+                ),
+            ],
+        )
+    )
+    body = exporter.render().decode()
+    assert "# TYPE forecast_accuracy_mape gauge" in body
+    assert "# TYPE forecast_accuracy_mase gauge" in body
+    assert 'horizon="1h"' in body and 'horizon="24h"' in body
+    assert "12.0" in body and "25.0" in body
+
+
+def test_render_drops_nan_accuracy_values() -> None:
+    exporter = Exporter()
+    exporter.update(
+        GroupSnapshot(
+            group="g",
+            accuracy_points=[
+                AccuracyPoint(
+                    labels={"id": "m", "group": "g", "model": "X", "horizon": "1h"},
+                    mape=math.nan,
+                    mase=math.nan,
+                ),
+            ],
+        )
+    )
+    body = exporter.render().decode()
+    # Family is declared but no samples are emitted for the NaN row.
+    assert "forecast_accuracy_mape{" not in body
+    assert "forecast_accuracy_mase{" not in body
 
 
 def test_render_escapes_label_values() -> None:

@@ -8,7 +8,7 @@ snapshot update.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
 import pytest
@@ -133,13 +133,14 @@ async def test_run_group_full_snapshot_with_canned_fit(monkeypatch: pytest.Monke
     runner = Runner(config=cfg, source=source, exporter=exporter)
 
     async def _canned(self, query, frame, group_name):  # type: ignore[no-untyped-def]
-        return [
+        points = [
             ForecastPoint(
                 metric="m_forecast",
                 labels={**frame.labels, "group": group_name, "model": "Fake"},
                 value=42.0,
             )
         ]
+        return points, []
 
     monkeypatch.setattr(Runner, "_fit_series", _canned)
     await runner.run_group(cfg.groups[0])
@@ -148,6 +149,188 @@ async def test_run_group_full_snapshot_with_canned_fit(monkeypatch: pytest.Monke
     assert "m_forecast{" in body
     assert 'instance="host-a"' in body
     assert 'forecast_series_count{group="g"} 1.0' in body
+
+
+class _FakeModel:
+    """ForecastModel that emits a constant ``yhat``. Used in tests instead of
+    statsforecast — keeps the runner tests isolated from heavy fit deps."""
+
+    def __init__(self, name: str, value: float, season_length: int = 288) -> None:
+        self.name = name
+        self._value = value
+
+    def fit_predict(
+        self,
+        df,  # type: ignore[no-untyped-def]
+        horizon: int,
+        freq: str,
+        levels: list[int],
+        regressors=None,  # type: ignore[no-untyped-def]
+    ):  # type: ignore[no-untyped-def]
+        import pandas as pd  # noqa: PLC0415
+
+        idx = pd.date_range(df["ds"].iloc[-1], periods=horizon + 1, freq=freq)[1:]
+        out = pd.DataFrame(
+            {
+                "unique_id": ["s"] * horizon,
+                "ds": idx,
+                "yhat": [self._value] * horizon,
+            }
+        )
+        for level in levels:
+            out[f"yhat_lower_{level}"] = self._value - 1.0
+            out[f"yhat_upper_{level}"] = self._value + 1.0
+        return out
+
+
+def _ramp_frame(n: int) -> SeriesFrame:
+    from datetime import timedelta as _td  # noqa: PLC0415
+
+    start = datetime(2024, 1, 1, tzinfo=UTC)
+    timestamps = [start + _td(minutes=5 * i) for i in range(n)]
+    values = [float(i) for i in range(n)]
+    return SeriesFrame(labels={"instance": "host-a"}, timestamps=timestamps, values=values)
+
+
+@pytest.mark.asyncio
+async def test_run_group_auto_select_emits_winner_with_best_model_label(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from promforecast import models as model_registry  # noqa: PLC0415
+
+    cfg = Config(
+        datasource=DatasourceConfig(url="http://x"),
+        server=ServerConfig(),
+        safety=SafetyConfig(),
+        defaults=DefaultsConfig(
+            min_points=10,
+            models=["AutoARIMA", "SeasonalNaive"],
+            confidence_levels=[80],
+            auto_select=True,
+            evaluate=True,
+            fallback_mape_threshold=None,
+        ),
+        groups=[GroupConfig(name="g", queries=[QueryConfig(id="m", promql="up")])],
+    )
+
+    # AutoARIMA tracks the actuals exactly → MAPE near 0; SeasonalNaive
+    # predicts 0 → much higher MAPE. Auto-select must pick AutoARIMA.
+    def _fake_build(name: str, season_length: int) -> _FakeModel:
+        if name == "AutoARIMA":
+            return _FakeModel("AutoARIMA", value=50.0)
+        if name == "SeasonalNaive":
+            return _FakeModel("SeasonalNaive", value=0.0)
+        raise AssertionError(name)
+
+    monkeypatch.setattr(model_registry, "build", _fake_build)
+
+    # Series of [0..59], hold-out is last 288 (24h) — but len < 288, so we
+    # use a short accuracy_horizon to make backtest viable.
+    cfg.defaults.accuracy_horizons = [timedelta(minutes=10)]
+    source = _FakeSource({"up": [_ramp_frame(60)]})
+    exporter = Exporter()
+    runner = Runner(config=cfg, source=source, exporter=exporter)
+
+    await runner.run_group(cfg.groups[0])
+
+    body = exporter.render().decode()
+    # Only one model's forecast should appear.
+    assert body.count("m_forecast{") == 1
+    assert 'best_model="AutoARIMA"' in body
+    assert 'model="AutoARIMA"' in body
+    assert 'model_fallback="false"' in body
+    # Backtest also produced accuracy metrics for both models.
+    assert "forecast_accuracy_mape" in body
+    assert 'model="SeasonalNaive"' in body  # in accuracy metrics
+    assert 'horizon="10m"' in body
+
+
+@pytest.mark.asyncio
+async def test_run_group_auto_select_falls_back_when_winner_exceeds_threshold(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from promforecast import models as model_registry  # noqa: PLC0415
+
+    cfg = Config(
+        datasource=DatasourceConfig(url="http://x"),
+        server=ServerConfig(),
+        safety=SafetyConfig(),
+        defaults=DefaultsConfig(
+            min_points=10,
+            models=["AutoARIMA"],
+            confidence_levels=[80],
+            auto_select=True,
+            evaluate=True,
+            fallback_model="SeasonalNaive",
+            fallback_mape_threshold=10.0,
+            accuracy_horizons=[timedelta(minutes=10)],
+        ),
+        groups=[GroupConfig(name="g", queries=[QueryConfig(id="m", promql="up")])],
+    )
+
+    def _fake_build(name: str, season_length: int) -> _FakeModel:
+        if name == "AutoARIMA":
+            # Predict 999 against actuals near 50 → MAPE > threshold.
+            return _FakeModel("AutoARIMA", value=999.0)
+        if name == "SeasonalNaive":
+            return _FakeModel("SeasonalNaive", value=42.0)
+        raise AssertionError(name)
+
+    monkeypatch.setattr(model_registry, "build", _fake_build)
+
+    source = _FakeSource({"up": [_ramp_frame(60)]})
+    exporter = Exporter()
+    runner = Runner(config=cfg, source=source, exporter=exporter)
+
+    await runner.run_group(cfg.groups[0])
+
+    body = exporter.render().decode()
+    assert 'model="SeasonalNaive"' in body  # forecast
+    assert 'best_model="AutoARIMA"' in body  # what won the (bad) horse race
+    assert 'model_fallback="true"' in body
+
+
+@pytest.mark.asyncio
+async def test_run_group_explicit_mode_emits_one_per_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from promforecast import models as model_registry  # noqa: PLC0415
+
+    cfg = Config(
+        datasource=DatasourceConfig(url="http://x"),
+        server=ServerConfig(),
+        safety=SafetyConfig(),
+        defaults=DefaultsConfig(
+            min_points=10,
+            models=["AutoARIMA", "SeasonalNaive"],
+            confidence_levels=[80],
+            auto_select=False,
+            evaluate=False,
+            accuracy_horizons=[timedelta(minutes=10)],
+        ),
+        groups=[GroupConfig(name="g", queries=[QueryConfig(id="m", promql="up")])],
+    )
+
+    def _fake_build(name: str, season_length: int) -> _FakeModel:
+        return _FakeModel(name, value=1.0 if name == "AutoARIMA" else 2.0)
+
+    monkeypatch.setattr(model_registry, "build", _fake_build)
+
+    source = _FakeSource({"up": [_ramp_frame(60)]})
+    exporter = Exporter()
+    runner = Runner(config=cfg, source=source, exporter=exporter)
+
+    await runner.run_group(cfg.groups[0])
+
+    body = exporter.render().decode()
+    # Two forecast rows — one per model.
+    assert body.count("m_forecast{") == 2
+    assert 'model="AutoARIMA"' in body
+    assert 'model="SeasonalNaive"' in body
+    # No best_model label in explicit mode.
+    assert "best_model=" not in body
+    # No accuracy metrics when evaluate=false.
+    assert "forecast_accuracy_mape" not in body
 
 
 @pytest.mark.asyncio

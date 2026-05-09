@@ -101,6 +101,13 @@ class DefaultsConfig(BaseModel):
     confidence_levels: list[int] = Field(default_factory=lambda: [80, 95])
     min_points: int = 200
     evaluate: bool = True
+    accuracy_horizons: list[Duration] = Field(
+        default_factory=lambda: [
+            timedelta(hours=1),
+            timedelta(hours=6),
+            timedelta(hours=24),
+        ]
+    )
     auto_select: bool | Literal["ensemble"] = False
     fallback_model: str = "SeasonalNaive"
     fallback_mape_threshold: float | None = 50.0
@@ -157,7 +164,7 @@ def load(path: str | Path) -> Config:
     config = Config.model_validate(raw)
     if config.datasource.auth.type != "none":
         raise NotImplementedError(
-            f"datasource.auth.type={config.datasource.auth.type!r} is not implemented in v0.1; "
+            f"datasource.auth.type={config.datasource.auth.type!r} is not implemented yet; "
             "only 'none' is supported"
         )
     for group in config.groups:
