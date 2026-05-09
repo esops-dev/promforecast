@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "title": "promforecast-stack Helm values",
+  "description": "Umbrella chart bundling VictoriaMetrics + promforecast. Subchart values are pass-throughs and validated by their own charts.",
+  "type": "object",
+  "additionalProperties": true,
+  "properties": {
+    "victoria-metrics-single": { "type": "object" },
+    "promforecast": { "type": "object" },
+    "dashboards": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "labels": { "type": "object" }
+      }
+    },
+    "prometheusRules": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "labels": { "type": "object" }
+      }
+    }
+  }
+}

@@ -1,0 +1,42 @@
+# Local-dev override of examples/configs/node-capacity.yaml with a small
+# min_points so forecasts produce output before VM has accumulated lookback's
+# worth of data. Not intended for any non-development use.
+
+datasource:
+  url: http://victoriametrics:8428/
+  timeout: 30s
+
+server:
+  listen: ":9091"
+  refresh_interval: 5m
+
+# Tight caps to exercise overflow handling end-to-end in dev.
+safety:
+  max_series_per_query: 50
+  max_total_series: 500
+  series_overflow: drop_lowest_priority
+  fit_timeout: 60s
+  query_timeout: 30s
+
+defaults:
+  lookback: 2h
+  step: 1m
+  horizon: 1h
+  models: [SeasonalNaive]
+  season_length: 60          # 1m step → hourly seasonality
+  confidence_levels: [80, 95]
+  min_points: 30
+  evaluate: false
+  emit_deviation: false
+  emit_quality: false
+
+groups:
+  - name: node_capacity
+    priority: 10
+    queries:
+      - id: node_cpu_busy_pct
+        promql: |
+          100 - (avg by (instance) (rate(node_cpu_seconds_total{mode="idle"}[2m])) * 100)
+      - id: node_memory_used_bytes
+        promql: |
+          node_memory_MemTotal_bytes - node_memory_MemAvailable_bytes
