@@ -5,10 +5,11 @@ victoria-metrics-single:
   enabled: true
   server:
     # IMPORTANT: forecasts are written with future timestamps. Without this
-    # flag VictoriaMetrics will silently drop them. Tune higher than your
-    # longest configured forecast horizon.
+    # flag VictoriaMetrics will silently drop them. VM enforces a 2-day
+    # minimum; tune this higher than your longest configured forecast
+    # horizon.
     extraArgs:
-      futureRetention: "24h"
+      futureRetention: "2d"
     persistentVolume:
       enabled: true
       size: 20Gi
