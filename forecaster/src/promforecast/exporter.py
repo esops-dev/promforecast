@@ -58,16 +58,31 @@ class ForecastPoint:
     value: float
 
 
+@dataclass(frozen=True)
+class AccuracyPoint:
+    """One backtest result row destined for /metrics.
+
+    Rendered as ``forecast_accuracy_mape`` and ``forecast_accuracy_mase``
+    gauges; carrying both numbers in one struct avoids two parallel lists
+    that would have to be kept in lockstep.
+    """
+
+    labels: dict[str, str]
+    mape: float
+    mase: float
+
+
 @dataclass
 class GroupSnapshot:
     """The most recent successful forecast output for one group."""
 
     group: str
     points: list[ForecastPoint] = field(default_factory=list)
+    accuracy_points: list[AccuracyPoint] = field(default_factory=list)
     last_run_timestamp: float = 0.0
     run_duration_seconds: float = 0.0
     series_count: int = 0
-    # series_dropped reasons (bounded set, see "Operational metrics" in CLAUDE.md):
+    # series_dropped reasons (bounded set):
     #   per_query_cap, total_cap, min_points
     series_dropped: dict[str, int] = field(default_factory=dict)
     # failures reasons (bounded set):
@@ -113,6 +128,7 @@ class _SnapshotCollector:
     def collect(self) -> Iterator[GaugeMetricFamily | CounterMetricFamily]:
         groups = self._exporter._snapshot()
         yield from _forecast_families(groups)
+        yield from _accuracy_families(groups)
         yield from _operational_families(groups)
 
 
@@ -137,6 +153,44 @@ def _forecast_families(
         for point in points:
             family.add_metric([point.labels.get(k, "") for k in label_keys], point.value)
         yield family
+
+
+def _accuracy_families(
+    groups: list[GroupSnapshot],
+) -> Iterator[GaugeMetricFamily]:
+    """Render ``forecast_accuracy_mape`` and ``forecast_accuracy_mase`` gauges.
+
+    NaN MAPE/MASE values (degenerate series, all-zero actuals) are dropped
+    rather than emitted: ``NaN`` round-trips through Prometheus exposition
+    fine but pollutes alerts and dashboards.
+    """
+    import math  # noqa: PLC0415
+
+    accuracy_points = [(snap, p) for snap in groups for p in snap.accuracy_points]
+    if not accuracy_points:
+        return
+
+    label_keys = sorted({k for _, p in accuracy_points for k in p.labels})
+
+    mape_family = GaugeMetricFamily(
+        "forecast_accuracy_mape",
+        "Mean absolute percentage error from the most recent backtest, in percent.",
+        labels=label_keys,
+    )
+    mase_family = GaugeMetricFamily(
+        "forecast_accuracy_mase",
+        "Mean absolute scaled error from the most recent backtest.",
+        labels=label_keys,
+    )
+
+    for _, point in accuracy_points:
+        values = [point.labels.get(k, "") for k in label_keys]
+        if math.isfinite(point.mape):
+            mape_family.add_metric(values, point.mape)
+        if math.isfinite(point.mase):
+            mase_family.add_metric(values, point.mase)
+    yield mape_family
+    yield mase_family
 
 
 def _operational_families(

@@ -2,6 +2,10 @@
 
 Forecasts for Prometheus-compatible metrics, exposed as Prometheus metrics.
 
+[![CI](https://github.com/esops-dev/promforecast/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/esops-dev/promforecast/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/esops-dev/promforecast?include_prereleases&sort=semver)](https://github.com/esops-dev/promforecast/releases)
+[![License](https://img.shields.io/github/license/esops-dev/promforecast)](LICENSE)
+
 promforecast reads a YAML config, queries a Prometheus-compatible TSDB
 (VictoriaMetrics by default), runs [`statsforecast`](https://nixtla.github.io/statsforecast/)
 models, and exposes the predictions on `/metrics`. Forecasts become first-class
@@ -38,6 +42,13 @@ Early development. Output metric names are part of the public API and follow
 Prometheus conventions strictly (no colons — those are reserved for recording
 rules).
 
+## Security
+
+Found a vulnerability? See [SECURITY.md](SECURITY.md). Please do not open public issues for security reports.
+
+## Contributing
+See [CONTRIBUTING.md](CONTRIBUTING.md) and the [docs/](docs/) folder for rule authoring.
+
 ## License
 
-[Apache-2.0](LICENSE).
+Apache-2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).

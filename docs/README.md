@@ -9,8 +9,7 @@ The docs follow the [Diataxis](https://diataxis.fr/) framework:
 
 ## Index
 
-- [Configuration reference](configuration.md)
-- [Models](models.md)
-- [Metrics emitted](metrics.md)
-- [Operating in HA mode](ha.md)
-- [Compatibility matrix](compatibility.md)
+- [Models](models.md) — built-in forecasters, auto-select, accuracy metrics
+
+The configuration reference, metrics catalogue, HA guide, and compatibility
+matrix are tracked against later milestones — see `ROADMAP.md`.

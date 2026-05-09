@@ -11,11 +11,13 @@ from collections.abc import Callable
 from .auto_arima import AutoARIMAModel
 from .auto_ets import AutoETSModel
 from .base import ForecastModel
+from .mstl import MSTLModel
 from .seasonal_naive import SeasonalNaiveModel
 
 _BUILTIN: dict[str, Callable[[int], ForecastModel]] = {
     "AutoARIMA": lambda s: AutoARIMAModel(season_length=s),
-    "AutoETS": lambda s: AutoETSModel(),
+    "AutoETS": lambda s: AutoETSModel(season_length=s),
+    "MSTL": lambda s: MSTLModel(season_length=s),
     "SeasonalNaive": lambda s: SeasonalNaiveModel(season_length=s),
 }
 
@@ -32,4 +34,12 @@ def build(name: str, season_length: int) -> ForecastModel:
     return factory(season_length)
 
 
-__all__ = ["ForecastModel", "UnknownModelError", "build"]
+__all__ = [
+    "AutoARIMAModel",
+    "AutoETSModel",
+    "ForecastModel",
+    "MSTLModel",
+    "SeasonalNaiveModel",
+    "UnknownModelError",
+    "build",
+]

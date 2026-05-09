@@ -50,6 +50,7 @@ promforecast = "promforecast.main:cli"
 [project.entry-points."promforecast.models"]
 auto_arima     = "promforecast.models.auto_arima:AutoARIMAModel"
 auto_ets       = "promforecast.models.auto_ets:AutoETSModel"
+mstl           = "promforecast.models.mstl:MSTLModel"
 seasonal_naive = "promforecast.models.seasonal_naive:SeasonalNaiveModel"
 
 [project.urls]

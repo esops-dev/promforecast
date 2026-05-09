@@ -13,20 +13,31 @@ import contextlib
 import random
 import time
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Literal
 
 import structlog
 
 from . import models as model_registry
+from .accuracy import (
+    AccuracyResult,
+    HorizonSpec,
+    backtest,
+    evaluate,
+    horizons_from_durations,
+    overall_mape,
+)
 from .config import GroupConfig
 from .exporter import (
+    AccuracyPoint,
     Exporter,
     ForecastPoint,
     GroupSnapshot,
     InvalidMetricNameError,
     validate_metric_name,
 )
+from .selector import SelectionResult, select
 from .source import PromSource, SeriesFrame
 
 if TYPE_CHECKING:
@@ -41,6 +52,23 @@ logger = structlog.get_logger(__name__)
 
 
 OverflowStrategy = Literal["drop_lowest_priority", "reject", "sample"]
+
+
+@dataclass
+class _RunContext:
+    """Mutable accumulator threaded through ``_run_query`` calls.
+
+    Group-level totals (points, drops, failures) used to live as locals in
+    ``run_group``; pulling them into a struct keeps the per-query helper a
+    method instead of a closure and lets tests inspect per-query state.
+    """
+
+    points: list[ForecastPoint] = field(default_factory=list)
+    accuracy_points: list[AccuracyPoint] = field(default_factory=list)
+    series_count: int = 0
+    dropped: dict[str, int] = field(default_factory=dict)
+    failures: dict[str, int] = field(default_factory=dict)
+    global_remaining: int = 0
 
 
 def _compute_global_budgets(groups: list[GroupConfig], max_total_series: int) -> dict[str, int]:
@@ -92,8 +120,8 @@ class Runner:
     ``fit_timeout``. With ``max_workers`` sized comfortably above the
     expected concurrent fit count this is rarely visible. A hard timeout
     would require ``ProcessPoolExecutor`` with pool restart on timeout
-    (~hundreds of MB of fork overhead per timeout); deferred to v0.2 when
-    we have evidence it's needed.
+    (~hundreds of MB of fork overhead per timeout); deferred until there's
+    evidence it's needed.
     """
 
     def __init__(
@@ -113,6 +141,15 @@ class Runner:
         self._global_budgets = _compute_global_budgets(
             list(config.groups), config.safety.max_total_series
         )
+        if config.defaults.auto_select == "ensemble":
+            # Surfaced once at boot so an operator who picked ``ensemble``
+            # doesn't quietly get explicit-mode behaviour. Keeping the value
+            # accepted (rather than rejecting it in the schema) means configs
+            # written today won't break when ensemble support lands later.
+            logger.warning(
+                "ensemble_auto_select_not_yet_implemented",
+                effective_behaviour="explicit",
+            )
 
     async def start(self) -> None:
         """Run each group once immediately, then on the configured interval."""
@@ -139,72 +176,76 @@ class Runner:
             log = logger.bind(group=group.name)
             log.info("group_run_start")
 
-            points: list[ForecastPoint] = []
-            series_count = 0
-            dropped: dict[str, int] = {}
-            failures: dict[str, int] = {}
-
-            safety = self._config.safety
-            strategy: OverflowStrategy = safety.series_overflow
-            global_remaining = self._global_budgets.get(group.name, 0)
-            global_cap_enabled = safety.max_total_series > 0
-
+            ctx = _RunContext(global_remaining=self._global_budgets.get(group.name, 0))
             for query in group.queries:
-                try:
-                    frames = await self._fetch(query)
-                except Exception:
-                    log.exception("query_failed", id=query.id)
-                    failures["query_error"] = failures.get("query_error", 0) + 1
-                    continue
-
-                effective_cap = safety.max_series_per_query
-                cap_reason = "per_query_cap"
-                if global_cap_enabled and global_remaining < effective_cap:
-                    effective_cap = global_remaining
-                    cap_reason = "total_cap"
-
-                allowed, dropped_n = _apply_overflow(frames, effective_cap, strategy)
-                if dropped_n:
-                    dropped[cap_reason] = dropped.get(cap_reason, 0) + dropped_n
-                if global_cap_enabled:
-                    global_remaining = max(0, global_remaining - len(allowed))
-                series_count += len(allowed)
-
-                min_points = self._config.defaults.min_points
-                for frame in allowed:
-                    if len(frame.values) < min_points:
-                        dropped["min_points"] = dropped.get("min_points", 0) + 1
-                        continue
-                    try:
-                        new_points = await self._fit_series(query, frame, group.name)
-                    except InvalidMetricNameError:
-                        log.exception("invalid_metric_name", id=query.id)
-                        failures["invalid_metric_name"] = failures.get("invalid_metric_name", 0) + 1
-                        break
-                    except Exception:
-                        log.exception("fit_failed", id=query.id, labels=frame.labels)
-                        failures["fit_error"] = failures.get("fit_error", 0) + 1
-                        continue
-                    points.extend(new_points)
+                await self._run_query(query, group, ctx, log)
 
             duration = time.monotonic() - started
             self._exporter.update(
                 GroupSnapshot(
                     group=group.name,
-                    points=points,
+                    points=ctx.points,
+                    accuracy_points=ctx.accuracy_points,
                     last_run_timestamp=time.time(),
                     run_duration_seconds=duration,
-                    series_count=series_count,
-                    series_dropped=dropped,
-                    failures=failures,
+                    series_count=ctx.series_count,
+                    series_dropped=ctx.dropped,
+                    failures=ctx.failures,
                 )
             )
             log.info(
                 "group_run_complete",
                 duration_s=round(duration, 3),
-                series=series_count,
-                points=len(points),
+                series=ctx.series_count,
+                points=len(ctx.points),
             )
+
+    async def _run_query(
+        self,
+        query: QueryConfig,
+        group: GroupConfig,
+        ctx: _RunContext,
+        log: structlog.stdlib.BoundLogger,
+    ) -> None:
+        try:
+            frames = await self._fetch(query)
+        except Exception:
+            log.exception("query_failed", id=query.id)
+            ctx.failures["query_error"] = ctx.failures.get("query_error", 0) + 1
+            return
+
+        safety = self._config.safety
+        global_cap_enabled = safety.max_total_series > 0
+        effective_cap = safety.max_series_per_query
+        cap_reason = "per_query_cap"
+        if global_cap_enabled and ctx.global_remaining < effective_cap:
+            effective_cap = ctx.global_remaining
+            cap_reason = "total_cap"
+
+        allowed, dropped_n = _apply_overflow(frames, effective_cap, safety.series_overflow)
+        if dropped_n:
+            ctx.dropped[cap_reason] = ctx.dropped.get(cap_reason, 0) + dropped_n
+        if global_cap_enabled:
+            ctx.global_remaining = max(0, ctx.global_remaining - len(allowed))
+        ctx.series_count += len(allowed)
+
+        min_points = self._config.defaults.min_points
+        for frame in allowed:
+            if len(frame.values) < min_points:
+                ctx.dropped["min_points"] = ctx.dropped.get("min_points", 0) + 1
+                continue
+            try:
+                new_points, new_accuracy = await self._fit_series(query, frame, group.name)
+            except InvalidMetricNameError:
+                log.exception("invalid_metric_name", id=query.id)
+                ctx.failures["invalid_metric_name"] = ctx.failures.get("invalid_metric_name", 0) + 1
+                return
+            except Exception:
+                log.exception("fit_failed", id=query.id, labels=frame.labels)
+                ctx.failures["fit_error"] = ctx.failures.get("fit_error", 0) + 1
+                continue
+            ctx.points.extend(new_points)
+            ctx.accuracy_points.extend(new_accuracy)
 
     async def _fetch(self, query: QueryConfig) -> list[SeriesFrame]:
         d = self._config.defaults
@@ -222,7 +263,7 @@ class Runner:
         query: QueryConfig,
         frame: SeriesFrame,
         group_name: str,
-    ) -> list[ForecastPoint]:
+    ) -> tuple[list[ForecastPoint], list[AccuracyPoint]]:
         import pandas as pd  # noqa: PLC0415
 
         d = self._config.defaults
@@ -237,34 +278,241 @@ class Runner:
         )
         freq = _pandas_freq(d.step)
         horizon = max(1, int(d.horizon.total_seconds() // d.step.total_seconds()))
+        levels = list(d.confidence_levels)
 
-        all_points: list[ForecastPoint] = []
-        loop = asyncio.get_running_loop()
-        for model_name in d.models:
-            model = model_registry.build(model_name, season_length=d.season_length)
-            forecast = await asyncio.wait_for(
-                loop.run_in_executor(
-                    self._executor,
-                    _run_fit,
-                    model,
-                    df,
-                    horizon,
-                    freq,
-                    list(d.confidence_levels),
-                ),
-                timeout=self._config.safety.fit_timeout.total_seconds(),
+        accuracy_horizons = horizons_from_durations(list(d.accuracy_horizons), d.step)
+        auto_select_enabled = bool(d.auto_select)
+        # Even when ``evaluate`` is off, auto-select still needs the backtest
+        # to pick a winner; we just suppress emission of the accuracy metrics.
+        run_backtest = (d.evaluate or auto_select_enabled) and len(accuracy_horizons) > 0
+
+        backtest_results: dict[str, list[AccuracyResult]] = {}
+        if run_backtest:
+            backtest_results = await self._run_backtests(
+                df=df,
+                models=list(d.models),
+                horizons=accuracy_horizons,
+                freq=freq,
+                levels=levels,
+                season_length=d.season_length,
             )
-            all_points.extend(
+
+        if auto_select_enabled and d.auto_select != "ensemble":
+            forecast_points = await self._auto_select_and_forecast(
+                df=df,
+                query=query,
+                frame=frame,
+                group_name=group_name,
+                horizon=horizon,
+                freq=freq,
+                levels=levels,
+                backtest_results=backtest_results,
+            )
+        else:
+            forecast_points = await self._explicit_forecast(
+                df=df,
+                models=list(d.models),
+                query=query,
+                frame=frame,
+                group_name=group_name,
+                horizon=horizon,
+                freq=freq,
+                levels=levels,
+            )
+
+        accuracy_points: list[AccuracyPoint] = []
+        if d.evaluate and backtest_results:
+            accuracy_points = list(
+                _accuracy_points_for_series(
+                    backtest_results=backtest_results,
+                    metric_id=query.id,
+                    base_labels=frame.labels,
+                    group=group_name,
+                )
+            )
+
+        return forecast_points, accuracy_points
+
+    async def _explicit_forecast(
+        self,
+        *,
+        df: pd.DataFrame,
+        models: list[str],
+        query: QueryConfig,
+        frame: SeriesFrame,
+        group_name: str,
+        horizon: int,
+        freq: str,
+        levels: list[int],
+    ) -> list[ForecastPoint]:
+        # Fits run concurrently against the shared executor: per-series wall
+        # time becomes ``max(fit_time)`` instead of ``sum(fit_time)`` whenever
+        # the pool has spare workers. The pool itself caps total concurrency,
+        # so this doesn't risk overloading anything beyond what a single
+        # serial pass already touched.
+        d = self._config.defaults
+        tasks = [
+            self._fit_one(
+                model_name=model_name,
+                df=df,
+                horizon=horizon,
+                freq=freq,
+                levels=levels,
+                season_length=d.season_length,
+            )
+            for model_name in models
+        ]
+        outcomes = await asyncio.gather(*tasks, return_exceptions=True)
+        out: list[ForecastPoint] = []
+        for model_name, forecast in zip(models, outcomes, strict=True):
+            if isinstance(forecast, BaseException):
+                logger.exception(
+                    "fit_failed_in_explicit_mode",
+                    model=model_name,
+                    exc_info=forecast,
+                )
+                continue
+            out.extend(
                 _forecast_to_points(
                     forecast=forecast,
                     metric_id=query.id,
                     base_labels=frame.labels,
                     group=group_name,
                     model_name=model_name,
-                    levels=list(d.confidence_levels),
+                    levels=levels,
+                    selection=None,
                 )
             )
-        return all_points
+        return out
+
+    async def _auto_select_and_forecast(
+        self,
+        *,
+        df: pd.DataFrame,
+        query: QueryConfig,
+        frame: SeriesFrame,
+        group_name: str,
+        horizon: int,
+        freq: str,
+        levels: list[int],
+        backtest_results: dict[str, list[AccuracyResult]],
+    ) -> list[ForecastPoint]:
+        d = self._config.defaults
+        backtest_mape = {
+            model_name: mape
+            for model_name, results in backtest_results.items()
+            if (mape := overall_mape(results)) is not None
+        }
+        selection = select(
+            fallback_model=d.fallback_model,
+            fallback_mape_threshold=d.fallback_mape_threshold,
+            backtest_mape=backtest_mape,
+        )
+        forecast = await self._fit_one(
+            model_name=selection.model,
+            df=df,
+            horizon=horizon,
+            freq=freq,
+            levels=levels,
+            season_length=d.season_length,
+        )
+        return list(
+            _forecast_to_points(
+                forecast=forecast,
+                metric_id=query.id,
+                base_labels=frame.labels,
+                group=group_name,
+                model_name=selection.model,
+                levels=levels,
+                selection=selection,
+            )
+        )
+
+    async def _run_backtests(
+        self,
+        *,
+        df: pd.DataFrame,
+        models: list[str],
+        horizons: list[HorizonSpec],
+        freq: str,
+        levels: list[int],
+        season_length: int,
+    ) -> dict[str, list[AccuracyResult]]:
+        """Backtest each configured model. Per-model failures are isolated.
+
+        The hold-out window is ``max(horizon.steps)`` — large enough to score
+        every horizon from a single fit, which keeps the cost to one extra
+        per-model fit per series. With ``auto_select: true`` the per-series
+        cost is therefore N + 1 fits (N backtests + 1 final forecast on full
+        data); with ``auto_select: false`` it's N + N (N backtests + N final
+        forecasts). Set ``evaluate: false`` to skip backtesting when the fit
+        budget is tight — the trade-off is no MAPE/MASE metrics and no
+        auto-select winner picking.
+
+        Backtest fits dispatch concurrently against the executor pool, so
+        per-series wall time tracks the slowest model rather than the sum.
+        """
+        if not horizons:
+            return {}
+        eval_steps = max(h.steps for h in horizons)
+        if len(df) <= eval_steps + 1:
+            return {}
+        train = df.iloc[:-eval_steps].reset_index(drop=True)
+        loop = asyncio.get_running_loop()
+        timeout = self._config.safety.fit_timeout.total_seconds()
+
+        async def _one(model_name: str) -> tuple[pd.DataFrame, pd.DataFrame] | None:
+            model = model_registry.build(model_name, season_length=season_length)
+            return await asyncio.wait_for(
+                loop.run_in_executor(
+                    self._executor, _run_backtest, model, df, eval_steps, freq, levels
+                ),
+                timeout=timeout,
+            )
+
+        outcomes = await asyncio.gather(*(_one(name) for name in models), return_exceptions=True)
+        results: dict[str, list[AccuracyResult]] = {}
+        for model_name, outcome in zip(models, outcomes, strict=True):
+            if isinstance(outcome, BaseException):
+                logger.exception("backtest_failed", model=model_name, exc_info=outcome)
+                continue
+            if outcome is None:
+                continue
+            test, predictions = outcome
+            results[model_name] = evaluate(
+                test=test,
+                predictions=predictions,
+                train=train,
+                season_length=season_length,
+                horizons=horizons,
+                model_name=model_name,
+            )
+        return results
+
+    async def _fit_one(
+        self,
+        *,
+        model_name: str,
+        df: pd.DataFrame,
+        horizon: int,
+        freq: str,
+        levels: list[int],
+        season_length: int,
+    ) -> pd.DataFrame:
+        loop = asyncio.get_running_loop()
+        model = model_registry.build(model_name, season_length=season_length)
+        return await asyncio.wait_for(
+            loop.run_in_executor(
+                self._executor,
+                _run_fit,
+                model,
+                df,
+                horizon,
+                freq,
+                levels,
+            ),
+            timeout=self._config.safety.fit_timeout.total_seconds(),
+        )
 
     async def stop(self) -> None:
         """Shut down the scheduler and cancel in-flight runs."""
@@ -288,6 +536,16 @@ def _run_fit(
     return model.fit_predict(df=df, horizon=horizon, freq=freq, levels=levels)
 
 
+def _run_backtest(
+    model: ForecastModel,
+    df: pd.DataFrame,
+    horizon_steps: int,
+    freq: str,
+    levels: list[int],
+) -> tuple[pd.DataFrame, pd.DataFrame] | None:
+    return backtest(model=model, df=df, horizon_steps=horizon_steps, freq=freq, levels=levels)
+
+
 def _pandas_freq(step: timedelta) -> str:
     seconds = int(step.total_seconds())
     if seconds % 3600 == 0:
@@ -304,12 +562,18 @@ def _forecast_to_points(
     group: str,
     model_name: str,
     levels: list[int],
+    selection: SelectionResult | None,
 ) -> Iterable[ForecastPoint]:
     """Convert the last forecast row into snapshot points.
 
     /metrics is a snapshot endpoint, so we expose only the *next* forecast
-    step. Drawing the full curve in Grafana is the job of the remote_write
-    sink (v0.3) — see CLAUDE.md.
+    step. Drawing the full curve in Grafana is the job of the planned
+    remote_write sink.
+
+    When ``selection`` is set (auto-select mode), additional labels
+    ``best_model`` and ``model_fallback`` are attached so dashboards can
+    distinguish "this model won the horse race" from "this is the fallback
+    after the winner blew its MAPE budget".
     """
     if forecast.empty:
         return
@@ -323,6 +587,9 @@ def _forecast_to_points(
         "model": model_name,
         "horizon": horizon_step,
     }
+    if selection is not None:
+        common_labels["best_model"] = selection.best_model
+        common_labels["model_fallback"] = "true" if selection.fallback_applied else "false"
     yield ForecastPoint(
         metric=f"{metric_id}_forecast",
         labels=common_labels,
@@ -342,4 +609,30 @@ def _forecast_to_points(
                 metric=f"{metric_id}_forecast_upper",
                 labels={**common_labels, "level": str(level)},
                 value=float(last[hi_col]),
+            )
+
+
+def _accuracy_points_for_series(
+    backtest_results: dict[str, list[AccuracyResult]],
+    metric_id: str,
+    base_labels: dict[str, str],
+    group: str,
+) -> Iterable[AccuracyPoint]:
+    """Flatten per-series backtest results into ``AccuracyPoint``s.
+
+    ``id`` is the same string used for the forecast metric stem so that an
+    accuracy dashboard can join cleanly on ``id``.
+    """
+    common_labels = {k: v for k, v in base_labels.items() if k != "__name__"}
+    common_labels = {**common_labels, "id": metric_id, "group": group}
+    for model_name, results in backtest_results.items():
+        for res in results:
+            yield AccuracyPoint(
+                labels={
+                    **common_labels,
+                    "model": model_name,
+                    "horizon": res.horizon,
+                },
+                mape=res.mape,
+                mase=res.mase,
             )
