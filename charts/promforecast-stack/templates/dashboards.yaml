@@ -1,0 +1,19 @@
+{{- if .Values.dashboards.enabled }}
+{{- $root := . }}
+{{- range $path, $_ := .Files.Glob "dashboards/*.json" }}
+{{- $name := regexReplaceAll "\\.json$" (base $path) "" }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ printf "%s-%s" (include "promforecast-stack.fullname" $root) $name | trunc 63 | trimSuffix "-" }}
+  labels:
+{{- include "promforecast-stack.labels" $root | nindent 4 }}
+{{- range $k, $v := $root.Values.dashboards.labels }}
+    {{ $k }}: {{ $v | quote }}
+{{- end }}
+data:
+  {{ $name }}.json: |-
+{{ $root.Files.Get $path | indent 4 }}
+{{- end }}
+{{- end }}

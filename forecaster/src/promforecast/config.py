@@ -91,6 +91,14 @@ class SafetyConfig(BaseModel):
 
 
 class DefaultsConfig(BaseModel):
+    """Cascaded defaults applied to every group.
+
+    Note on backtest cost: ``evaluate``, ``auto_select``, ``emit_deviation``,
+    and ``emit_quality`` all rely on the per-fit hold-out backtest. Turning
+    *any* of them on costs one extra fit per (series, model). Set all four
+    to ``false`` to skip backtests entirely when CPU is tight.
+    """
+
     model_config = ConfigDict(extra="forbid")
 
     lookback: Duration = timedelta(days=14)

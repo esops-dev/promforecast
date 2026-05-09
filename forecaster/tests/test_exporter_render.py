@@ -4,7 +4,14 @@ from __future__ import annotations
 
 import math
 
-from promforecast.exporter import AccuracyPoint, Exporter, ForecastPoint, GroupSnapshot
+from promforecast.exporter import (
+    AccuracyPoint,
+    DeviationPoint,
+    Exporter,
+    ForecastPoint,
+    GroupSnapshot,
+    QualityPoint,
+)
 
 
 def test_render_empty_is_well_formed() -> None:
@@ -120,6 +127,107 @@ def test_render_drops_nan_accuracy_values() -> None:
     # Family is declared but no samples are emitted for the NaN row.
     assert "forecast_accuracy_mape{" not in body
     assert "forecast_accuracy_mase{" not in body
+
+
+def test_render_emits_deviation_metrics() -> None:
+    exporter = Exporter()
+    exporter.update(
+        GroupSnapshot(
+            group="g",
+            deviation_points=[
+                DeviationPoint(
+                    labels={
+                        "id": "m",
+                        "group": "g",
+                        "model": "AutoARIMA",
+                        "level": "95",
+                        "instance": "host-a",
+                    },
+                    ratio=0.25,
+                    outside_band=False,
+                ),
+                DeviationPoint(
+                    labels={
+                        "id": "m",
+                        "group": "g",
+                        "model": "AutoARIMA",
+                        "level": "95",
+                        "instance": "host-b",
+                    },
+                    ratio=1.5,
+                    outside_band=True,
+                ),
+            ],
+        )
+    )
+    body = exporter.render().decode()
+    assert "# TYPE forecast_deviation_ratio gauge" in body
+    assert "# TYPE forecast_deviation_outside_band gauge" in body
+    assert 'instance="host-a"' in body
+    assert 'instance="host-b"' in body
+    # outside_band rendered as 1 / 0.
+    assert "forecast_deviation_outside_band{" in body
+    assert "1.0" in body and "0.0" in body
+
+
+def test_render_drops_nan_deviation_ratio_but_keeps_outside_band() -> None:
+    exporter = Exporter()
+    exporter.update(
+        GroupSnapshot(
+            group="g",
+            deviation_points=[
+                DeviationPoint(
+                    labels={"id": "m", "group": "g", "model": "X", "level": "95"},
+                    ratio=math.nan,
+                    outside_band=True,
+                ),
+            ],
+        )
+    )
+    body = exporter.render().decode()
+    assert "forecast_deviation_ratio{" not in body
+    assert "forecast_deviation_outside_band{" in body
+
+
+def test_render_emits_quality_score() -> None:
+    exporter = Exporter()
+    exporter.update(
+        GroupSnapshot(
+            group="g",
+            quality_points=[
+                QualityPoint(
+                    labels={
+                        "id": "m",
+                        "group": "g",
+                        "model": "AutoARIMA",
+                        "instance": "host-a",
+                    },
+                    score=0.82,
+                ),
+            ],
+        )
+    )
+    body = exporter.render().decode()
+    assert "# TYPE forecast_quality_score gauge" in body
+    assert 'instance="host-a"' in body
+    assert "0.82" in body
+
+
+def test_render_drops_nan_quality_scores() -> None:
+    exporter = Exporter()
+    exporter.update(
+        GroupSnapshot(
+            group="g",
+            quality_points=[
+                QualityPoint(
+                    labels={"id": "m", "group": "g", "model": "X"},
+                    score=math.nan,
+                ),
+            ],
+        )
+    )
+    body = exporter.render().decode()
+    assert "forecast_quality_score{" not in body
 
 
 def test_render_escapes_label_values() -> None:

@@ -1,0 +1,104 @@
+{{- if .Values.prometheusRules.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "promforecast-stack.fullname" . }}-rules
+  labels:
+{{- include "promforecast-stack.labels" . | nindent 4 }}
+{{- range $k, $v := .Values.prometheusRules.labels }}
+    {{ $k }}: {{ $v | quote }}
+{{- end }}
+spec:
+  groups:
+    - name: promforecast.operational
+      interval: 1m
+      rules:
+        - alert: ForecastStale
+          expr: time() - forecast_last_run_timestamp_seconds > 7200
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "promforecast hasn't refreshed group {{`{{ $labels.group }}`}} in over 2h"
+            description: |
+              The forecaster has not produced a successful run for group
+              {{`{{ $labels.group }}`}} in over 2 hours. Check pod logs and
+              datasource availability.
+
+        - alert: ForecastModelDegraded
+          expr: forecast_accuracy_mape > 30
+          for: 24h
+          labels:
+            severity: warning
+          annotations:
+            summary: "Forecast accuracy degraded for {{`{{ $labels.id }}`}} (MAPE > 30%)"
+            description: |
+              Backtest MAPE for {{`{{ $labels.id }}`}} model {{`{{ $labels.model }}`}}
+              at horizon {{`{{ $labels.horizon }}`}} has exceeded 30% for 24h.
+
+        - alert: ForecastFallbackPersistent
+          expr: count by (group) (forecast_quality_score{model_fallback="true"}) > 0
+          for: 6h
+          labels:
+            severity: info
+          annotations:
+            summary: "Auto-select keeps falling back for group {{`{{ $labels.group }}`}}"
+            description: |
+              At least one series in {{`{{ $labels.group }}`}} has been falling
+              back to the configured fallback model for 6h.
+
+        - alert: ForecastQualityLow
+          expr: avg by (group) (forecast_quality_score) < 0.4
+          for: 6h
+          labels:
+            severity: info
+          annotations:
+            summary: "Average forecast quality for group {{`{{ $labels.group }}`}} is low"
+            description: |
+              Average forecast_quality_score for group {{`{{ $labels.group }}`}}
+              is below 0.4 for 6h. Treat downstream forecast-based alerts
+              with caution.
+
+        - alert: ForecastQualityZero
+          expr: forecast_quality_score == 0
+          for: 1h
+          labels:
+            severity: info
+          annotations:
+            summary: "Forecast quality is 0 for {{`{{ $labels.id }}`}} ({{`{{ $labels.model }}`}})"
+            description: |
+              forecast_quality_score for {{`{{ $labels.id }}`}}
+              ({{`{{ $labels.model }}`}}) has been zero for 1h. Check
+              data coverage and band width.
+
+    - name: promforecast.deviation
+      interval: 1m
+      rules:
+        - alert: ForecastDeviation
+          expr: |
+            forecast_deviation_outside_band == 1
+            and on (id, group, model) forecast_quality_score > 0.6
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Actual {{`{{ $labels.id }}`}} is outside its forecast band"
+            description: |
+              {{`{{ $labels.id }}`}} (group {{`{{ $labels.group }}`}}, model
+              {{`{{ $labels.model }}`}}, level {{`{{ $labels.level }}`}}) has been
+              outside its forecast confidence band for 15m.
+
+        - alert: ForecastDeviationSevere
+          expr: |
+            abs(forecast_deviation_ratio) > 2
+            and on (id, group, model) forecast_quality_score > 0.6
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Actual {{`{{ $labels.id }}`}} is far outside its forecast band"
+            description: |
+              {{`{{ $labels.id }}`}} (group {{`{{ $labels.group }}`}}, model
+              {{`{{ $labels.model }}`}}, level {{`{{ $labels.level }}`}}) has a
+              deviation ratio with magnitude above 2 for 5m.
+{{- end }}

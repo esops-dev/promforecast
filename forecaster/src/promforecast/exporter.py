@@ -72,6 +72,30 @@ class AccuracyPoint:
     mase: float
 
 
+@dataclass(frozen=True)
+class DeviationPoint:
+    """A single deviation observation destined for /metrics.
+
+    Rendered as ``forecast_deviation_ratio`` and
+    ``forecast_deviation_outside_band`` gauges.
+    """
+
+    labels: dict[str, str]
+    ratio: float
+    outside_band: bool
+
+
+@dataclass(frozen=True)
+class QualityPoint:
+    """A composite forecast-quality observation destined for /metrics.
+
+    Rendered as ``forecast_quality_score`` (gauge, 0..1).
+    """
+
+    labels: dict[str, str]
+    score: float
+
+
 @dataclass
 class GroupSnapshot:
     """The most recent successful forecast output for one group."""
@@ -79,6 +103,8 @@ class GroupSnapshot:
     group: str
     points: list[ForecastPoint] = field(default_factory=list)
     accuracy_points: list[AccuracyPoint] = field(default_factory=list)
+    deviation_points: list[DeviationPoint] = field(default_factory=list)
+    quality_points: list[QualityPoint] = field(default_factory=list)
     last_run_timestamp: float = 0.0
     run_duration_seconds: float = 0.0
     series_count: int = 0
@@ -129,6 +155,8 @@ class _SnapshotCollector:
         groups = self._exporter._snapshot()
         yield from _forecast_families(groups)
         yield from _accuracy_families(groups)
+        yield from _deviation_families(groups)
+        yield from _quality_families(groups)
         yield from _operational_families(groups)
 
 
@@ -191,6 +219,71 @@ def _accuracy_families(
             mase_family.add_metric(values, point.mase)
     yield mape_family
     yield mase_family
+
+
+def _deviation_families(
+    groups: list[GroupSnapshot],
+) -> Iterator[GaugeMetricFamily]:
+    """Render ``forecast_deviation_ratio`` and ``forecast_deviation_outside_band``.
+
+    NaN ratios (degenerate confidence band) are dropped from the ratio metric
+    but still produce a well-defined ``outside_band`` sample, so an alert on
+    ``forecast_deviation_outside_band == 1`` works even when the band is
+    pathological.
+    """
+    import math  # noqa: PLC0415
+
+    deviation_points = [(snap, p) for snap in groups for p in snap.deviation_points]
+    if not deviation_points:
+        return
+
+    label_keys = sorted({k for _, p in deviation_points for k in p.labels})
+
+    ratio_family = GaugeMetricFamily(
+        "forecast_deviation_ratio",
+        "Signed deviation of the most recent actual from the forecast band, "
+        "as (actual - yhat) / (yhat_upper - yhat_lower).",
+        labels=label_keys,
+    )
+    outside_family = GaugeMetricFamily(
+        "forecast_deviation_outside_band",
+        "1 if the most recent actual is outside the forecast band, else 0.",
+        labels=label_keys,
+    )
+
+    for _, point in deviation_points:
+        values = [point.labels.get(k, "") for k in label_keys]
+        if math.isfinite(point.ratio):
+            ratio_family.add_metric(values, point.ratio)
+        outside_family.add_metric(values, 1.0 if point.outside_band else 0.0)
+    yield ratio_family
+    yield outside_family
+
+
+def _quality_families(
+    groups: list[GroupSnapshot],
+) -> Iterator[GaugeMetricFamily]:
+    """Render ``forecast_quality_score`` gauges (0..1 per series/model)."""
+    import math  # noqa: PLC0415
+
+    quality_points = [(snap, p) for snap in groups for p in snap.quality_points]
+    if not quality_points:
+        return
+
+    label_keys = sorted({k for _, p in quality_points for k in p.labels})
+
+    family = GaugeMetricFamily(
+        "forecast_quality_score",
+        "Composite forecast quality score in [0, 1] combining backtest MAPE, "
+        "confidence-band width, and lookback data coverage.",
+        labels=label_keys,
+    )
+    for _, point in quality_points:
+        if not math.isfinite(point.score):
+            continue
+        values = [point.labels.get(k, "") for k in label_keys]
+        family.add_metric(values, point.score)
+    yield family
 
 
 def _operational_families(

@@ -28,5 +28,12 @@ scrape_configs:
       - targets: ["node-exporter:9100"]
 
   - job_name: promforecast
+    # honor_labels: forecast metrics carry the source ``instance`` label
+    # (e.g. ``dev-host-a:9100``) from the underlying time-series. Without
+    # honor_labels Prometheus would rename it to ``exported_instance`` and
+    # add its own ``instance="forecaster:9091"``, which makes joining
+    # ``node_cpu_busy_pct_forecast`` to ``node_cpu_seconds_total`` on
+    # ``instance`` impossible from a dashboard.
+    honor_labels: true
     static_configs:
       - targets: ["forecaster:9091"]

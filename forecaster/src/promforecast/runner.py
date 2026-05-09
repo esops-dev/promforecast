@@ -19,7 +19,9 @@ from typing import TYPE_CHECKING, Literal
 
 import structlog
 
+from . import deviation as deviation_mod
 from . import models as model_registry
+from . import quality as quality_mod
 from .accuracy import (
     AccuracyResult,
     HorizonSpec,
@@ -31,10 +33,12 @@ from .accuracy import (
 from .config import GroupConfig
 from .exporter import (
     AccuracyPoint,
+    DeviationPoint,
     Exporter,
     ForecastPoint,
     GroupSnapshot,
     InvalidMetricNameError,
+    QualityPoint,
     validate_metric_name,
 )
 from .selector import SelectionResult, select
@@ -55,6 +59,44 @@ OverflowStrategy = Literal["drop_lowest_priority", "reject", "sample"]
 
 
 @dataclass
+class _FitResult:
+    """Per-series outputs returned by ``Runner._fit_series``."""
+
+    points: list[ForecastPoint] = field(default_factory=list)
+    accuracy: list[AccuracyPoint] = field(default_factory=list)
+    deviation: list[DeviationPoint] = field(default_factory=list)
+    quality: list[QualityPoint] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class _BandSummary:
+    """Per-level (lower, upper) band from the trailing backtest row."""
+
+    lower: float
+    upper: float
+
+    @property
+    def width(self) -> float:
+        return abs(self.upper - self.lower)
+
+
+@dataclass
+class _BacktestOutcome:
+    """Per-(model, horizon) scores plus a compact summary of the trailing row.
+
+    Storing only the last (actual, predicted, band) tuple — not the full
+    ``test``/``predictions`` frames — keeps memory bounded for high-cardinality
+    groups: at 500 series x 4 models x ~288-row frames the previous design
+    spiked ~22 MiB per series; this collapses it to a few hundred bytes.
+    """
+
+    results: list[AccuracyResult]
+    last_actual: float
+    last_yhat: float
+    last_bands: dict[int, _BandSummary]
+
+
+@dataclass
 class _RunContext:
     """Mutable accumulator threaded through ``_run_query`` calls.
 
@@ -65,6 +107,8 @@ class _RunContext:
 
     points: list[ForecastPoint] = field(default_factory=list)
     accuracy_points: list[AccuracyPoint] = field(default_factory=list)
+    deviation_points: list[DeviationPoint] = field(default_factory=list)
+    quality_points: list[QualityPoint] = field(default_factory=list)
     series_count: int = 0
     dropped: dict[str, int] = field(default_factory=dict)
     failures: dict[str, int] = field(default_factory=dict)
@@ -186,6 +230,8 @@ class Runner:
                     group=group.name,
                     points=ctx.points,
                     accuracy_points=ctx.accuracy_points,
+                    deviation_points=ctx.deviation_points,
+                    quality_points=ctx.quality_points,
                     last_run_timestamp=time.time(),
                     run_duration_seconds=duration,
                     series_count=ctx.series_count,
@@ -235,7 +281,7 @@ class Runner:
                 ctx.dropped["min_points"] = ctx.dropped.get("min_points", 0) + 1
                 continue
             try:
-                new_points, new_accuracy = await self._fit_series(query, frame, group.name)
+                fit_result = await self._fit_series(query, frame, group.name)
             except InvalidMetricNameError:
                 log.exception("invalid_metric_name", id=query.id)
                 ctx.failures["invalid_metric_name"] = ctx.failures.get("invalid_metric_name", 0) + 1
@@ -244,8 +290,10 @@ class Runner:
                 log.exception("fit_failed", id=query.id, labels=frame.labels)
                 ctx.failures["fit_error"] = ctx.failures.get("fit_error", 0) + 1
                 continue
-            ctx.points.extend(new_points)
-            ctx.accuracy_points.extend(new_accuracy)
+            ctx.points.extend(fit_result.points)
+            ctx.accuracy_points.extend(fit_result.accuracy)
+            ctx.deviation_points.extend(fit_result.deviation)
+            ctx.quality_points.extend(fit_result.quality)
 
     async def _fetch(self, query: QueryConfig) -> list[SeriesFrame]:
         d = self._config.defaults
@@ -263,7 +311,7 @@ class Runner:
         query: QueryConfig,
         frame: SeriesFrame,
         group_name: str,
-    ) -> tuple[list[ForecastPoint], list[AccuracyPoint]]:
+    ) -> _FitResult:
         import pandas as pd  # noqa: PLC0415
 
         d = self._config.defaults
@@ -282,13 +330,15 @@ class Runner:
 
         accuracy_horizons = horizons_from_durations(list(d.accuracy_horizons), d.step)
         auto_select_enabled = bool(d.auto_select)
-        # Even when ``evaluate`` is off, auto-select still needs the backtest
-        # to pick a winner; we just suppress emission of the accuracy metrics.
-        run_backtest = (d.evaluate or auto_select_enabled) and len(accuracy_horizons) > 0
+        # Backtests serve three consumers: accuracy metrics, auto-select, and
+        # the deviation/quality computations. Run if any of them is on.
+        run_backtest = (
+            d.evaluate or auto_select_enabled or d.emit_deviation or d.emit_quality
+        ) and len(accuracy_horizons) > 0
 
-        backtest_results: dict[str, list[AccuracyResult]] = {}
+        backtests: dict[str, _BacktestOutcome] = {}
         if run_backtest:
-            backtest_results = await self._run_backtests(
+            backtests = await self._run_backtests(
                 df=df,
                 models=list(d.models),
                 horizons=accuracy_horizons,
@@ -296,6 +346,10 @@ class Runner:
                 levels=levels,
                 season_length=d.season_length,
             )
+
+        backtest_results: dict[str, list[AccuracyResult]] = {
+            name: outcome.results for name, outcome in backtests.items()
+        }
 
         if auto_select_enabled and d.auto_select != "ensemble":
             forecast_points = await self._auto_select_and_forecast(
@@ -320,9 +374,10 @@ class Runner:
                 levels=levels,
             )
 
-        accuracy_points: list[AccuracyPoint] = []
+        result = _FitResult(points=forecast_points)
+
         if d.evaluate and backtest_results:
-            accuracy_points = list(
+            result.accuracy = list(
                 _accuracy_points_for_series(
                     backtest_results=backtest_results,
                     metric_id=query.id,
@@ -331,7 +386,42 @@ class Runner:
                 )
             )
 
-        return forecast_points, accuracy_points
+        # Restrict deviation/quality to the model(s) actually emitted as
+        # forecasts. In auto-select mode that's the winner; in explicit mode
+        # it's all configured models.
+        emitted_models = sorted({p.labels.get("model", "") for p in forecast_points})
+        emitted_models = [m for m in emitted_models if m]
+
+        if d.emit_deviation:
+            result.deviation = list(
+                _deviation_points_for_series(
+                    backtests=backtests,
+                    emitted_models=emitted_models,
+                    metric_id=query.id,
+                    base_labels=frame.labels,
+                    group=group_name,
+                    levels=levels,
+                )
+            )
+
+        if d.emit_quality:
+            expected_points = max(
+                1,
+                int(d.lookback.total_seconds() // max(1, int(d.step.total_seconds()))),
+            )
+            result.quality = list(
+                _quality_points_for_series(
+                    backtests=backtests,
+                    emitted_models=emitted_models,
+                    metric_id=query.id,
+                    base_labels=frame.labels,
+                    group=group_name,
+                    train_y=frame.values,
+                    coverage=min(1.0, len(frame.values) / float(expected_points)),
+                )
+            )
+
+        return result
 
     async def _explicit_forecast(
         self,
@@ -437,7 +527,7 @@ class Runner:
         freq: str,
         levels: list[int],
         season_length: int,
-    ) -> dict[str, list[AccuracyResult]]:
+    ) -> dict[str, _BacktestOutcome]:
         """Backtest each configured model. Per-model failures are isolated.
 
         The hold-out window is ``max(horizon.steps)`` — large enough to score
@@ -445,12 +535,15 @@ class Runner:
         per-model fit per series. With ``auto_select: true`` the per-series
         cost is therefore N + 1 fits (N backtests + 1 final forecast on full
         data); with ``auto_select: false`` it's N + N (N backtests + N final
-        forecasts). Set ``evaluate: false`` to skip backtesting when the fit
-        budget is tight — the trade-off is no MAPE/MASE metrics and no
-        auto-select winner picking.
+        forecasts). Set ``evaluate: false`` *and* disable deviation/quality
+        emission to skip backtesting when the fit budget is tight.
 
         Backtest fits dispatch concurrently against the executor pool, so
         per-series wall time tracks the slowest model rather than the sum.
+
+        The returned mapping keeps the raw ``test``/``predictions`` frames so
+        the deviation step can use the most recent (actual, predicted band)
+        pair without refitting.
         """
         if not horizons:
             return {}
@@ -471,7 +564,7 @@ class Runner:
             )
 
         outcomes = await asyncio.gather(*(_one(name) for name in models), return_exceptions=True)
-        results: dict[str, list[AccuracyResult]] = {}
+        results: dict[str, _BacktestOutcome] = {}
         for model_name, outcome in zip(models, outcomes, strict=True):
             if isinstance(outcome, BaseException):
                 logger.exception("backtest_failed", model=model_name, exc_info=outcome)
@@ -479,13 +572,22 @@ class Runner:
             if outcome is None:
                 continue
             test, predictions = outcome
-            results[model_name] = evaluate(
-                test=test,
-                predictions=predictions,
-                train=train,
-                season_length=season_length,
-                horizons=horizons,
-                model_name=model_name,
+            summary = _summarise_backtest(predictions=predictions, test=test, levels=levels)
+            if summary is None:
+                continue
+            last_actual, last_yhat, last_bands = summary
+            results[model_name] = _BacktestOutcome(
+                results=evaluate(
+                    test=test,
+                    predictions=predictions,
+                    train=train,
+                    season_length=season_length,
+                    horizons=horizons,
+                    model_name=model_name,
+                ),
+                last_actual=last_actual,
+                last_yhat=last_yhat,
+                last_bands=last_bands,
             )
         return results
 
@@ -636,3 +738,133 @@ def _accuracy_points_for_series(
                 mape=res.mape,
                 mase=res.mase,
             )
+
+
+def _summarise_backtest(
+    predictions: pd.DataFrame,
+    test: pd.DataFrame,
+    levels: list[int],
+) -> tuple[float, float, dict[int, _BandSummary]] | None:
+    """Extract the trailing (actual, yhat, per-level band) tuple, or None.
+
+    Returns ``None`` if either frame is empty or missing the ``y``/``yhat``
+    columns; non-finite cells are tolerated and surface downstream as NaN.
+    """
+    if predictions.empty or test.empty:
+        return None
+    try:
+        last_actual = float(test["y"].iloc[-1])
+        last_yhat = float(predictions["yhat"].iloc[-1])
+    except (KeyError, IndexError, ValueError):
+        return None
+    bands: dict[int, _BandSummary] = {}
+    for level in levels:
+        lo_col = f"yhat_lower_{level}"
+        hi_col = f"yhat_upper_{level}"
+        if lo_col not in predictions.columns or hi_col not in predictions.columns:
+            continue
+        try:
+            lower = float(predictions[lo_col].iloc[-1])
+            upper = float(predictions[hi_col].iloc[-1])
+        except (ValueError, IndexError):
+            continue
+        bands[level] = _BandSummary(lower=lower, upper=upper)
+    return last_actual, last_yhat, bands
+
+
+def _deviation_points_for_series(
+    backtests: dict[str, _BacktestOutcome],
+    emitted_models: list[str],
+    metric_id: str,
+    base_labels: dict[str, str],
+    group: str,
+    levels: list[int],
+) -> Iterable[DeviationPoint]:
+    """Compute deviation from the most recent backtest (actual, band) pair.
+
+    The forecaster is stateless, so we use the trailing point of the
+    backtest hold-out window — the most recent in-sample point where we
+    have both an actual and a predicted band — as the canonical "is the
+    world still behaving like the model expects?" signal. One sample per
+    (series, model, level) is emitted.
+    """
+    common_labels = {k: v for k, v in base_labels.items() if k != "__name__"}
+    common_labels = {**common_labels, "id": metric_id, "group": group}
+    for model_name in emitted_models:
+        outcome = backtests.get(model_name)
+        if outcome is None:
+            continue
+        for level in levels:
+            band = outcome.last_bands.get(level)
+            if band is None:
+                continue
+            dev = deviation_mod.compute(
+                actual=outcome.last_actual,
+                yhat=outcome.last_yhat,
+                yhat_lower=band.lower,
+                yhat_upper=band.upper,
+            )
+            yield DeviationPoint(
+                labels={
+                    **common_labels,
+                    "model": model_name,
+                    "level": str(level),
+                },
+                ratio=dev.ratio,
+                outside_band=dev.outside_band,
+            )
+
+
+def _quality_points_for_series(
+    backtests: dict[str, _BacktestOutcome],
+    emitted_models: list[str],
+    metric_id: str,
+    base_labels: dict[str, str],
+    group: str,
+    train_y: list[float],
+    coverage: float,
+) -> Iterable[QualityPoint]:
+    """Compute a composite quality score per emitted (series, model).
+
+    Combines:
+      - overall MAPE across the configured accuracy horizons,
+      - the mean backtest band width relative to ``mean(|train_y|)`` (paired
+        with actuals during backtest, which is more meaningful than scoring
+        the unvalidated forward bands), and
+      - the lookback data coverage.
+
+    Models with no backtest data — typically the auto-select fallback model
+    when it isn't in the configured ``models`` list — are skipped rather
+    than scored as zero. Emitting zero quality for fallback'd series would
+    fire the ``ForecastQualityZero`` alert without signal; the
+    ``ForecastFallbackPersistent`` alert covers that case better.
+
+    See :mod:`promforecast.quality` for the exact formula.
+    """
+    import math  # noqa: PLC0415
+
+    abs_train = [abs(v) for v in train_y]
+    scale = (sum(abs_train) / len(abs_train)) if abs_train else 0.0
+
+    common_labels = {k: v for k, v in base_labels.items() if k != "__name__"}
+    common_labels = {**common_labels, "id": metric_id, "group": group}
+
+    for model_name in emitted_models:
+        outcome = backtests.get(model_name)
+        if outcome is None:
+            continue
+        mape = overall_mape(outcome.results)
+        widths = [b.width for b in outcome.last_bands.values() if math.isfinite(b.width)]
+        avg_width = sum(widths) / len(widths) if widths else float("nan")
+        band_width_relative = (
+            (avg_width / scale) if scale > 0 and math.isfinite(avg_width) else None
+        )
+        score = quality_mod.compute(
+            backtest_mape=mape,
+            band_width_relative=band_width_relative,
+            coverage=coverage,
+        )
+        yield QualityPoint(
+            labels={**common_labels, "model": model_name},
+            score=score,
+        )

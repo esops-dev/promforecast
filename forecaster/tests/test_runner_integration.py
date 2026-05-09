@@ -133,6 +133,8 @@ async def test_run_group_full_snapshot_with_canned_fit(monkeypatch: pytest.Monke
     runner = Runner(config=cfg, source=source, exporter=exporter)
 
     async def _canned(self, query, frame, group_name):  # type: ignore[no-untyped-def]
+        from promforecast.runner import _FitResult  # noqa: PLC0415
+
         points = [
             ForecastPoint(
                 metric="m_forecast",
@@ -140,7 +142,7 @@ async def test_run_group_full_snapshot_with_canned_fit(monkeypatch: pytest.Monke
                 value=42.0,
             )
         ]
-        return points, []
+        return _FitResult(points=points)
 
     monkeypatch.setattr(Runner, "_fit_series", _canned)
     await runner.run_group(cfg.groups[0])
@@ -331,6 +333,144 @@ async def test_run_group_explicit_mode_emits_one_per_model(
     assert "best_model=" not in body
     # No accuracy metrics when evaluate=false.
     assert "forecast_accuracy_mape" not in body
+
+
+@pytest.mark.asyncio
+async def test_run_group_skips_quality_for_unbacktested_fallback_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When auto-select falls back to a model that wasn't in ``models``, the
+    fallback model has no backtest data. Quality is undefined for that
+    series/model pair and we drop the sample rather than emit zero —
+    otherwise ``ForecastQualityZero`` alerts would fire for every fallback.
+    """
+    from promforecast import models as model_registry  # noqa: PLC0415
+
+    cfg = Config(
+        datasource=DatasourceConfig(url="http://x"),
+        server=ServerConfig(),
+        safety=SafetyConfig(),
+        defaults=DefaultsConfig(
+            min_points=10,
+            # Fallback (SeasonalNaive) deliberately not in ``models`` so it
+            # never gets backtested.
+            models=["AutoARIMA"],
+            confidence_levels=[80],
+            auto_select=True,
+            evaluate=True,
+            emit_quality=True,
+            emit_deviation=True,
+            fallback_model="SeasonalNaive",
+            fallback_mape_threshold=10.0,
+            accuracy_horizons=[timedelta(minutes=10)],
+        ),
+        groups=[GroupConfig(name="g", queries=[QueryConfig(id="m", promql="up")])],
+    )
+
+    def _fake_build(name: str, season_length: int) -> _FakeModel:
+        if name == "AutoARIMA":
+            return _FakeModel("AutoARIMA", value=999.0)  # bad MAPE → fallback
+        if name == "SeasonalNaive":
+            return _FakeModel("SeasonalNaive", value=42.0)
+        raise AssertionError(name)
+
+    monkeypatch.setattr(model_registry, "build", _fake_build)
+
+    source = _FakeSource({"up": [_ramp_frame(60)]})
+    exporter = Exporter()
+    runner = Runner(config=cfg, source=source, exporter=exporter)
+
+    await runner.run_group(cfg.groups[0])
+
+    body = exporter.render().decode()
+    assert 'model_fallback="true"' in body
+    # No quality_score sample for the fallback'd (SeasonalNaive) emission —
+    # the family may exist as a header from other groups, but no SeasonalNaive
+    # row should appear here.
+    assert "forecast_quality_score{" not in body
+    # And no deviation sample either — no backtest data for the fallback.
+    assert "forecast_deviation_ratio{" not in body
+    assert "forecast_deviation_outside_band{" not in body
+
+
+@pytest.mark.asyncio
+async def test_run_group_emits_deviation_and_quality_metrics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from promforecast import models as model_registry  # noqa: PLC0415
+
+    cfg = Config(
+        datasource=DatasourceConfig(url="http://x"),
+        server=ServerConfig(),
+        safety=SafetyConfig(),
+        defaults=DefaultsConfig(
+            min_points=10,
+            models=["SeasonalNaive"],
+            confidence_levels=[80],
+            auto_select=False,
+            evaluate=True,
+            emit_deviation=True,
+            emit_quality=True,
+            accuracy_horizons=[timedelta(minutes=10)],
+        ),
+        groups=[GroupConfig(name="g", queries=[QueryConfig(id="m", promql="up")])],
+    )
+    monkeypatch.setattr(
+        model_registry, "build", lambda name, season_length: _FakeModel(name, value=42.0)
+    )
+
+    source = _FakeSource({"up": [_ramp_frame(60)]})
+    exporter = Exporter()
+    runner = Runner(config=cfg, source=source, exporter=exporter)
+
+    await runner.run_group(cfg.groups[0])
+
+    body = exporter.render().decode()
+    assert "# TYPE forecast_deviation_ratio gauge" in body
+    assert "# TYPE forecast_deviation_outside_band gauge" in body
+    assert "# TYPE forecast_quality_score gauge" in body
+    assert 'level="80"' in body  # deviation carries level
+    assert 'id="m"' in body
+    assert 'group="g"' in body
+    assert 'model="SeasonalNaive"' in body
+
+
+@pytest.mark.asyncio
+async def test_run_group_emit_deviation_and_quality_disabled_suppresses_metrics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from promforecast import models as model_registry  # noqa: PLC0415
+
+    cfg = Config(
+        datasource=DatasourceConfig(url="http://x"),
+        server=ServerConfig(),
+        safety=SafetyConfig(),
+        defaults=DefaultsConfig(
+            min_points=10,
+            models=["SeasonalNaive"],
+            confidence_levels=[80],
+            auto_select=False,
+            evaluate=False,
+            emit_deviation=False,
+            emit_quality=False,
+            accuracy_horizons=[timedelta(minutes=10)],
+        ),
+        groups=[GroupConfig(name="g", queries=[QueryConfig(id="m", promql="up")])],
+    )
+    monkeypatch.setattr(
+        model_registry, "build", lambda name, season_length: _FakeModel(name, value=1.0)
+    )
+
+    source = _FakeSource({"up": [_ramp_frame(60)]})
+    exporter = Exporter()
+    runner = Runner(config=cfg, source=source, exporter=exporter)
+
+    await runner.run_group(cfg.groups[0])
+
+    body = exporter.render().decode()
+    assert "forecast_deviation_ratio" not in body
+    assert "forecast_deviation_outside_band" not in body
+    assert "forecast_quality_score" not in body
 
 
 @pytest.mark.asyncio

@@ -95,6 +95,53 @@ jobs:
         run: |
           helm template charts/promforecast       | kubeconform -strict -summary -ignore-missing-schemas
           helm template charts/promforecast-stack | kubeconform -strict -summary -ignore-missing-schemas
+          # Also validate the bundled dashboards + PrometheusRule path so CI
+          # catches regressions in the templated assets, not only the default
+          # off path.
+          helm template charts/promforecast-stack \
+              --set dashboards.enabled=true \
+              --set prometheusRules.enabled=true \
+            | kubeconform -strict -summary -ignore-missing-schemas
+
+      - name: Dashboards are valid JSON
+        run: |
+          for f in dashboards/grafana/*.json; do
+            python3 -m json.tool "$f" > /dev/null
+          done
+
+      - name: Example alerts and chart rules cover the same core alert set
+        # The standalone manifest in examples/alerts and the chart-templated
+        # PrometheusRule are intentionally separate artifacts (one for non-
+        # Helm users, one for chart users) but the *core* alert names must
+        # match — otherwise a rule added in one place silently misses the
+        # other. Per-environment template groups (suffix ``.examples``) are
+        # exempt and live only in the standalone manifest.
+        run: |
+          python3 - <<'PY'
+          import re, sys, pathlib, yaml
+          example = yaml.safe_load(pathlib.Path("examples/alerts/promforecast-rules.yaml").read_text())
+          example_alerts = {
+              r["alert"]
+              for g in example["spec"]["groups"]
+              if not g["name"].endswith(".examples")
+              for r in g["rules"]
+              if "alert" in r
+          }
+          chart_text = pathlib.Path(
+              "charts/promforecast-stack/templates/prometheusrule.yaml"
+          ).read_text()
+          chart_alerts = set(re.findall(r"^\s*-\s+alert:\s+(\S+)\s*$", chart_text, re.M))
+          missing_in_chart = example_alerts - chart_alerts
+          missing_in_example = chart_alerts - example_alerts
+          if missing_in_chart or missing_in_example:
+              print("Alert drift between examples/alerts and chart template:")
+              if missing_in_chart:
+                  print(f"  missing in chart: {sorted(missing_in_chart)}")
+              if missing_in_example:
+                  print(f"  missing in example: {sorted(missing_in_example)}")
+              sys.exit(1)
+          print(f"core alert sets match ({len(example_alerts)} alerts)")
+          PY
 
   container:
     name: Build container image
