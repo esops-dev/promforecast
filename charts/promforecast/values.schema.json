@@ -1,0 +1,112 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "title": "promforecast Helm values",
+  "description": "Schema for the promforecast forecaster chart values. The `config` block is a pass-through to the forecaster's YAML schema and is validated by pydantic at startup.",
+  "type": "object",
+  "additionalProperties": true,
+  "properties": {
+    "image": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "repository": { "type": "string", "minLength": 1 },
+        "tag": { "type": "string" },
+        "pullPolicy": {
+          "type": "string",
+          "enum": ["Always", "IfNotPresent", "Never"]
+        },
+        "pullSecrets": {
+          "type": "array",
+          "items": { "type": "object" }
+        }
+      },
+      "required": ["repository"]
+    },
+    "replicaCount": { "type": "integer", "minimum": 1, "maximum": 1 },
+    "strategy": { "type": "object" },
+    "highAvailability": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "redis": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "address": { "type": "string" },
+            "existingSecret": { "type": "string" },
+            "secretKey": { "type": "string" }
+          }
+        }
+      },
+      "if": { "properties": { "enabled": { "const": true } }, "required": ["enabled"] },
+      "then": {
+        "properties": {
+          "redis": {
+            "properties": { "address": { "minLength": 1 } },
+            "required": ["address"]
+          }
+        }
+      }
+    },
+    "existingConfigMap": { "type": "string" },
+    "config": { "type": "object" },
+    "service": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": { "type": "string", "enum": ["ClusterIP", "NodePort", "LoadBalancer"] },
+        "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "annotations": { "type": "object" }
+      }
+    },
+    "serviceMonitor": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "namespace": { "type": "string" },
+        "interval": { "type": "string" },
+        "scrapeTimeout": { "type": "string" },
+        "labels": { "type": "object" },
+        "relabelings": { "type": "array" },
+        "metricRelabelings": { "type": "array" }
+      }
+    },
+    "resources": { "type": "object" },
+    "podSecurityContext": { "type": "object" },
+    "securityContext": { "type": "object" },
+    "serviceAccount": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "create": { "type": "boolean" },
+        "name": { "type": "string" },
+        "annotations": { "type": "object" }
+      }
+    },
+    "rbac": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": { "create": { "type": "boolean" } }
+    },
+    "networkPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "egress": { "type": "array" }
+      }
+    },
+    "nodeSelector": { "type": "object" },
+    "tolerations": { "type": "array" },
+    "affinity": { "type": "object" },
+    "podAnnotations": { "type": "object" },
+    "podLabels": { "type": "object" },
+    "extraEnv": { "type": "array" },
+    "extraVolumes": { "type": "array" },
+    "extraVolumeMounts": { "type": "array" },
+    "nameOverride": { "type": "string" },
+    "fullnameOverride": { "type": "string" }
+  }
+}

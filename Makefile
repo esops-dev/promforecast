@@ -53,17 +53,20 @@ build: ## Build the forecaster container image.
 
 # ---------- Helm ----------
 
+.PHONY: chart-deps
+chart-deps: ## Resolve umbrella subchart dependencies.
+	helm dependency update $(CHART_DIR)/promforecast-stack
+
 .PHONY: chart-lint
-chart-lint: ## helm lint + kubeconform on rendered manifests.
+chart-lint: chart-deps ## helm lint + kubeconform on rendered manifests.
 	helm lint $(CHART_DIR)/promforecast
 	helm lint $(CHART_DIR)/promforecast-stack
 	helm template $(CHART_DIR)/promforecast       | kubeconform -strict -summary -ignore-missing-schemas
 	helm template $(CHART_DIR)/promforecast-stack | kubeconform -strict -summary -ignore-missing-schemas
 
-.PHONY: chart-schema
-chart-schema: ## Regenerate values.schema.json for each chart.
-	cd $(CHART_DIR)/promforecast       && helm schema-gen values.yaml > values.schema.json
-	cd $(CHART_DIR)/promforecast-stack && helm schema-gen values.yaml > values.schema.json
+# values.schema.json is hand-authored alongside values.yaml so it can express
+# constraints (enums, ranges, the v0.1 single-replica cap) that a generator
+# can't infer from a sample. Keep them in sync manually when adding fields.
 
 # ---------- Local dev ----------
 

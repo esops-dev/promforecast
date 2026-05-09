@@ -7,10 +7,38 @@ check enforces this.
 
 from __future__ import annotations
 
+import re
 from datetime import timedelta
-from typing import Literal
+from pathlib import Path
+from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+import yaml
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field
+
+from .exporter import validate_metric_name
+
+_PROM_DURATION_RE = re.compile(
+    r"^\s*(?:(\d+)d)?(?:(\d+)h)?(?:(\d+)m(?!s))?(?:(\d+)s)?(?:(\d+)ms)?\s*$"
+)
+
+
+def _parse_duration(value: object) -> object:
+    """Accept Prometheus-style durations (``5m``, ``1h``, ``14d``).
+
+    Pydantic's native timedelta parser only accepts ISO-8601 ("PT5M") and
+    seconds. The Prometheus ecosystem uses the compact form everywhere, so
+    config files become unfriendly without this coercion.
+    """
+    if not isinstance(value, str):
+        return value
+    match = _PROM_DURATION_RE.match(value)
+    if not match or not any(match.groups()):
+        return value  # let pydantic emit its native error
+    days, hours, minutes, seconds, millis = (int(g) if g else 0 for g in match.groups())
+    return timedelta(days=days, hours=hours, minutes=minutes, seconds=seconds, milliseconds=millis)
+
+
+Duration = Annotated[timedelta, BeforeValidator(_parse_duration)]
 
 
 class AuthConfig(BaseModel):
@@ -23,7 +51,7 @@ class DatasourceConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     url: str
-    timeout: timedelta = timedelta(seconds=30)
+    timeout: Duration = timedelta(seconds=30)
     auth: AuthConfig = AuthConfig()
 
 
@@ -38,26 +66,36 @@ class ServerConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     listen: str = ":9091"
-    refresh_interval: timedelta = timedelta(hours=1)
+    refresh_interval: Duration = timedelta(hours=1)
     reload: ReloadConfig = ReloadConfig()
 
 
 class SafetyConfig(BaseModel):
+    """Cardinality and resource guards.
+
+    ``max_series_per_query`` is enforced **client-side**, after the TSDB
+    response is parsed. A query that returns many more series than the cap
+    still costs bandwidth and a brief memory spike; if you expect runaway
+    cardinality, use a ``topk(N, ...)`` wrapper in your PromQL. This is
+    deliberate: server-side ``?limit=`` parameters are non-standard and
+    differ between Prometheus / VictoriaMetrics / Mimir.
+    """
+
     model_config = ConfigDict(extra="forbid")
 
     max_series_per_query: int = 500
     max_total_series: int = 5000
     series_overflow: Literal["drop_lowest_priority", "reject", "sample"] = "drop_lowest_priority"
-    fit_timeout: timedelta = timedelta(seconds=60)
-    query_timeout: timedelta = timedelta(seconds=30)
+    fit_timeout: Duration = timedelta(seconds=60)
+    query_timeout: Duration = timedelta(seconds=30)
 
 
 class DefaultsConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    lookback: timedelta = timedelta(days=14)
-    step: timedelta = timedelta(minutes=5)
-    horizon: timedelta = timedelta(hours=24)
+    lookback: Duration = timedelta(days=14)
+    step: Duration = timedelta(minutes=5)
+    horizon: Duration = timedelta(hours=24)
     models: list[str] = Field(default_factory=lambda: ["AutoARIMA", "SeasonalNaive"])
     season_length: int = 288
     confidence_levels: list[int] = Field(default_factory=lambda: [80, 95])
@@ -105,6 +143,24 @@ class Config(BaseModel):
     groups: list[GroupConfig]
 
 
-def load(path: str) -> Config:
-    """Load and validate a YAML config file."""
-    raise NotImplementedError
+def load(path: str | Path) -> Config:
+    """Load and validate a YAML config file.
+
+    Validates that all query IDs are usable as Prometheus metric names —
+    output names are derived as ``<id>_forecast`` and rejecting bad IDs at
+    boot is much friendlier than failing on first scrape. Auth modes other
+    than ``none`` are accepted by the schema (so configs stay forward-
+    compatible) but rejected here so a misconfigured ``bearer`` doesn't
+    silently send unauthenticated requests.
+    """
+    raw = yaml.safe_load(Path(path).read_text())
+    config = Config.model_validate(raw)
+    if config.datasource.auth.type != "none":
+        raise NotImplementedError(
+            f"datasource.auth.type={config.datasource.auth.type!r} is not implemented in v0.1; "
+            "only 'none' is supported"
+        )
+    for group in config.groups:
+        for query in group.queries:
+            validate_metric_name(query.id)
+    return config
