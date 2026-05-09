@@ -17,9 +17,10 @@ helm install pf promforecast/promforecast-stack
 
 The forecaster writes points with future timestamps. VictoriaMetrics drops
 those by default; this chart sets
-`victoria-metrics-single.server.extraArgs.futureRetention: "24h"` so they're
-accepted. **Tune this higher than your longest configured forecast horizon
-or your longest forecasts will be silently dropped.**
+`victoria-metrics-single.server.extraArgs.futureRetention: "2d"` so they're
+accepted (VM enforces a 2-day minimum). **Tune this higher than your longest
+configured forecast horizon or your longest forecasts will be silently
+dropped.**
 
 ## Subchart toggles
 

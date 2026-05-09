@@ -69,7 +69,7 @@ chart-schema: ## Regenerate values.schema.json for each chart.
 
 .PHONY: dev-up
 dev-up: ## Start VictoriaMetrics + node-exporter + Prometheus + forecaster locally.
-	docker compose -f docker-compose.dev.yml up --build
+	docker compose -f docker-compose.dev.yml up -d --build
 
 .PHONY: dev-down
 dev-down: ## Stop the local dev stack.
