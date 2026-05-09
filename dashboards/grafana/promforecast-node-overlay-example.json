@@ -1,0 +1,417 @@
+{
+  "title": "promforecast — Node overlay (example)",
+  "uid": "promforecast-node-overlay",
+  "description": "Example: how a typical node CPU/memory dashboard looks once forecasts are layered on. With only the snapshot exporter (no remote_write yet), the trick is to plot the forecast metric with `offset <horizon>` so 'predicted-30m-ago' aligns on the X axis with 'actual now'. Where they track each other, the model is calibrated; where they diverge, that's prediction error. v0.3 remote_write will add real forecast curves projected into the future.",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "tags": ["promforecast", "forecasting", "node", "example"],
+  "timezone": "",
+  "time": { "from": "now-1h", "to": "now" },
+  "refresh": "30s",
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": {}
+      },
+      {
+        "name": "instance",
+        "type": "query",
+        "datasource": { "type": "prometheus", "uid": "${datasource}" },
+        "query": "label_values(node_cpu_busy_pct_forecast, instance)",
+        "refresh": 2,
+        "includeAll": true,
+        "multi": true,
+        "current": { "text": "All", "value": "$__all" }
+      }
+    ]
+  },
+  "annotations": {
+    "list": [
+      {
+        "name": "Outside band",
+        "datasource": { "type": "prometheus", "uid": "${datasource}" },
+        "enable": true,
+        "iconColor": "red",
+        "expr": "forecast_deviation_outside_band{instance=~\"$instance\",level=\"95\"} == 1 and on(instance,id,model) forecast_quality_score > 0",
+        "titleFormat": "Outside 95% band",
+        "tagKeys": "id,instance,model"
+      }
+    ]
+  },
+  "panels": [
+    {
+      "type": "row",
+      "id": 100,
+      "title": "Now vs. predicted (+30m)",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
+      "collapsed": false
+    },
+    {
+      "type": "stat",
+      "id": 1,
+      "title": "CPU now",
+      "description": "Live CPU busy %, computed from node_cpu_seconds_total exactly as a normal node-exporter dashboard would.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 5, "w": 6, "x": 0, "y": 1 },
+      "targets": [
+        {
+          "expr": "100 - (avg by (instance)(rate(node_cpu_seconds_total{mode=\"idle\",instance=~\"$instance\"}[2m])) * 100)",
+          "legendFormat": "{{instance}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 60 },
+              { "color": "red", "value": 85 }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "stat",
+      "id": 2,
+      "title": "CPU in +30m (predicted)",
+      "description": "What the AutoARIMA model thinks CPU will be 30 minutes from now. Single-point snapshot — every refresh_interval the forecaster re-fits and overwrites this value.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 5, "w": 6, "x": 6, "y": 1 },
+      "targets": [
+        {
+          "expr": "node_cpu_busy_pct_forecast{instance=~\"$instance\",model=\"AutoARIMA\"}",
+          "legendFormat": "{{instance}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 60 },
+              { "color": "red", "value": 85 }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "stat",
+      "id": 3,
+      "title": "Memory now",
+      "description": "Live memory in use.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 5, "w": 6, "x": 12, "y": 1 },
+      "targets": [
+        {
+          "expr": "node_memory_MemTotal_bytes{instance=~\"$instance\"} - node_memory_MemAvailable_bytes{instance=~\"$instance\"}",
+          "legendFormat": "{{instance}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "bytes" },
+        "overrides": []
+      }
+    },
+    {
+      "type": "stat",
+      "id": 4,
+      "title": "Memory in +30m (predicted)",
+      "description": "Predicted memory usage 30 minutes ahead.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 5, "w": 6, "x": 18, "y": 1 },
+      "targets": [
+        {
+          "expr": "node_memory_used_bytes_forecast{instance=~\"$instance\",model=\"AutoARIMA\"}",
+          "legendFormat": "{{instance}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "bytes" },
+        "overrides": []
+      }
+    },
+
+    {
+      "type": "row",
+      "id": 200,
+      "title": "Forecast trustworthiness",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 6 },
+      "collapsed": false
+    },
+    {
+      "type": "gauge",
+      "id": 5,
+      "title": "Quality score — CPU",
+      "description": "0..1 composite of MAPE, band width, and data coverage. Anything < 0.4 means: do not trust this forecast. Anything > 0.7 is solid.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 6, "w": 8, "x": 0, "y": 7 },
+      "targets": [
+        {
+          "expr": "forecast_quality_score{id=\"node_cpu_busy_pct\",instance=~\"$instance\"}",
+          "legendFormat": "{{instance}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "min": 0,
+          "max": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "yellow", "value": 0.4 },
+              { "color": "green", "value": 0.7 }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "gauge",
+      "id": 6,
+      "title": "Quality score — Memory",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 6, "w": 8, "x": 8, "y": 7 },
+      "targets": [
+        {
+          "expr": "forecast_quality_score{id=\"node_memory_used_bytes\",instance=~\"$instance\"}",
+          "legendFormat": "{{instance}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "min": 0,
+          "max": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "yellow", "value": 0.4 },
+              { "color": "green", "value": 0.7 }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "stat",
+      "id": 7,
+      "title": "Auto-select winners",
+      "description": "Which model the auto-selector picked per series. ``model_fallback=true`` means the configured fallback model is being used because the configured models all backtested poorly.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 6, "w": 8, "x": 16, "y": 7 },
+      "targets": [
+        {
+          "expr": "node_cpu_busy_pct_forecast{instance=~\"$instance\"}",
+          "instant": true,
+          "format": "table",
+          "legendFormat": "{{id}} {{instance}} → {{model}} (fallback={{model_fallback}})"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "none" },
+        "overrides": []
+      },
+      "options": { "textMode": "name", "graphMode": "none" }
+    },
+
+    {
+      "type": "row",
+      "id": 300,
+      "title": "CPU: actual vs predicted (offset overlay)",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 13 },
+      "collapsed": false
+    },
+    {
+      "type": "timeseries",
+      "id": 8,
+      "title": "CPU — actual now vs. what was predicted 30m ago for now",
+      "description": "Solid line: actual CPU at time T. Dashed line: the forecast MADE at T-30m, i.e. 'what the model thought CPU would be at T'. The two should track each other when the model is calibrated. The shaded area is the 95% confidence band, also offset by 30m. Vertical red lines (annotations) mark times when the actual fell outside the 95% band — gated by quality > 0 to suppress noise from poor fits.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 14 },
+      "targets": [
+        {
+          "expr": "100 - (avg by (instance)(rate(node_cpu_seconds_total{mode=\"idle\",instance=~\"$instance\"}[2m])) * 100)",
+          "legendFormat": "actual {{instance}}",
+          "refId": "A"
+        },
+        {
+          "expr": "node_cpu_busy_pct_forecast{instance=~\"$instance\",model=\"AutoARIMA\"} offset 30m",
+          "legendFormat": "predicted-30m-ago {{instance}}",
+          "refId": "B"
+        },
+        {
+          "expr": "node_cpu_busy_pct_forecast_lower{instance=~\"$instance\",model=\"AutoARIMA\",level=\"95\"} offset 30m",
+          "legendFormat": "lower 95% {{instance}}",
+          "refId": "C"
+        },
+        {
+          "expr": "node_cpu_busy_pct_forecast_upper{instance=~\"$instance\",model=\"AutoARIMA\",level=\"95\"} offset 30m",
+          "legendFormat": "upper 95% {{instance}}",
+          "refId": "D"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "percent" },
+        "overrides": [
+          {
+            "matcher": { "id": "byRegexp", "options": ".*predicted-30m-ago.*" },
+            "properties": [
+              { "id": "custom.lineStyle", "value": { "fill": "dash", "dash": [10, 10] } },
+              { "id": "custom.lineWidth", "value": 2 }
+            ]
+          },
+          {
+            "matcher": { "id": "byRegexp", "options": ".*lower 95%.*" },
+            "properties": [
+              { "id": "custom.lineWidth", "value": 0 },
+              { "id": "custom.fillOpacity", "value": 0 }
+            ]
+          },
+          {
+            "matcher": { "id": "byRegexp", "options": ".*upper 95%.*" },
+            "properties": [
+              { "id": "custom.lineWidth", "value": 0 },
+              { "id": "custom.fillOpacity", "value": 15 },
+              { "id": "custom.fillBelowTo", "value": "lower 95% " }
+            ]
+          }
+        ]
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom" } }
+    },
+
+    {
+      "type": "row",
+      "id": 400,
+      "title": "Memory: actual vs predicted (offset overlay)",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 24 },
+      "collapsed": false
+    },
+    {
+      "type": "timeseries",
+      "id": 9,
+      "title": "Memory — actual now vs. what was predicted 30m ago for now",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 25 },
+      "targets": [
+        {
+          "expr": "node_memory_MemTotal_bytes{instance=~\"$instance\"} - node_memory_MemAvailable_bytes{instance=~\"$instance\"}",
+          "legendFormat": "actual {{instance}}",
+          "refId": "A"
+        },
+        {
+          "expr": "node_memory_used_bytes_forecast{instance=~\"$instance\",model=\"AutoARIMA\"} offset 30m",
+          "legendFormat": "predicted-30m-ago {{instance}}",
+          "refId": "B"
+        },
+        {
+          "expr": "node_memory_used_bytes_forecast_lower{instance=~\"$instance\",model=\"AutoARIMA\",level=\"95\"} offset 30m",
+          "legendFormat": "lower 95% {{instance}}",
+          "refId": "C"
+        },
+        {
+          "expr": "node_memory_used_bytes_forecast_upper{instance=~\"$instance\",model=\"AutoARIMA\",level=\"95\"} offset 30m",
+          "legendFormat": "upper 95% {{instance}}",
+          "refId": "D"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "bytes" },
+        "overrides": [
+          {
+            "matcher": { "id": "byRegexp", "options": ".*predicted-30m-ago.*" },
+            "properties": [
+              { "id": "custom.lineStyle", "value": { "fill": "dash", "dash": [10, 10] } },
+              { "id": "custom.lineWidth", "value": 2 }
+            ]
+          },
+          {
+            "matcher": { "id": "byRegexp", "options": ".*lower 95%.*" },
+            "properties": [
+              { "id": "custom.lineWidth", "value": 0 },
+              { "id": "custom.fillOpacity", "value": 0 }
+            ]
+          },
+          {
+            "matcher": { "id": "byRegexp", "options": ".*upper 95%.*" },
+            "properties": [
+              { "id": "custom.lineWidth", "value": 0 },
+              { "id": "custom.fillOpacity", "value": 15 },
+              { "id": "custom.fillBelowTo", "value": "lower 95% " }
+            ]
+          }
+        ]
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom" } }
+    },
+
+    {
+      "type": "row",
+      "id": 500,
+      "title": "Forecast diagnostics over time",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 35 },
+      "collapsed": false
+    },
+    {
+      "type": "timeseries",
+      "id": 10,
+      "title": "MAPE by horizon (lower is better)",
+      "description": "Backtest MAPE per (model, horizon). A spike here means the model lost calibration — investigate before trusting the forward forecast.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 36 },
+      "targets": [
+        {
+          "expr": "forecast_accuracy_mape{instance=~\"$instance\",model=\"AutoARIMA\"}",
+          "legendFormat": "{{id}} @{{horizon}} {{instance}}"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "percent" }, "overrides": [] }
+    },
+    {
+      "type": "timeseries",
+      "id": 11,
+      "title": "Deviation ratio (signed)",
+      "description": "How far the most recent actual sits from the forecast band centre, normalised by band width. ±0.5 = at the edge of the band; |x| > 0.5 = outside; 0 = perfectly on the forecast.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 36 },
+      "targets": [
+        {
+          "expr": "forecast_deviation_ratio{instance=~\"$instance\",level=\"95\",model=\"AutoARIMA\"}",
+          "legendFormat": "{{id}} {{instance}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "custom": { "thresholdsStyle": { "mode": "line" } },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "orange", "value": 0.5 },
+              { "color": "red", "value": 2 }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    }
+  ]
+}

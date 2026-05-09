@@ -1,6 +1,7 @@
-# Local-dev override of examples/configs/node-capacity.yaml with a small
-# min_points so forecasts produce output before VM has accumulated lookback's
-# worth of data. Not intended for any non-development use.
+# Local-dev config: short lookback, fast refresh, low min_points so forecasts
+# produce output minutes after the stack starts (instead of after 14 days).
+# Backtesting and the deviation/quality emitters are on so the bundled
+# Grafana dashboards have data to show. Not intended for any non-dev use.
 
 datasource:
   url: http://victoriametrics:8428/
@@ -8,7 +9,7 @@ datasource:
 
 server:
   listen: ":9091"
-  refresh_interval: 5m
+  refresh_interval: 1m
 
 # Tight caps to exercise overflow handling end-to-end in dev.
 safety:
@@ -21,14 +22,26 @@ safety:
 defaults:
   lookback: 2h
   step: 1m
-  horizon: 1h
-  models: [SeasonalNaive]
-  season_length: 60          # 1m step → hourly seasonality
+  horizon: 30m
+  models: [AutoARIMA, SeasonalNaive]
+  # Short, physically meaningless seasonality so SeasonalNaive can fit on
+  # the small warm-up window (it needs at least one full season). Production
+  # configs use 288 (5-min step → daily seasonality).
+  season_length: 15
   confidence_levels: [80, 95]
+  # ~30 min of data before the first fit. With step=1m that's fast enough
+  # to validate the dashboards without waiting for production-scale lookback.
   min_points: 30
-  evaluate: false
-  emit_deviation: false
-  emit_quality: false
+  # Backtest hold-out is max(horizon) = 15 steps. min_points=30 guarantees
+  # backtests run on the very first fit, so accuracy/deviation/quality
+  # metrics start flowing immediately.
+  accuracy_horizons: [3m, 5m, 15m]
+  evaluate: true
+  auto_select: true
+  fallback_model: SeasonalNaive
+  fallback_mape_threshold: 50
+  emit_deviation: true
+  emit_quality: true
 
 groups:
   - name: node_capacity

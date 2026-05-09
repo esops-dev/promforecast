@@ -63,6 +63,17 @@ chart-lint: chart-deps ## helm lint + kubeconform on rendered manifests.
 	helm lint $(CHART_DIR)/promforecast-stack
 	helm template $(CHART_DIR)/promforecast       | kubeconform -strict -summary -ignore-missing-schemas
 	helm template $(CHART_DIR)/promforecast-stack | kubeconform -strict -summary -ignore-missing-schemas
+	helm template $(CHART_DIR)/promforecast-stack \
+	    --set dashboards.enabled=true \
+	    --set prometheusRules.enabled=true \
+	  | kubeconform -strict -summary -ignore-missing-schemas
+	@for f in dashboards/grafana/*.json; do python3 -m json.tool "$$f" > /dev/null; done
+	@echo "dashboards JSON ok"
+	@python3 -c "import re,sys,pathlib,yaml; \
+e=yaml.safe_load(pathlib.Path('examples/alerts/promforecast-rules.yaml').read_text()); \
+ex={r['alert'] for g in e['spec']['groups'] if not g['name'].endswith('.examples') for r in g['rules'] if 'alert' in r}; \
+ch=set(re.findall(r'^\s*-\s+alert:\s+(\S+)\s*\$$', pathlib.Path('charts/promforecast-stack/templates/prometheusrule.yaml').read_text(), re.M)); \
+sys.exit(f'alert drift: chart {sorted(ch-ex) or \"-\"}, example {sorted(ex-ch) or \"-\"}') if ex^ch else print(f'alert sets match ({len(ex)})')"
 
 # values.schema.json is hand-authored alongside values.yaml so it can express
 # constraints (enums, ranges, the current single-replica cap) that a generator
@@ -77,6 +88,23 @@ dev-up: ## Start VictoriaMetrics + node-exporter + Prometheus + forecaster local
 .PHONY: dev-down
 dev-down: ## Stop the local dev stack.
 	docker compose -f docker-compose.dev.yml down -v
+
+.PHONY: dev-validate
+dev-validate: ## Sanity-check the running dev stack: forecaster fits and exposes all metric families.
+	@echo ">> forecaster /metrics summary"
+	@python3 -c "import urllib.request as u; \
+b=u.urlopen('http://localhost:9091/metrics').read().decode(); \
+fams=sorted({l.split()[2] for l in b.splitlines() if l.startswith('# TYPE forecast') or l.startswith('# TYPE node_')}); \
+[print(f'  {f}') for f in fams]; \
+need={'forecast_accuracy_mape','forecast_quality_score','forecast_deviation_ratio','forecast_deviation_outside_band'}; \
+missing=need-set(fams); \
+exit(f'!! missing: {sorted(missing)} -- the forecaster has not produced its first fit yet, wait one refresh_interval and retry') if missing else print('>> all expected metric families present')"
+	@echo ">> Prometheus has scraped the forecaster"
+	@python3 -c "import urllib.request as u, json; \
+r=json.loads(u.urlopen('http://localhost:9090/api/v1/query?query=forecast_accuracy_mape').read())['data']['result']; \
+print(f'  forecast_accuracy_mape: {len(r)} series'); \
+exit('!! Prometheus has 0 series - check the prometheus scrape config and forecaster reachability') if not r else None"
+	@echo ">> dashboards reachable in Grafana at http://localhost:3000 (admin / admin)"
 
 .PHONY: load-test
 load-test: ## Synthetic high-cardinality run for safety-control validation.

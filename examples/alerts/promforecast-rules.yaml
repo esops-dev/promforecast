@@ -10,6 +10,7 @@ spec:
     - name: promforecast.operational
       interval: 1m
       rules:
+        # Forecaster has not produced a successful run in over 2h.
         - alert: ForecastStale
           expr: time() - forecast_last_run_timestamp_seconds > 7200
           for: 10m
@@ -22,6 +23,9 @@ spec:
               {{ $labels.group }} in over 2 hours. Check pod logs and
               datasource availability.
 
+        # Backtest accuracy has degraded — model needs retraining or
+        # replacement. Threshold is intentionally loose; tune for the SLOs
+        # of the metrics being forecasted.
         - alert: ForecastModelDegraded
           expr: forecast_accuracy_mape > 30
           for: 24h
@@ -31,9 +35,13 @@ spec:
             summary: "Forecast accuracy degraded for {{ $labels.id }} (MAPE > 30%)"
             description: |
               Backtest MAPE for {{ $labels.id }} model {{ $labels.model }}
-              has exceeded 30% for 24h. Consider retraining, switching
-              models, or extending the lookback window.
+              at horizon {{ $labels.horizon }} has exceeded 30% for 24h.
+              Consider retraining, switching models, or extending the
+              lookback window.
 
+        # The exporter keeps falling back to the configured fallback model,
+        # which means the configured `models:` list isn't a good fit for
+        # this data. Symptom of mis-configuration, not an outage.
         - alert: ForecastFallbackPersistent
           expr: count by (group) (forecast_quality_score{model_fallback="true"}) > 0
           for: 6h
@@ -46,21 +54,76 @@ spec:
               back to the configured fallback model for 6h. The configured
               models are likely a poor fit for this data.
 
+        # Persistently low quality across a group: forecasts shouldn't be
+        # trusted for alerting. Tune the threshold; 0.4 is a useful default.
+        - alert: ForecastQualityLow
+          expr: avg by (group) (forecast_quality_score) < 0.4
+          for: 6h
+          labels:
+            severity: info
+          annotations:
+            summary: "Average forecast quality for group {{ $labels.group }} is low"
+            description: |
+              Average forecast_quality_score for group {{ $labels.group }}
+              is below 0.4 for 6h. Treat downstream forecast-based alerts
+              with caution and investigate model fit, band width, and
+              data coverage.
+
+        # Quality score is composed multiplicatively from MAPE / band /
+        # coverage; if it sticks at zero for a single series for hours,
+        # the inputs are likely degenerate (no MAPE, all-zero data).
+        - alert: ForecastQualityZero
+          expr: forecast_quality_score == 0
+          for: 1h
+          labels:
+            severity: info
+          annotations:
+            summary: "Forecast quality is 0 for {{ $labels.id }} ({{ $labels.model }})"
+            description: |
+              forecast_quality_score for {{ $labels.id }}
+              ({{ $labels.model }}) has been zero for 1h. The model is
+              likely producing meaningless output for this series; check
+              data coverage and band width.
+
     - name: promforecast.deviation
       interval: 1m
       rules:
+        # Anomaly-detection signal: the actual is outside its forecast
+        # band. Gated on quality so poor forecasts don't fire false
+        # positives. Tune `for:` and the quality threshold to your noise
+        # tolerance.
         - alert: ForecastDeviation
-          # Gated on quality so poor forecasts don't fire false positives.
-          expr: forecast_deviation_outside_band == 1 and on (id, group) forecast_quality_score > 0.6
+          expr: |
+            forecast_deviation_outside_band == 1
+            and on (id, group, model) forecast_quality_score > 0.6
           for: 15m
           labels:
             severity: warning
           annotations:
             summary: "Actual {{ $labels.id }} is outside its forecast band"
             description: |
-              {{ $labels.id }} (group {{ $labels.group }}) has been outside
-              its forecast confidence band for 15m. Quality score for this
-              series is above 0.6, so the deviation is likely meaningful.
+              {{ $labels.id }} (group {{ $labels.group }}, model
+              {{ $labels.model }}, level {{ $labels.level }}) has been
+              outside its forecast confidence band for 15m. Quality score
+              for this series is above 0.6, so the deviation is likely
+              meaningful.
+
+        # Stronger signal: actual is far outside the band (|ratio| > 2 means
+        # it's a full band-width past the edge). Good candidate for paging.
+        - alert: ForecastDeviationSevere
+          expr: |
+            abs(forecast_deviation_ratio) > 2
+            and on (id, group, model) forecast_quality_score > 0.6
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Actual {{ $labels.id }} is far outside its forecast band"
+            description: |
+              {{ $labels.id }} (group {{ $labels.group }}, model
+              {{ $labels.model }}, level {{ $labels.level }}) has a
+              deviation ratio with magnitude above 2 for 5m. The actual is
+              well past the edge of the high-confidence forecast band.
 
     - name: promforecast.capacity.examples
       interval: 5m

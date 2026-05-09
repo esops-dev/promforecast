@@ -1,0 +1,176 @@
+{
+  "title": "promforecast — Accuracy",
+  "uid": "promforecast-accuracy",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "tags": ["promforecast", "forecasting", "accuracy"],
+  "timezone": "",
+  "time": { "from": "now-7d", "to": "now" },
+  "refresh": "5m",
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": {}
+      },
+      {
+        "name": "group",
+        "type": "query",
+        "datasource": { "type": "prometheus", "uid": "${datasource}" },
+        "query": "label_values(forecast_accuracy_mape, group)",
+        "refresh": 2,
+        "includeAll": true,
+        "multi": true
+      },
+      {
+        "name": "id",
+        "type": "query",
+        "datasource": { "type": "prometheus", "uid": "${datasource}" },
+        "query": "label_values(forecast_accuracy_mape{group=~\"$group\"}, id)",
+        "refresh": 2,
+        "includeAll": true,
+        "multi": true
+      },
+      {
+        "name": "model",
+        "type": "query",
+        "datasource": { "type": "prometheus", "uid": "${datasource}" },
+        "query": "label_values(forecast_accuracy_mape{group=~\"$group\",id=~\"$id\"}, model)",
+        "refresh": 2,
+        "includeAll": true,
+        "multi": true
+      }
+    ]
+  },
+  "panels": [
+    {
+      "type": "stat",
+      "id": 1,
+      "title": "Median MAPE (24h horizon)",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 6, "w": 8, "x": 0, "y": 0 },
+      "targets": [
+        {
+          "expr": "quantile(0.5, forecast_accuracy_mape{group=~\"$group\",id=~\"$id\",model=~\"$model\",horizon=\"24h\"})",
+          "legendFormat": "median MAPE"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 15 },
+              { "color": "red", "value": 30 }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "stat",
+      "id": 2,
+      "title": "p90 MAPE (24h horizon)",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 6, "w": 8, "x": 8, "y": 0 },
+      "targets": [
+        {
+          "expr": "quantile(0.9, forecast_accuracy_mape{group=~\"$group\",id=~\"$id\",model=~\"$model\",horizon=\"24h\"})",
+          "legendFormat": "p90 MAPE"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 25 },
+              { "color": "red", "value": 50 }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "stat",
+      "id": 3,
+      "title": "Series tracked",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 6, "w": 8, "x": 16, "y": 0 },
+      "targets": [
+        {
+          "expr": "sum(forecast_series_count{group=~\"$group\"})",
+          "legendFormat": "series"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "none" },
+        "overrides": []
+      }
+    },
+    {
+      "type": "timeseries",
+      "id": 4,
+      "title": "MAPE by horizon",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 6 },
+      "targets": [
+        {
+          "expr": "avg by (horizon) (forecast_accuracy_mape{group=~\"$group\",id=~\"$id\",model=~\"$model\"})",
+          "legendFormat": "{{horizon}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "percent" },
+        "overrides": []
+      }
+    },
+    {
+      "type": "timeseries",
+      "id": 5,
+      "title": "MASE by model",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 6 },
+      "targets": [
+        {
+          "expr": "avg by (model) (forecast_accuracy_mase{group=~\"$group\",id=~\"$id\",model=~\"$model\"})",
+          "legendFormat": "{{model}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "none" },
+        "overrides": []
+      }
+    },
+    {
+      "type": "table",
+      "id": 6,
+      "title": "Worst-performing series (24h MAPE)",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 9, "w": 24, "x": 0, "y": 15 },
+      "targets": [
+        {
+          "expr": "topk(20, forecast_accuracy_mape{group=~\"$group\",id=~\"$id\",model=~\"$model\",horizon=\"24h\"})",
+          "instant": true,
+          "format": "table"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "percent" },
+        "overrides": []
+      },
+      "transformations": [
+        { "id": "organize", "options": { "excludeByName": { "Time": true, "__name__": true } } }
+      ]
+    }
+  ]
+}
