@@ -125,7 +125,7 @@ async def test_run_group_records_fit_duration_metric(monkeypatch: pytest.MonkeyP
                 out[f"yhat_upper_{level}"] = 2.0
             return out
 
-    monkeypatch.setattr(model_registry, "build", lambda name, season_length: _Fake())
+    monkeypatch.setattr(model_registry, "build", lambda name, season_length, params=None: _Fake())
 
     cfg = _config()
     exporter = Exporter()
@@ -183,7 +183,9 @@ async def test_slow_fit_threshold_increments_counter(monkeypatch: pytest.MonkeyP
                 out[f"yhat_upper_{level}"] = 2.0
             return out
 
-    monkeypatch.setattr(model_registry, "build", lambda name, season_length: _SlowFake())
+    monkeypatch.setattr(
+        model_registry, "build", lambda name, season_length, params=None: _SlowFake()
+    )
 
     cfg = _config()
     # Make the slow-fit threshold trivially crossable: any fit over 0s is
@@ -244,7 +246,7 @@ async def test_slow_fits_counter_prunes_removed_query_labels(
                 out[f"yhat_upper_{level}"] = 2.0
             return out
 
-    monkeypatch.setattr(model_registry, "build", lambda name, season_length: _Fake())
+    monkeypatch.setattr(model_registry, "build", lambda name, season_length, params=None: _Fake())
     monkeypatch.setattr(runner_module, "SLOW_FIT_RATIO", 0.0)
 
     cfg = Config(
@@ -322,7 +324,7 @@ async def test_slow_fits_counter_is_monotonic_across_runs(
                 out[f"yhat_upper_{level}"] = 2.0
             return out
 
-    monkeypatch.setattr(model_registry, "build", lambda name, season_length: _Fake())
+    monkeypatch.setattr(model_registry, "build", lambda name, season_length, params=None: _Fake())
 
     cfg = _config()
     cfg.safety.fit_timeout = timedelta(seconds=5)

@@ -48,6 +48,9 @@ config:
     lookback: 14d
     step: 5m
     horizon: 24h
+    # Models can be plain names, or `{ name: ..., params: ... }` for power
+    # users who want to override individual model hyperparameters. Both
+    # forms can be mixed in the same list.
     models: [AutoARIMA, SeasonalNaive]
     season_length: 288
     confidence_levels: [80, 95]
@@ -55,12 +58,30 @@ config:
     accuracy:
       evaluate: true
       horizons: [1h, 6h, 24h]
+      # `false` (default) | `true` (single winner) | `ensemble` (weighted
+      # combo of every configured model, plus the components).
       auto_select: false
       fallback_model: SeasonalNaive
       fallback_mape_threshold: 50
     emission:
       deviation: true
       quality: true
+
+  # Optional remote_write sink: writes the *full* forecast curve to a TSDB
+  # with future timestamps. The /metrics exporter remains the pull default
+  # and is unaffected. Requires a TSDB that accepts forward-dated samples
+  # (VictoriaMetrics with -futureRetention=2d, Mimir, Thanos receive). The
+  # default endpoint shape targets VictoriaMetrics' text-import endpoint.
+  sink:
+    remote_write:
+      enabled: false
+      url: ""    # e.g. http://victoriametrics:8428/api/v1/import/prometheus
+      timeout: 30s
+      # Rows per HTTP request body. Default keeps each POST well under the
+      # typical TSDB ingest cap; tighten for shops behind aggressive
+      # ingress proxies or when push latency matters.
+      chunk_size: 10000
+      headers: {}
 
   groups: []
 

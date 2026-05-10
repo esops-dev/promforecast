@@ -32,6 +32,7 @@ if TYPE_CHECKING:
 __all__ = [
     "AccuracyPoint",
     "DeviationPoint",
+    "EnsembleWeightPoint",
     "Exporter",
     "ForecastPoint",
     "GroupSnapshot",
@@ -88,6 +89,19 @@ class QualityPoint:
     score: float
 
 
+@dataclass(frozen=True)
+class EnsembleWeightPoint:
+    """Per-model contribution weight inside an ensemble forecast.
+
+    Rendered as ``forecast_ensemble_weight`` (gauge, 0..1). One sample per
+    (series, model) when ``accuracy.auto_select == "ensemble"``; absent
+    otherwise.
+    """
+
+    labels: dict[str, str]
+    weight: float
+
+
 @dataclass
 class GroupSnapshot:
     """The most recent successful forecast output for one group."""
@@ -97,6 +111,7 @@ class GroupSnapshot:
     accuracy_points: list[AccuracyPoint] = field(default_factory=list)
     deviation_points: list[DeviationPoint] = field(default_factory=list)
     quality_points: list[QualityPoint] = field(default_factory=list)
+    ensemble_weights: list[EnsembleWeightPoint] = field(default_factory=list)
     last_run_timestamp: float = 0.0
     run_duration_seconds: float = 0.0
     series_count: int = 0
@@ -107,6 +122,11 @@ class GroupSnapshot:
     #   query_error, fit_error, invalid_metric_name, group_error,
     #   fit_timeout
     failures: dict[str, int] = field(default_factory=dict)
+    # Per-(query, regressor_id, reason) regressor-resolution failure
+    # counter. Surfaces as ``forecast_regressor_failures_total`` so a flaky
+    # exogenous regressor can be alerted on without polluting the generic
+    # ``forecast_failures_total`` series.
+    regressor_failures: dict[tuple[str, str, str], int] = field(default_factory=dict)
     # Per-(query, model) fit duration in seconds (most recent run). Used to
     # render ``forecast_fit_duration_seconds`` so operators can spot a slow
     # model on a specific query without scraping logs.
@@ -129,6 +149,10 @@ class Exporter:
         self._reload_timestamp: float = 0.0
         self._reload_success: bool = True
         self._reload_failures: int = 0
+        # Per-(group, reason) push-sink failure counter. The reason set is
+        # bounded by the sink (``timeout``, ``http_error``, ``encode_error``)
+        # so cardinality is small and predictable.
+        self._remote_write_failures: dict[tuple[str, str], int] = {}
         self._registry = CollectorRegistry()
         self._registry.register(_SnapshotCollector(self))
 
@@ -173,6 +197,12 @@ class Exporter:
         with self._lock:
             self._reload_failures += 1
 
+    def increment_remote_write_failure(self, group: str, reason: str) -> None:
+        """Bump the remote_write push-sink failure counter for ``group``."""
+        with self._lock:
+            key = (group, reason)
+            self._remote_write_failures[key] = self._remote_write_failures.get(key, 0) + 1
+
     def render(self) -> bytes:
         """Render the current snapshot in Prometheus exposition format."""
         return generate_latest(self._registry)
@@ -195,6 +225,10 @@ class Exporter:
         with self._lock:
             return self._reload_timestamp, self._reload_success, self._reload_failures
 
+    def _remote_write_state(self) -> dict[tuple[str, str], int]:
+        with self._lock:
+            return dict(self._remote_write_failures)
+
 
 class _SnapshotCollector:
     """prometheus_client Collector that streams metrics from an Exporter snapshot."""
@@ -205,12 +239,15 @@ class _SnapshotCollector:
     def collect(self) -> Iterator[GaugeMetricFamily | CounterMetricFamily]:
         groups = self._exporter._snapshot()
         reload_state = self._exporter._reload_state()
+        remote_write_state = self._exporter._remote_write_state()
         yield from _forecast_families(groups)
         yield from _accuracy_families(groups)
         yield from _deviation_families(groups)
         yield from _quality_families(groups)
+        yield from _ensemble_families(groups)
         yield from _operational_families(groups)
         yield from _reload_families(reload_state)
+        yield from _remote_write_families(remote_write_state)
 
 
 def _emit_gauge_family(
@@ -335,6 +372,24 @@ def _quality_families(
     )
 
 
+def _ensemble_families(
+    groups: list[GroupSnapshot],
+) -> Iterator[GaugeMetricFamily]:
+    """Render ``forecast_ensemble_weight`` gauges (one per component model).
+
+    Only populated when ``accuracy.auto_select == "ensemble"``. Weights are
+    inverse-MAPE normalised to sum to 1; non-finite samples are dropped.
+    """
+    points = [p for snap in groups for p in snap.ensemble_weights]
+    yield from _emit_gauge_family(
+        points,
+        "forecast_ensemble_weight",
+        "Inverse-MAPE component weight inside an ensemble forecast (sum = 1 per series).",
+        value_fn=lambda p: p.weight,
+        skip_fn=lambda p: not math.isfinite(p.weight),
+    )
+
+
 def _operational_families(
     groups: list[GroupSnapshot],
 ) -> Iterator[GaugeMetricFamily | CounterMetricFamily]:
@@ -408,6 +463,22 @@ def _operational_families(
         yield fit_duration
         yield slow_fits
 
+    regressor_failures = CounterMetricFamily(
+        "forecast_regressor_failures",
+        "Exogenous regressor resolution failures, by reason "
+        "(query_error | query_timeout | empty_result | invalid_type | no_source).",
+        labels=["group", "query", "regressor", "reason"],
+    )
+    have_regressor_failures = False
+    for snap in groups:
+        for (query_id, regressor_id, reason), count in snap.regressor_failures.items():
+            regressor_failures.add_metric(
+                [snap.group, query_id, regressor_id, reason], float(count)
+            )
+            have_regressor_failures = True
+    if have_regressor_failures:
+        yield regressor_failures
+
 
 def _reload_families(
     state: tuple[float, bool, int],
@@ -442,3 +513,22 @@ def _reload_families(
     )
     failure_counter.add_metric([], float(failures))
     yield failure_counter
+
+
+def _remote_write_families(
+    state: dict[tuple[str, str], int],
+) -> Iterator[CounterMetricFamily]:
+    """Render the ``forecast_remote_write_failures_total`` counter.
+
+    Always emitted (even when empty) so dashboards can display "0 errors"
+    rather than 404'ing the panel before the first failure occurs.
+    """
+    counter = CounterMetricFamily(
+        "forecast_remote_write_failures",
+        "Total number of remote_write push attempts that failed, by reason "
+        "(timeout | http_error | encode_error).",
+        labels=["group", "reason"],
+    )
+    for (group, reason), count in state.items():
+        counter.add_metric([group, reason], float(count))
+    yield counter

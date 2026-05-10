@@ -21,6 +21,7 @@ from . import validate as validate_module
 from .exporter import Exporter
 from .reload import ConfigMapWatcher, ConfigReloader, ReloadError
 from .runner import Runner
+from .sink import ForecastSink, RemoteWriteSink
 from .source import PromSource
 
 logger = structlog.get_logger(__name__)
@@ -120,7 +121,8 @@ def run(config_path: Path, log_level: str) -> None:
         url=cfg.datasource.url,
         timeout_seconds=cfg.datasource.timeout.total_seconds(),
     )
-    runner = Runner(config=cfg, source=source, exporter=exporter)
+    sink = _build_sink(cfg)
+    runner = Runner(config=cfg, source=source, exporter=exporter, sink=sink)
     reloader = ConfigReloader(runner=runner, exporter=exporter, config_path=config_path)
     watcher = (
         ConfigMapWatcher(reloader)
@@ -296,6 +298,28 @@ def _configure_logging(level: str) -> None:
         lg = logging.getLogger(name)
         lg.handlers.clear()
         lg.propagate = True
+
+
+def _build_sink(cfg: config_module.Config) -> ForecastSink | None:
+    """Construct the configured push sink, or ``None`` if disabled.
+
+    Currently only ``remote_write`` is wired up; if more sinks are added
+    later this is the dispatch point.
+    """
+    rw = cfg.sink.remote_write
+    if not rw.enabled:
+        return None
+    logger.info(
+        "remote_write_sink_enabled",
+        url=rw.url,
+        timeout_s=rw.timeout.total_seconds(),
+    )
+    return RemoteWriteSink(
+        url=rw.url,
+        timeout_seconds=rw.timeout.total_seconds(),
+        headers=rw.headers,
+        chunk_size=rw.chunk_size,
+    )
 
 
 def _parse_listen(listen: str) -> tuple[str, int]:

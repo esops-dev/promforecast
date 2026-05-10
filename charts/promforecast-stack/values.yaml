@@ -4,10 +4,11 @@
 victoria-metrics-single:
   enabled: true
   server:
-    # IMPORTANT: forecasts are written with future timestamps. Without this
-    # flag VictoriaMetrics will silently drop them. VM enforces a 2-day
+    # IMPORTANT: forecasts are written with future timestamps when the
+    # forecaster's `sink.remote_write` is enabled. Without this flag
+    # VictoriaMetrics will silently drop them. VM enforces a 2-day
     # minimum; tune this higher than your longest configured forecast
-    # horizon.
+    # horizon (`defaults.horizon`).
     extraArgs:
       futureRetention: "2d"
     persistentVolume:
@@ -27,6 +28,15 @@ promforecast:
       timeout: 30s
       auth:
         type: none
+    # Push the full forecast curve back into VictoriaMetrics so historical
+    # forecast lines are queryable in Grafana. Disabled by default — the
+    # /metrics snapshot endpoint is enough for many users; flip this on
+    # when you want forecasts as first-class historical data.
+    sink:
+      remote_write:
+        enabled: false
+        url: http://promforecast-stack-victoria-metrics-single-server:8428/api/v1/import/prometheus
+        timeout: 30s
 
 # Bundled dashboards / alerts toggles. Off by default; enable explicitly so
 # users on shops with their own asset pipelines aren't surprised.

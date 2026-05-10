@@ -8,7 +8,7 @@ where AutoARIMA's differencing wins.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from .seasonal_naive import _normalize
 
@@ -19,8 +19,9 @@ if TYPE_CHECKING:
 class AutoETSModel:
     name = "AutoETS"
 
-    def __init__(self, season_length: int = 288) -> None:
+    def __init__(self, season_length: int = 288, **params: Any) -> None:
         self._season_length = season_length
+        self._params = params
 
     def fit_predict(
         self,
@@ -34,7 +35,7 @@ class AutoETSModel:
         from statsforecast.models import AutoETS  # noqa: PLC0415
 
         sf = StatsForecast(
-            models=[AutoETS(season_length=self._season_length)],
+            models=[AutoETS(season_length=self._season_length, **self._params)],
             freq=freq,
             n_jobs=1,
         )

@@ -134,7 +134,7 @@ async def test_run_group_full_snapshot_with_canned_fit(monkeypatch: pytest.Monke
     exporter = Exporter()
     runner = Runner(config=cfg, source=source, exporter=exporter)
 
-    async def _canned(self, query, frame, group_name):  # type: ignore[no-untyped-def]
+    async def _canned(self, query, frame, group_name, prefetch):  # type: ignore[no-untyped-def]
         from promforecast.runner import _FitResult  # noqa: PLC0415
 
         points = [
@@ -221,7 +221,7 @@ async def test_run_group_auto_select_emits_winner_with_best_model_label(
 
     # AutoARIMA tracks the actuals exactly → MAPE near 0; SeasonalNaive
     # predicts 0 → much higher MAPE. Auto-select must pick AutoARIMA.
-    def _fake_build(name: str, season_length: int) -> _FakeModel:
+    def _fake_build(name: str, season_length: int, params: dict | None = None) -> _FakeModel:
         if name == "AutoARIMA":
             return _FakeModel("AutoARIMA", value=50.0)
         if name == "SeasonalNaive":
@@ -276,7 +276,7 @@ async def test_run_group_auto_select_falls_back_when_winner_exceeds_threshold(
         groups=[GroupConfig(name="g", queries=[QueryConfig(id="m", promql="up")])],
     )
 
-    def _fake_build(name: str, season_length: int) -> _FakeModel:
+    def _fake_build(name: str, season_length: int, params: dict | None = None) -> _FakeModel:
         if name == "AutoARIMA":
             # Predict 999 against actuals near 50 → MAPE > threshold.
             return _FakeModel("AutoARIMA", value=999.0)
@@ -321,7 +321,7 @@ async def test_run_group_explicit_mode_emits_one_per_model(
         groups=[GroupConfig(name="g", queries=[QueryConfig(id="m", promql="up")])],
     )
 
-    def _fake_build(name: str, season_length: int) -> _FakeModel:
+    def _fake_build(name: str, season_length: int, params: dict | None = None) -> _FakeModel:
         return _FakeModel(name, value=1.0 if name == "AutoARIMA" else 2.0)
 
     monkeypatch.setattr(model_registry, "build", _fake_build)
@@ -376,7 +376,7 @@ async def test_run_group_skips_quality_for_unbacktested_fallback_model(
         groups=[GroupConfig(name="g", queries=[QueryConfig(id="m", promql="up")])],
     )
 
-    def _fake_build(name: str, season_length: int) -> _FakeModel:
+    def _fake_build(name: str, season_length: int, params: dict | None = None) -> _FakeModel:
         if name == "AutoARIMA":
             return _FakeModel("AutoARIMA", value=999.0)  # bad MAPE → fallback
         if name == "SeasonalNaive":
@@ -425,9 +425,11 @@ async def test_run_group_emits_deviation_and_quality_metrics(
         ),
         groups=[GroupConfig(name="g", queries=[QueryConfig(id="m", promql="up")])],
     )
-    monkeypatch.setattr(
-        model_registry, "build", lambda name, season_length: _FakeModel(name, value=42.0)
-    )
+
+    def _build(name: str, season_length: int, params: dict | None = None) -> _FakeModel:
+        return _FakeModel(name, value=42.0)
+
+    monkeypatch.setattr(model_registry, "build", _build)
 
     source = _FakeSource({"up": [_ramp_frame(60)]})
     exporter = Exporter()
@@ -468,9 +470,11 @@ async def test_run_group_emit_deviation_and_quality_disabled_suppresses_metrics(
         ),
         groups=[GroupConfig(name="g", queries=[QueryConfig(id="m", promql="up")])],
     )
-    monkeypatch.setattr(
-        model_registry, "build", lambda name, season_length: _FakeModel(name, value=1.0)
-    )
+
+    def _build(name: str, season_length: int, params: dict | None = None) -> _FakeModel:
+        return _FakeModel(name, value=1.0)
+
+    monkeypatch.setattr(model_registry, "build", _build)
 
     source = _FakeSource({"up": [_ramp_frame(60)]})
     exporter = Exporter()
@@ -511,9 +515,11 @@ async def test_backtests_skip_summary_when_only_accuracy_consumer_is_on(
         ),
         groups=[GroupConfig(name="g", queries=[QueryConfig(id="m", promql="up")])],
     )
-    monkeypatch.setattr(
-        model_registry, "build", lambda name, season_length: _FakeModel(name, value=1.0)
-    )
+
+    def _build(name: str, season_length: int, params: dict | None = None) -> _FakeModel:
+        return _FakeModel(name, value=1.0)
+
+    monkeypatch.setattr(model_registry, "build", _build)
 
     summary_calls: list[None] = []
     real_summary = runner_module._summarise_backtest

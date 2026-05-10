@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from .seasonal_naive import _normalize
 
@@ -13,8 +13,9 @@ if TYPE_CHECKING:
 class AutoARIMAModel:
     name = "AutoARIMA"
 
-    def __init__(self, season_length: int = 288) -> None:
+    def __init__(self, season_length: int = 288, **params: Any) -> None:
         self._season_length = season_length
+        self._params = params
 
     def fit_predict(
         self,
@@ -28,7 +29,7 @@ class AutoARIMAModel:
         from statsforecast.models import AutoARIMA  # noqa: PLC0415
 
         sf = StatsForecast(
-            models=[AutoARIMA(season_length=self._season_length)],
+            models=[AutoARIMA(season_length=self._season_length, **self._params)],
             freq=freq,
             n_jobs=1,
         )

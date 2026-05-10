@@ -21,7 +21,14 @@ from typing import TYPE_CHECKING
 from . import deviation as deviation_mod
 from . import quality as quality_mod
 from .accuracy import overall_mape
-from .exporter import AccuracyPoint, DeviationPoint, ForecastPoint, QualityPoint
+from .exporter import (
+    AccuracyPoint,
+    DeviationPoint,
+    EnsembleWeightPoint,
+    ForecastPoint,
+    QualityPoint,
+)
+from .sink import ForecastCurvePoint
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -91,8 +98,8 @@ class SeriesPointFactory:
         """Convert the last forecast row into snapshot points.
 
         /metrics is a snapshot endpoint, so we expose only the *next* forecast
-        step. Drawing the full curve in Grafana is the job of the planned
-        remote_write sink.
+        step. The full curve goes to the optional remote_write sink — see
+        :meth:`forecast_curve_points`.
 
         When ``selection`` is set (auto-select mode), additional labels
         ``best_model`` and ``model_fallback`` are attached so dashboards can
@@ -102,15 +109,7 @@ class SeriesPointFactory:
         if forecast.empty:
             return
         last = forecast.iloc[-1]
-        common: dict[str, str] = {
-            **self._base_common,
-            "group": self._group,
-            "model": model_name,
-            "horizon": "next",
-        }
-        if selection is not None:
-            common["best_model"] = selection.best_model
-            common["model_fallback"] = "true" if selection.fallback_applied else "false"
+        common = self._build_common_labels(model_name, selection)
         yield ForecastPoint(
             metric=f"{self._metric_id}_forecast",
             labels=common,
@@ -131,6 +130,92 @@ class SeriesPointFactory:
                     labels={**common, "level": str(level)},
                     value=float(last[hi_col]),
                 )
+
+    def forecast_curve_points(
+        self,
+        forecast: pd.DataFrame,
+        model_name: str,
+        selection: SelectionResult | None,
+    ) -> Iterable[ForecastCurvePoint]:
+        """Yield every horizon step as a (timestamp, value) push point.
+
+        Used by the remote_write sink to ingest the full curve into a TSDB.
+        Each row in ``forecast`` produces one ``yhat`` point plus a per-level
+        ``lower``/``upper`` pair, all sharing the same ``timestamp_ms``.
+
+        Rows with non-finite timestamps or values are dropped — TSDBs reject
+        NaN samples, and emitting them would just generate noise in the
+        sink's failure counter.
+        """
+        if forecast.empty:
+            return
+        common = self._build_common_labels(model_name, selection)
+        for _, row in forecast.iterrows():
+            ts = row.get("ds")
+            if ts is None:
+                continue
+            try:
+                # ``Timestamp.timestamp()`` returns seconds; we want ms.
+                ts_ms = int(float(ts.timestamp()) * 1000)
+            except (AttributeError, TypeError, ValueError):
+                continue
+            yhat_raw = row.get("yhat")
+            if yhat_raw is not None and math.isfinite(float(yhat_raw)):
+                yield ForecastCurvePoint(
+                    metric=f"{self._metric_id}_forecast",
+                    labels=common,
+                    value=float(yhat_raw),
+                    timestamp_ms=ts_ms,
+                )
+            for level in self._levels:
+                lo_col = f"yhat_lower_{level}"
+                hi_col = f"yhat_upper_{level}"
+                if lo_col in forecast.columns:
+                    lo = row[lo_col]
+                    if math.isfinite(float(lo)):
+                        yield ForecastCurvePoint(
+                            metric=f"{self._metric_id}_forecast_lower",
+                            labels={**common, "level": str(level)},
+                            value=float(lo),
+                            timestamp_ms=ts_ms,
+                        )
+                if hi_col in forecast.columns:
+                    hi = row[hi_col]
+                    if math.isfinite(float(hi)):
+                        yield ForecastCurvePoint(
+                            metric=f"{self._metric_id}_forecast_upper",
+                            labels={**common, "level": str(level)},
+                            value=float(hi),
+                            timestamp_ms=ts_ms,
+                        )
+
+    def ensemble_weight_points(
+        self,
+        weights: dict[str, float],
+    ) -> Iterable[EnsembleWeightPoint]:
+        """One ``forecast_ensemble_weight`` sample per component model."""
+        common = self._common_with_id()
+        for model_name, weight in weights.items():
+            yield EnsembleWeightPoint(
+                labels={**common, "model": model_name},
+                weight=float(weight),
+            )
+
+    def _build_common_labels(
+        self,
+        model_name: str,
+        selection: SelectionResult | None,
+    ) -> dict[str, str]:
+        common: dict[str, str] = {
+            **self._base_common,
+            "group": self._group,
+            "model": model_name,
+            "horizon": "next",
+        }
+        if selection is not None:
+            common["best_model"] = selection.best_model
+            common["model_fallback"] = "true" if selection.fallback_applied else "false"
+        return common
 
     def accuracy_points(
         self,
