@@ -145,29 +145,29 @@ def _estimate_cardinality(cfg: Config) -> CardinalityEstimate:
     series_cap = cfg.safety.max_series_per_query
     n_models = max(1, len(cfg.defaults.models))
     n_levels = len(cfg.defaults.confidence_levels)
-    n_horizons = max(1, len(cfg.defaults.accuracy_horizons))
+    n_horizons = max(1, len(cfg.defaults.accuracy.horizons))
 
     # Each forecast: 1 yhat row + 2 (lower/upper) per confidence level.
     per_series_forecast = n_models * (1 + 2 * n_levels)
     # Auto-select emits a single winner; explicit emits all configured models.
-    if cfg.defaults.auto_select and cfg.defaults.auto_select != "ensemble":
+    if cfg.defaults.accuracy.auto_select and cfg.defaults.accuracy.auto_select != "ensemble":
         per_series_forecast = 1 + 2 * n_levels
 
     forecast_lines = queries * series_cap * per_series_forecast
     accuracy_lines = (
         queries * series_cap * n_models * n_horizons * 2  # MAPE + MASE
-        if cfg.defaults.evaluate
+        if cfg.defaults.accuracy.evaluate
         else 0
     )
     # Deviation: one per (series, model, level) on the *emitted* models —
     # in auto-select mode that's 1 model; in explicit mode it's n_models.
-    emitted_models = 1 if cfg.defaults.auto_select else n_models
+    emitted_models = 1 if cfg.defaults.accuracy.auto_select else n_models
     deviation_lines = (
         queries * series_cap * emitted_models * n_levels * 2  # ratio + outside_band
-        if cfg.defaults.emit_deviation
+        if cfg.defaults.emission.deviation
         else 0
     )
-    quality_lines = queries * series_cap * emitted_models if cfg.defaults.emit_quality else 0
+    quality_lines = queries * series_cap * emitted_models if cfg.defaults.emission.quality else 0
     # Operational: 7 gauges + N reasons per group; we ballpark 7 per group.
     operational_lines = 7 * len(cfg.groups)
 
@@ -286,7 +286,7 @@ def _fit_sample(cfg: Config, frame: SeriesFrame, write: Writer) -> int:
         yhat_str = f"{yhat:.4f}" if yhat is not None and math.isfinite(float(yhat)) else "NaN"
         write(f"      {ts}  yhat={yhat_str}")
 
-    horizons = horizons_from_durations(list(cfg.defaults.accuracy_horizons), cfg.defaults.step)
+    horizons = horizons_from_durations(list(cfg.defaults.accuracy.horizons), cfg.defaults.step)
     if horizons and len(df) > horizons[0].steps + 1:
         rc = _backtest_preview(model, df, horizons[0].steps, freq, levels, write)
         return rc

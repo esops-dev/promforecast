@@ -32,16 +32,18 @@ defaults:
   # ~30 min of data before the first fit. With step=1m that's fast enough
   # to validate the dashboards without waiting for production-scale lookback.
   min_points: 30
-  # Backtest hold-out is max(horizon) = 15 steps. min_points=30 guarantees
-  # backtests run on the very first fit, so accuracy/deviation/quality
-  # metrics start flowing immediately.
-  accuracy_horizons: [3m, 5m, 15m]
-  evaluate: true
-  auto_select: true
-  fallback_model: SeasonalNaive
-  fallback_mape_threshold: 50
-  emit_deviation: true
-  emit_quality: true
+  accuracy:
+    evaluate: true
+    # Backtest hold-out is max(horizon) = 15 steps. min_points=30 guarantees
+    # backtests run on the very first fit, so accuracy/deviation/quality
+    # metrics start flowing immediately.
+    horizons: [3m, 5m, 15m]
+    auto_select: true
+    fallback_model: SeasonalNaive
+    fallback_mape_threshold: 50
+  emission:
+    deviation: true
+    quality: true
 
 groups:
   - name: node_capacity

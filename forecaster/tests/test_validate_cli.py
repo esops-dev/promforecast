@@ -85,9 +85,11 @@ def test_cardinality_estimate_matches_doc_formula() -> None:
     from datetime import timedelta  # noqa: PLC0415
 
     from promforecast.config import (  # noqa: PLC0415
+        AccuracyConfig,
         Config,
         DatasourceConfig,
         DefaultsConfig,
+        EmissionConfig,
         GroupConfig,
         QueryConfig,
         SafetyConfig,
@@ -101,11 +103,12 @@ def test_cardinality_estimate_matches_doc_formula() -> None:
         defaults=DefaultsConfig(
             models=["AutoARIMA", "SeasonalNaive"],
             confidence_levels=[80, 95],
-            evaluate=True,
-            emit_deviation=True,
-            emit_quality=True,
-            accuracy_horizons=[timedelta(hours=1), timedelta(hours=24)],
-            auto_select=False,
+            accuracy=AccuracyConfig(
+                evaluate=True,
+                horizons=[timedelta(hours=1), timedelta(hours=24)],
+                auto_select=False,
+            ),
+            emission=EmissionConfig(deviation=True, quality=True),
         ),
         groups=[GroupConfig(name="g", queries=[QueryConfig(id="m", promql="up")])],
     )

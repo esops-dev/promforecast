@@ -46,7 +46,7 @@ class HorizonSpec:
 
 
 def horizons_from_durations(durations: list[timedelta], step: timedelta) -> list[HorizonSpec]:
-    """Convert ``accuracy_horizons`` durations to (label, n_steps) pairs.
+    """Convert ``accuracy.horizons`` durations to (label, n_steps) pairs.
 
     Horizons that round to 0 steps (because they're shorter than ``step``)
     are dropped — emitting a 0-step accuracy metric is meaningless and would

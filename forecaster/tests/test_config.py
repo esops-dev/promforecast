@@ -99,3 +99,58 @@ mystery_top_level: 42
     )
     with pytest.raises(ValidationError):
         config_module.load(path)
+
+
+def test_load_accepts_nested_accuracy_and_emission_blocks(tmp_path: Path) -> None:
+    path = _write(
+        tmp_path,
+        """
+datasource:
+  url: http://vm:8428/
+defaults:
+  accuracy:
+    evaluate: false
+    horizons: [10m, 1h]
+    auto_select: true
+    fallback_model: SeasonalNaive
+    fallback_mape_threshold: 25
+  emission:
+    deviation: false
+    quality: true
+groups:
+  - name: g
+    queries:
+      - id: m
+        promql: up
+""",
+    )
+    cfg = config_module.load(path)
+    assert cfg.defaults.accuracy.evaluate is False
+    assert cfg.defaults.accuracy.auto_select is True
+    assert cfg.defaults.accuracy.fallback_mape_threshold == 25
+    assert len(cfg.defaults.accuracy.horizons) == 2
+    assert cfg.defaults.emission.deviation is False
+    assert cfg.defaults.emission.quality is True
+
+
+def test_load_rejects_legacy_flat_accuracy_fields(tmp_path: Path) -> None:
+    """Old (flat) ``evaluate`` / ``emit_quality`` etc. now live under nested
+    blocks; the schema must reject the flat form so stale configs fail loudly
+    rather than silently using the field defaults."""
+    path = _write(
+        tmp_path,
+        """
+datasource:
+  url: http://vm:8428/
+defaults:
+  evaluate: true
+  emit_quality: true
+groups:
+  - name: g
+    queries:
+      - id: m
+        promql: up
+""",
+    )
+    with pytest.raises(ValidationError):
+        config_module.load(path)
