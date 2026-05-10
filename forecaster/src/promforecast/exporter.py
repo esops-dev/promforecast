@@ -1,7 +1,4 @@
-"""Prometheus exposition: snapshot cache + metric-name validator.
-
-The validator enforces Prometheus naming rules strictly. Colons are reserved
-for recording rules and rejected here. There is no escape hatch.
+"""Prometheus exposition: snapshot cache.
 
 Rendering goes through ``prometheus_client.CollectorRegistry`` via a custom
 collector. The collector reads the snapshot under a lock once per scrape and
@@ -9,11 +6,16 @@ emits ``GaugeMetricFamily`` / ``CounterMetricFamily`` instances; this keeps
 the snapshot model (one replace-per-run per group) but delegates exposition
 formatting, label-value escaping, and the ``# TYPE`` / ``# HELP`` ordering
 invariants to the well-tested upstream library.
+
+The metric-name validator lives in :mod:`promforecast._naming` so that
+``config.py`` (and CI tooling that only needs schema validation) can pull
+it in without the ``prometheus_client`` dependency. ``InvalidMetricNameError``
+and ``validate_metric_name`` are re-exported from here as a backwards-
+compatibility shim.
 """
 
 from __future__ import annotations
 
-import re
 import threading
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
@@ -21,32 +23,21 @@ from typing import TYPE_CHECKING
 from prometheus_client import CollectorRegistry, generate_latest
 from prometheus_client.core import CounterMetricFamily, GaugeMetricFamily
 
+from ._naming import InvalidMetricNameError, validate_metric_name
+
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
-_METRIC_NAME_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
-
-
-class InvalidMetricNameError(ValueError):
-    """Raised when an output metric name violates Prometheus conventions."""
-
-
-def validate_metric_name(name: str) -> None:
-    """Reject metric names that are not safe for Prometheus exposition.
-
-    Rules:
-        - Must match ``[a-zA-Z_][a-zA-Z0-9_]*``.
-        - Must not contain a colon (reserved for recording rules).
-
-    Raises:
-        InvalidMetricNameError: If ``name`` does not satisfy the rules.
-    """
-    if ":" in name:
-        raise InvalidMetricNameError(
-            f"metric name {name!r} contains a colon; colons are reserved for recording rules"
-        )
-    if not _METRIC_NAME_RE.match(name):
-        raise InvalidMetricNameError(f"metric name {name!r} does not match Prometheus naming regex")
+__all__ = [
+    "AccuracyPoint",
+    "DeviationPoint",
+    "Exporter",
+    "ForecastPoint",
+    "GroupSnapshot",
+    "InvalidMetricNameError",
+    "QualityPoint",
+    "validate_metric_name",
+]
 
 
 @dataclass(frozen=True)

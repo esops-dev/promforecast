@@ -15,7 +15,7 @@ from typing import Annotated, Literal
 import yaml
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field
 
-from .exporter import validate_metric_name
+from ._naming import validate_metric_name
 
 _PROM_DURATION_RE = re.compile(
     r"^\s*(?:(\d+)d)?(?:(\d+)h)?(?:(\d+)m(?!s))?(?:(\d+)s)?(?:(\d+)ms)?\s*$"
