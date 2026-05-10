@@ -64,6 +64,50 @@ jobs:
           path: forecaster/coverage.xml
           if-no-files-found: ignore
 
+  prophet-plugin:
+    name: Lint + test promforecast-prophet
+    # The Prophet plug-in lives in this monorepo so we keep its quality
+    # bar in lockstep with the forecaster: the same ruff/mypy strictness
+    # and entry-point discovery contract. Real Prophet is *not* installed —
+    # the tests stub it out — because the Stan toolchain blows up CI time
+    # for a smoke check. The end-to-end fit path is exercised via
+    # docker-compose by anyone actually running the package against data.
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: community/promforecast-prophet
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.12"
+          enable-cache: true
+          cache-dependency-glob: "community/promforecast-prophet/pyproject.toml"
+
+      # Install only the dev extras and a path-pinned ``promforecast`` so we
+      # exercise the same forecaster source the rest of CI sees, without
+      # paying the prophet/cmdstanpy install cost. The ``--no-deps`` flag
+      # keeps prophet from being pulled in transitively; tests stub it.
+      - name: Install package and dev deps (without prophet)
+        run: |
+          uv venv
+          uv pip install -e ../../forecaster
+          uv pip install --no-deps -e .
+          uv pip install pytest ruff mypy pandas pandas-stubs
+
+      - name: ruff check
+        run: uv run ruff check .
+
+      - name: ruff format --check
+        run: uv run ruff format --check .
+
+      - name: mypy --strict
+        run: uv run mypy --strict src
+
+      - name: pytest
+        run: uv run pytest
+
   chart-lint:
     name: Lint Helm charts
     runs-on: ubuntu-latest

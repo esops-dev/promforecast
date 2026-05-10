@@ -2,6 +2,8 @@
 # metrics. Drop into the forecaster's config — adjust the datasource URL
 # and any label matchers to suit your environment.
 
+apiVersion: promforecast.io/v1alpha1
+
 datasource:
   url: http://victoriametrics:8428/
   timeout: 30s

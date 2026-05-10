@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import warnings
 from datetime import timedelta
 from pathlib import Path
 
@@ -9,6 +10,10 @@ import pytest
 from pydantic import ValidationError
 
 import promforecast.config as config_module
+from promforecast.config import (
+    CURRENT_API_VERSION,
+    UnsupportedApiVersionError,
+)
 from promforecast.exporter import InvalidMetricNameError
 
 
@@ -22,6 +27,7 @@ def test_load_minimal(tmp_path: Path) -> None:
     path = _write(
         tmp_path,
         """
+apiVersion: promforecast.io/v1alpha1
 datasource:
   url: http://vm:8428/
 groups:
@@ -42,6 +48,7 @@ def test_load_parses_prometheus_durations(tmp_path: Path) -> None:
     path = _write(
         tmp_path,
         """
+apiVersion: promforecast.io/v1alpha1
 datasource:
   url: http://vm:8428/
   timeout: 45s
@@ -70,6 +77,7 @@ def test_load_rejects_colon_in_id(tmp_path: Path) -> None:
     path = _write(
         tmp_path,
         """
+apiVersion: promforecast.io/v1alpha1
 datasource:
   url: http://vm:8428/
 groups:
@@ -87,6 +95,7 @@ def test_load_rejects_unknown_field(tmp_path: Path) -> None:
     path = _write(
         tmp_path,
         """
+apiVersion: promforecast.io/v1alpha1
 datasource:
   url: http://vm:8428/
 groups:
@@ -105,6 +114,7 @@ def test_load_accepts_nested_accuracy_and_emission_blocks(tmp_path: Path) -> Non
     path = _write(
         tmp_path,
         """
+apiVersion: promforecast.io/v1alpha1
 datasource:
   url: http://vm:8428/
 defaults:
@@ -138,6 +148,7 @@ def test_load_accepts_models_as_strings_or_dicts(tmp_path: Path) -> None:
     path = _write(
         tmp_path,
         """
+apiVersion: promforecast.io/v1alpha1
 datasource:
   url: http://vm:8428/
 defaults:
@@ -166,6 +177,7 @@ def test_load_rejects_unknown_field_inside_model_spec(tmp_path: Path) -> None:
     path = _write(
         tmp_path,
         """
+apiVersion: promforecast.io/v1alpha1
 datasource:
   url: http://vm:8428/
 defaults:
@@ -187,6 +199,7 @@ def test_load_rejects_calendar_regressor_with_unknown_id(tmp_path: Path) -> None
     path = _write(
         tmp_path,
         """
+apiVersion: promforecast.io/v1alpha1
 datasource:
   url: http://vm:8428/
 groups:
@@ -207,6 +220,7 @@ def test_load_rejects_calendar_regressor_with_promql(tmp_path: Path) -> None:
     path = _write(
         tmp_path,
         """
+apiVersion: promforecast.io/v1alpha1
 datasource:
   url: http://vm:8428/
 groups:
@@ -228,6 +242,7 @@ def test_load_rejects_custom_regressor_without_promql(tmp_path: Path) -> None:
     path = _write(
         tmp_path,
         """
+apiVersion: promforecast.io/v1alpha1
 datasource:
   url: http://vm:8428/
 groups:
@@ -248,6 +263,7 @@ def test_load_rejects_remote_write_enabled_without_url(tmp_path: Path) -> None:
     path = _write(
         tmp_path,
         """
+apiVersion: promforecast.io/v1alpha1
 datasource:
   url: http://vm:8428/
 sink:
@@ -268,6 +284,7 @@ def test_load_accepts_remote_write_with_headers(tmp_path: Path) -> None:
     path = _write(
         tmp_path,
         """
+apiVersion: promforecast.io/v1alpha1
 datasource:
   url: http://vm:8428/
 sink:
@@ -296,6 +313,7 @@ def test_load_rejects_remote_write_chunk_size_below_one(tmp_path: Path) -> None:
     path = _write(
         tmp_path,
         """
+apiVersion: promforecast.io/v1alpha1
 datasource:
   url: http://vm:8428/
 sink:
@@ -314,6 +332,132 @@ groups:
         config_module.load(path)
 
 
+def test_load_rejects_datasource_keepalive_above_concurrent(tmp_path: Path) -> None:
+    """``max_keepalive_connections`` capped at ``max_concurrent_requests``.
+
+    Without this validator the operator could set a higher keepalive
+    expecting more idle connections to be retained, but httpx caps
+    keepalive at the total connection cap at runtime — so the larger
+    value silently has no effect. Better to reject at load time.
+    """
+    path = _write(
+        tmp_path,
+        """
+apiVersion: promforecast.io/v1alpha1
+datasource:
+  url: http://vm:8428/
+  max_concurrent_requests: 4
+  max_keepalive_connections: 8
+groups:
+  - name: g
+    queries:
+      - id: m
+        promql: up
+""",
+    )
+    with pytest.raises(ValidationError, match="max_keepalive_connections"):
+        config_module.load(path)
+
+
+def test_load_rejects_remote_write_keepalive_above_connections(tmp_path: Path) -> None:
+    """Same intent as the datasource validator, on the sink side."""
+    path = _write(
+        tmp_path,
+        """
+apiVersion: promforecast.io/v1alpha1
+datasource:
+  url: http://vm:8428/
+sink:
+  remote_write:
+    enabled: true
+    url: http://vm:8428/x
+    max_connections: 2
+    max_keepalive_connections: 4
+groups:
+  - name: g
+    queries:
+      - id: m
+        promql: up
+""",
+    )
+    with pytest.raises(ValidationError, match="max_keepalive_connections"):
+        config_module.load(path)
+
+
+def test_load_accepts_declared_api_version(tmp_path: Path) -> None:
+    """An explicit ``apiVersion`` matching the current schema must validate
+    silently — no warning, no rewrite."""
+    path = _write(
+        tmp_path,
+        """
+apiVersion: promforecast.io/v1alpha1
+datasource:
+  url: http://vm:8428/
+groups:
+  - name: g
+    queries:
+      - id: m
+        promql: up
+""",
+    )
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")  # any DeprecationWarning would fail the test
+        cfg = config_module.load(path)
+    assert cfg.api_version == CURRENT_API_VERSION
+
+
+def test_load_warns_when_api_version_missing(tmp_path: Path) -> None:
+    """Configs predating the versioning roll-out keep loading but emit a
+    DeprecationWarning so operators know to add ``apiVersion`` before
+    the schema freezes."""
+    path = _write(
+        tmp_path,
+        """
+datasource:
+  url: http://vm:8428/
+groups:
+  - name: g
+    queries:
+      - id: m
+        promql: up
+""",
+    )
+    with pytest.warns(DeprecationWarning, match="missing 'apiVersion'"):
+        cfg = config_module.load(path)
+    # Back-fill: the loader injects the current default so downstream code
+    # never has to handle ``None``.
+    assert cfg.api_version == CURRENT_API_VERSION
+
+
+def test_load_rejects_unknown_api_version(tmp_path: Path) -> None:
+    """Unknown apiVersion strings (typos, not-yet-released versions) raise
+    a precise error rather than the noisy ``Literal[...]`` mismatch
+    pydantic would otherwise produce."""
+    path = _write(
+        tmp_path,
+        """
+apiVersion: promforecast.io/v2
+datasource:
+  url: http://vm:8428/
+groups:
+  - name: g
+    queries:
+      - id: m
+        promql: up
+""",
+    )
+    with pytest.raises(UnsupportedApiVersionError, match="unsupported apiVersion"):
+        config_module.load(path)
+
+
+def test_load_rejects_top_level_non_mapping(tmp_path: Path) -> None:
+    """Non-mapping YAML (a list at top level, an empty file, a scalar)
+    should fail with a clear error rather than crashing inside pydantic."""
+    path = _write(tmp_path, "- foo\n- bar\n")
+    with pytest.raises(ValueError, match="YAML mapping"):
+        config_module.load(path)
+
+
 def test_load_rejects_legacy_flat_accuracy_fields(tmp_path: Path) -> None:
     """Old (flat) ``evaluate`` / ``emit_quality`` etc. now live under nested
     blocks; the schema must reject the flat form so stale configs fail loudly
@@ -321,6 +465,7 @@ def test_load_rejects_legacy_flat_accuracy_fields(tmp_path: Path) -> None:
     path = _write(
         tmp_path,
         """
+apiVersion: promforecast.io/v1alpha1
 datasource:
   url: http://vm:8428/
 defaults:

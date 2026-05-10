@@ -385,7 +385,10 @@ class _RecordingSink:
         self.received: list[ForecastCurvePoint] = []
         self._raise_on_write = raise_on_write
 
-    async def write(self, points) -> None:
+    async def write(self, points, *, on_retry=None) -> None:
+        # ``on_retry`` is part of the ForecastSink protocol but unused here:
+        # this fake never retries, it just records or raises directly.
+        del on_retry
         self.received.extend(points)
         if self._raise_on_write is not None:
             raise self._raise_on_write

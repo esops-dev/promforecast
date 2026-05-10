@@ -1,0 +1,80 @@
+[project]
+name = "promforecast-prophet"
+version = "0.0.0"
+description = "Prophet forecasting model plug-in for promforecast."
+license = { file = "LICENSE" }
+requires-python = ">=3.12"
+authors = [{ name = "The promforecast Authors" }]
+keywords = ["prometheus", "forecasting", "prophet", "promforecast"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: System :: Monitoring",
+]
+
+# `prophet` pulls cmdstanpy and a Stan toolchain on first use; pinning a
+# floor that ships wheels for Linux/macOS keeps `pip install` from trying
+# to compile from source on a clean container.
+dependencies = [
+    "promforecast",
+    "prophet>=1.1",
+    "pandas>=2.2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3",
+    "ruff>=0.8",
+    "mypy>=1.13",
+    "pandas-stubs>=2.2",
+]
+
+[project.entry-points."promforecast.models"]
+# Discovered by promforecast.models at startup; the value resolves to the
+# class whose ``name = "Prophet"`` becomes the user-visible model name.
+prophet = "promforecast_prophet:ProphetModel"
+
+[project.urls]
+Homepage      = "https://github.com/esops-dev/promforecast/tree/main/community/promforecast-prophet"
+Repository    = "https://github.com/esops-dev/promforecast"
+Issues        = "https://github.com/esops-dev/promforecast/issues"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/promforecast_prophet"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = [
+    "E", "F", "I", "B", "UP", "SIM", "RUF", "PL", "T20",
+]
+ignore = ["PLR0913"]  # the ForecastModel signature mirrors the upstream protocol
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["PLR2004"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+disallow_any_generics = true
+no_implicit_reexport = true
+
+[[tool.mypy.overrides]]
+module = ["prophet.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+addopts = "-ra -q --strict-markers --strict-config"
+testpaths = ["tests"]

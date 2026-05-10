@@ -520,9 +520,15 @@ class Runner:
             # standard exposition. Sink errors are bounded into the
             # ``forecast_remote_write_failures_total`` counter so dashboards
             # can alert on chronic push failures without crashing the run.
+            # ``on_retry`` is bound to *this* group so transient retries
+            # show up under the right label without the sink needing to
+            # know about group identity.
             if self._sink is not None and ctx.curve_points:
+                def _record_sink_retry(reason: str) -> None:
+                    self._exporter.increment_remote_write_retry(group.name, reason)
+
                 try:
-                    await self._sink.write(ctx.curve_points)
+                    await self._sink.write(ctx.curve_points, on_retry=_record_sink_retry)
                 except SinkError as exc:
                     log.warning(
                         "remote_write_failed",
@@ -1181,7 +1187,14 @@ class Runner:
             model = model_registry.build(spec.name, season_length=season_length, params=spec.params)
             return await asyncio.wait_for(
                 loop.run_in_executor(
-                    self._executor, _run_backtest, model, df, eval_steps, freq, levels
+                    self._executor,
+                    _run_backtest,
+                    model,
+                    df,
+                    eval_steps,
+                    freq,
+                    levels,
+                    regressors,
                 ),
                 timeout=timeout,
             )
@@ -1392,8 +1405,16 @@ def _run_backtest(
     horizon_steps: int,
     freq: str,
     levels: list[int],
+    regressors: pd.DataFrame | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame] | None:
-    return backtest(model=model, df=df, horizon_steps=horizon_steps, freq=freq, levels=levels)
+    return backtest(
+        model=model,
+        df=df,
+        horizon_steps=horizon_steps,
+        freq=freq,
+        levels=levels,
+        regressors=regressors,
+    )
 
 
 def _pandas_freq(step: timedelta) -> str:

@@ -173,9 +173,19 @@ class Exporter:
         # can confirm a deployment is running the expected revision.
         self._config_hash: str = ""
         # Per-(group, reason) push-sink failure counter. The reason set is
-        # bounded by the sink (``timeout``, ``http_error``, ``encode_error``)
-        # so cardinality is small and predictable.
+        # bounded by the sink (``timeout``, ``http_error``) so cardinality
+        # is small and predictable.
         self._remote_write_failures: dict[tuple[str, str], int] = {}
+        # Per-(group, reason) push-sink retry counter. Bumped *during* a
+        # push (before the SinkError surfaces), so an operator can spot a
+        # flaky TSDB that retries succeed against — without the counter
+        # only firing on terminal failures, intermittent latency would
+        # be invisible until it tipped over into outright failure.
+        self._remote_write_retries: dict[tuple[str, str], int] = {}
+        # Per-reason source (PromQL) retry counter. The source is shared
+        # across groups so this isn't labelled by group; per-group query
+        # latency is already observable via ``forecast_run_duration_seconds``.
+        self._source_retries: dict[str, int] = {}
         self._registry = CollectorRegistry()
         self._registry.register(_SnapshotCollector(self))
 
@@ -238,6 +248,28 @@ class Exporter:
             key = (group, reason)
             self._remote_write_failures[key] = self._remote_write_failures.get(key, 0) + 1
 
+    def increment_remote_write_retry(self, group: str, reason: str) -> None:
+        """Bump the remote_write push-sink retry counter for ``group``.
+
+        Distinct from the failure counter: a retry is bumped on *every*
+        retry attempt, including ones that eventually succeed. The
+        failure counter only ticks on terminal failure, so without this
+        a flaky TSDB papered-over by retries would be invisible.
+        """
+        with self._lock:
+            key = (group, reason)
+            self._remote_write_retries[key] = self._remote_write_retries.get(key, 0) + 1
+
+    def increment_source_retry(self, reason: str) -> None:
+        """Bump the PromQL-source retry counter for ``reason``.
+
+        Reason is one of ``transport`` (connection-level error) or
+        ``http_5xx`` (5xx response). 4xx responses fail fast and are not
+        retried; they surface as ``forecast_failures_total{reason="query_error"}``.
+        """
+        with self._lock:
+            self._source_retries[reason] = self._source_retries.get(reason, 0) + 1
+
     def render(self) -> bytes:
         """Render the current snapshot in Prometheus exposition format."""
         return generate_latest(self._registry)
@@ -268,6 +300,14 @@ class Exporter:
         with self._lock:
             return dict(self._remote_write_failures)
 
+    def _remote_write_retries_state(self) -> dict[tuple[str, str], int]:
+        with self._lock:
+            return dict(self._remote_write_retries)
+
+    def _source_retries_state(self) -> dict[str, int]:
+        with self._lock:
+            return dict(self._source_retries)
+
 
 class _SnapshotCollector:
     """prometheus_client Collector that streams metrics from an Exporter snapshot."""
@@ -279,6 +319,8 @@ class _SnapshotCollector:
         groups = self._exporter._snapshot()
         reload_state = self._exporter._reload_state()
         remote_write_state = self._exporter._remote_write_state()
+        remote_write_retries = self._exporter._remote_write_retries_state()
+        source_retries = self._exporter._source_retries_state()
         config_hash = self._exporter._config_hash_state()
         yield from _forecast_families(groups)
         yield from _accuracy_families(groups)
@@ -290,6 +332,8 @@ class _SnapshotCollector:
         yield from _reload_families(reload_state)
         yield from _config_hash_families(config_hash)
         yield from _remote_write_families(remote_write_state)
+        yield from _remote_write_retries_families(remote_write_retries)
+        yield from _source_retries_families(source_retries)
 
 
 def _emit_gauge_family(
@@ -310,14 +354,25 @@ def _emit_gauge_family(
 
     Yields nothing when the input is empty so callers can ``yield from``
     unconditionally.
+
+    Single-pass: collect label keys and surviving points together so
+    skipped rows aren't iterated twice and the label-key union runs while
+    we're already touching each point's dict.
     """
     if not points:
         return
-    label_keys = sorted({k for p in points for k in p.labels})
-    family = GaugeMetricFamily(metric_name, description, labels=label_keys)
+    label_keys_set: set[str] = set()
+    selected: list[Any] = []
     for point in points:
         if skip_fn is not None and skip_fn(point):
             continue
+        label_keys_set.update(point.labels)
+        selected.append(point)
+    if not selected:
+        return
+    label_keys = sorted(label_keys_set)
+    family = GaugeMetricFamily(metric_name, description, labels=label_keys)
+    for point in selected:
         family.add_metric([point.labels.get(k, "") for k in label_keys], value_fn(point))
     yield family
 
@@ -615,9 +670,50 @@ def _remote_write_families(
     counter = CounterMetricFamily(
         "forecast_remote_write_failures",
         "Total number of remote_write push attempts that failed, by reason "
-        "(timeout | http_error | encode_error).",
+        "(timeout | http_error).",
         labels=["group", "reason"],
     )
     for (group, reason), count in state.items():
         counter.add_metric([group, reason], float(count))
+    yield counter
+
+
+def _remote_write_retries_families(
+    state: dict[tuple[str, str], int],
+) -> Iterator[CounterMetricFamily]:
+    """Render the ``forecast_remote_write_retries_total`` counter.
+
+    Bumped on every retry attempt — including ones that eventually
+    succeed — so a flaky TSDB papered over by retries is visible before
+    it tips into outright failure. Always emitted so dashboards have a
+    series to chart from boot.
+    """
+    counter = CounterMetricFamily(
+        "forecast_remote_write_retries",
+        "Total number of remote_write push attempts that were retried, by reason "
+        "(timeout | http_error). Includes retries that eventually succeeded.",
+        labels=["group", "reason"],
+    )
+    for (group, reason), count in state.items():
+        counter.add_metric([group, reason], float(count))
+    yield counter
+
+
+def _source_retries_families(
+    state: dict[str, int],
+) -> Iterator[CounterMetricFamily]:
+    """Render the ``forecast_source_retries_total`` counter.
+
+    Tracks PromQL-side retries (transport errors, 5xx). Not labelled by
+    group: the source client is shared, and per-group query latency is
+    already observable via ``forecast_run_duration_seconds``.
+    """
+    counter = CounterMetricFamily(
+        "forecast_source_retries",
+        "Total number of PromQL fetches that were retried, by reason "
+        "(transport | http_5xx). Includes retries that eventually succeeded.",
+        labels=["reason"],
+    )
+    for reason, count in state.items():
+        counter.add_metric([reason], float(count))
     yield counter

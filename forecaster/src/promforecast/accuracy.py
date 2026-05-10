@@ -86,17 +86,34 @@ def backtest(
     horizon_steps: int,
     freq: str,
     levels: list[int],
+    regressors: pd.DataFrame | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame] | None:
     """Run a single hold-out backtest.
 
     Returns ``(test_actuals, predictions)`` aligned 1:1 in row order, or
     ``None`` if the series is too short for a meaningful split.
+
+    ``regressors`` (when present) is sliced into the same train/test split
+    as ``df`` so a model that consumes exogenous variables sees the same
+    in-sample shape it will see during the production fit. Built-in models
+    ignore the kwarg today; plug-in models that *do* honour regressors
+    would otherwise see biased MAPE because backtest fed them an
+    unconditional series while production fed them conditional input.
     """
     if horizon_steps < 1 or len(df) <= horizon_steps + 1:
         return None
     train = df.iloc[:-horizon_steps].reset_index(drop=True)
     test = df.iloc[-horizon_steps:].reset_index(drop=True)
-    predictions = model.fit_predict(df=train, horizon=horizon_steps, freq=freq, levels=levels)
+    train_regressors = (
+        regressors.iloc[:-horizon_steps].reset_index(drop=True) if regressors is not None else None
+    )
+    predictions = model.fit_predict(
+        df=train,
+        horizon=horizon_steps,
+        freq=freq,
+        levels=levels,
+        regressors=train_regressors,
+    )
     return test, predictions
 
 

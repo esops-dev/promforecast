@@ -239,7 +239,12 @@ async def _dry_run(
     write(f"  query:  {query.id}  ({query.promql.strip()[:60]}...)")
     write(f"  source: {url}")
 
-    source = PromSource(url=url, timeout_seconds=cfg.datasource.timeout.total_seconds())
+    source = PromSource(
+        url=url,
+        timeout_seconds=cfg.datasource.timeout.total_seconds(),
+        max_concurrency=cfg.datasource.max_concurrent_requests,
+        max_keepalive_connections=cfg.datasource.max_keepalive_connections,
+    )
     try:
         end = datetime.now(tz=UTC)
         start = end - cfg.defaults.lookback

@@ -172,16 +172,49 @@ sink:
 After every successful run the full forecast curve is pushed as Prometheus text format with explicit millisecond timestamps.  
 VictoriaMetrics requires `-futureRetention=2d` (or higher than your `defaults.horizon`) to accept future-dated samples.
 
-The body is chunked (`chunk_size` defaults to 10000 rows) to avoid huge requests.  
-A chunk failure aborts the rest of the push for that run; the next cycle re-sends everything.  
-`/metrics` continues to expose the latest snapshot. Push failures are tracked in `forecast_remote_write_failures_total{group, reason}`.
+The body is chunked (`chunk_size` defaults to 10000 rows) to avoid huge requests.
+Each chunk is retried up to 3 times with exponential backoff on transient failures (transport errors, timeouts, 5xx); 4xx fails fast.
+If retries are exhausted, the chunk failure aborts the rest of the push for that run and the next cycle re-sends everything.
+`/metrics` continues to expose the latest snapshot.
+
+Push failures are tracked in `forecast_remote_write_failures_total{group, reason}` (terminal — bumps after retries are exhausted).
+`forecast_remote_write_retries_total{group, reason}` bumps on every retry attempt, including ones that eventually succeed — so a flaky TSDB papered over by retries is observable before it tips into outright failure.
+PromQL retries on the read side are surfaced symmetrically as `forecast_source_retries_total{reason}` (`transport` | `http_5xx`); the source counter is unlabelled by group because the read client is shared across groups.
+
+Pool sizing is configurable via `sink.remote_write.max_connections` / `max_keepalive_connections` (and the symmetric `datasource.max_concurrent_requests` / `max_keepalive_connections` on the read side).
+Tune the sink pool up when many groups push concurrently; tune the datasource pool with the read fan-out (groups × per-query regressor fan-out).
 
 ## Extending the registry
 
-To add a third-party model:
+The forecaster discovers models through the standard Python `promforecast.models` entry-point group. Any installed package that registers under this group appears in the registry automatically — no fork, no PR, no forecaster-side code change.
+
+The first community model is [`promforecast-prophet`](../community/promforecast-prophet/) — install it and `Prophet` becomes available in the `models:` array immediately.
+
+### Adding a model in your own package
+
+```toml
+# pyproject.toml of your-promforecast-extra
+[project]
+name = "your-promforecast-extra"
+dependencies = ["promforecast"]
+
+[project.entry-points."promforecast.models"]
+my_model = "your_promforecast_extra:MyModel"
+```
+
+`MyModel` must:
+- Expose a class-level `name: str` (becomes the value users put in their config — e.g. `name = "MyModel"` makes `models: [MyModel]` work).
+- Accept `season_length: int` and `**params: Any` in `__init__`.
+- Implement `fit_predict(df, horizon, freq, levels, regressors=None) -> pd.DataFrame` returning the standard `unique_id, ds, yhat[, yhat_lower_<level>, yhat_upper_<level>]` shape.
+
+The registry is lazy and cached — the first call after import discovers all entry points; subsequent calls reuse the result. Two packages that register the same `name` produce a clear `ModelRegistrationError` at boot rather than silently shadowing each other.
+
+### Adding a model in-tree (built-ins)
+
+For models that ship in this repo:
 
 1. Implement the `ForecastModel` protocol in `forecaster/src/promforecast/models/<name>.py`.
-2. Register it under the `promforecast.models` entry point in `pyproject.toml`.
+2. Register it under the `promforecast.models` entry point in `forecaster/pyproject.toml`.
 3. Document it here.
 
-CI automatically verifies all registered models.
+CI automatically verifies all registered models via the registry tests.

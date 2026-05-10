@@ -48,6 +48,7 @@ def test_query_step_override_parses(tmp_path: Path) -> None:
         _write(
             tmp_path,
             """
+apiVersion: promforecast.io/v1alpha1
 datasource:
   url: http://vm:8428/
 defaults:
@@ -73,6 +74,7 @@ def test_query_season_length_auto_parses(tmp_path: Path) -> None:
         _write(
             tmp_path,
             """
+apiVersion: promforecast.io/v1alpha1
 datasource:
   url: http://vm:8428/
 groups:
@@ -94,6 +96,7 @@ def test_query_rejects_zero_step(tmp_path: Path) -> None:
             _write(
                 tmp_path,
                 """
+apiVersion: promforecast.io/v1alpha1
 datasource:
   url: http://vm:8428/
 groups:
@@ -113,6 +116,7 @@ def test_query_rejects_zero_season_length(tmp_path: Path) -> None:
             _write(
                 tmp_path,
                 """
+apiVersion: promforecast.io/v1alpha1
 datasource:
   url: http://vm:8428/
 groups:
@@ -132,6 +136,7 @@ def test_query_rejects_unknown_season_length_string(tmp_path: Path) -> None:
             _write(
                 tmp_path,
                 """
+apiVersion: promforecast.io/v1alpha1
 datasource:
   url: http://vm:8428/
 groups:

@@ -125,6 +125,9 @@ def run(config_path: Path, log_level: str) -> None:
     source = PromSource(
         url=cfg.datasource.url,
         timeout_seconds=cfg.datasource.timeout.total_seconds(),
+        max_concurrency=cfg.datasource.max_concurrent_requests,
+        max_keepalive_connections=cfg.datasource.max_keepalive_connections,
+        on_retry=exporter.increment_source_retry,
     )
     sink = _build_sink(cfg)
     runner = Runner(config=cfg, source=source, exporter=exporter, sink=sink)
@@ -370,6 +373,8 @@ def _build_sink(cfg: config_module.Config) -> ForecastSink | None:
         timeout_seconds=rw.timeout.total_seconds(),
         headers=rw.headers,
         chunk_size=rw.chunk_size,
+        max_connections=rw.max_connections,
+        max_keepalive_connections=rw.max_keepalive_connections,
     )
 
 

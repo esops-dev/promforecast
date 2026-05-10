@@ -24,11 +24,28 @@ highAvailability:
 # Forecaster YAML config. Either inline below, or set existingConfigMap.
 existingConfigMap: ""
 config:
+  # Schema version. The forecaster routes on this string and warns when it
+  # is missing. Keep in lockstep with the version pinned for the v1.0
+  # cut-over; new alpha/beta revisions ship a side-by-side validator and
+  # leave this default in place until the bump is intentional.
+  apiVersion: promforecast.io/v1alpha1
+
   datasource:
     url: http://victoria-metrics-single-server:8428/
     timeout: 30s
     auth:
       type: none
+    # In-flight PromQL request cap. The forecaster shares this client
+    # across every group's queries + per-query regressor fan-out, so a
+    # large fan-out can stack up requests against the TSDB. Default 8 is
+    # comfortable for a single-replica forecaster against a single-node
+    # VictoriaMetrics; tune up if you observe queueing, tune down for a
+    # shared TSDB that's rate-sensitive.
+    max_concurrent_requests: 8
+    # httpx pool sizing — kept in lockstep with max_concurrent_requests
+    # by default so the semaphore is the only bottleneck. Lower the
+    # keepalive count if your TSDB closes idle connections aggressively.
+    max_keepalive_connections: 8
 
   server:
     listen: ":9091"
@@ -93,6 +110,14 @@ config:
       # ingress proxies or when push latency matters.
       chunk_size: 10000
       headers: {}
+      # HTTP pool sizing for the push client. The sink is shared across
+      # groups and groups push concurrently when their refresh intervals
+      # overlap; increase max_connections when many groups are
+      # configured so concurrent pushes don't queue on the pool. Lower
+      # the keepalive count if your TSDB closes idle connections
+      # aggressively (e.g. fronted by an HTTP proxy).
+      max_connections: 4
+      max_keepalive_connections: 2
 
   groups: []
 

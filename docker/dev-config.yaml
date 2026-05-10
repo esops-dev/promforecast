@@ -3,6 +3,8 @@
 # Backtesting and the deviation/quality emitters are on so the bundled
 # Grafana dashboards have data to show. Not intended for any non-dev use.
 
+apiVersion: promforecast.io/v1alpha1
+
 datasource:
   url: http://victoriametrics:8428/
   timeout: 30s
