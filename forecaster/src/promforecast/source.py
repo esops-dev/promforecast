@@ -70,9 +70,7 @@ class PromSource:
         self._url = url.rstrip("/")
         self._timeout_seconds = timeout_seconds
         keepalive = (
-            max_keepalive_connections
-            if max_keepalive_connections is not None
-            else max_concurrency
+            max_keepalive_connections if max_keepalive_connections is not None else max_concurrency
         )
         # Stash the resolved limits as a public attribute so callers
         # (and tests) can introspect what the client was actually

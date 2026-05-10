@@ -669,8 +669,7 @@ def _remote_write_families(
     """
     counter = CounterMetricFamily(
         "forecast_remote_write_failures",
-        "Total number of remote_write push attempts that failed, by reason "
-        "(timeout | http_error).",
+        "Total number of remote_write push attempts that failed, by reason (timeout | http_error).",
         labels=["group", "reason"],
     )
     for (group, reason), count in state.items():

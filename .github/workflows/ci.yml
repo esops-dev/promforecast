@@ -96,17 +96,21 @@ jobs:
           uv pip install --no-deps -e .
           uv pip install pytest ruff mypy pandas pandas-stubs
 
+      # ``uv run`` defaults to ``uv sync`` first, which would try to
+      # resolve ``promforecast`` from PyPI (where it isn't published) and
+      # fail. ``--no-sync`` keeps the manually-populated venv we built
+      # above; without it every lint step below is dead on arrival.
       - name: ruff check
-        run: uv run ruff check .
+        run: uv run --no-sync ruff check .
 
       - name: ruff format --check
-        run: uv run ruff format --check .
+        run: uv run --no-sync ruff format --check .
 
       - name: mypy --strict
-        run: uv run mypy --strict src
+        run: uv run --no-sync mypy --strict src
 
       - name: pytest
-        run: uv run pytest
+        run: uv run --no-sync pytest
 
   chart-lint:
     name: Lint Helm charts

@@ -524,6 +524,7 @@ class Runner:
             # show up under the right label without the sink needing to
             # know about group identity.
             if self._sink is not None and ctx.curve_points:
+
                 def _record_sink_retry(reason: str) -> None:
                     self._exporter.increment_remote_write_retry(group.name, reason)
 
