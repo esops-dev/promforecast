@@ -111,9 +111,7 @@ def test_deviation_points_skip_models_without_band_at_level() -> None:
             last_bands={80: BandSummary(lower=8.0, upper=12.0)},  # ...but only 80 came back
         ),
     }
-    points = list(
-        factory.deviation_points(backtests=backtests, emitted_models=["AutoARIMA"])
-    )
+    points = list(factory.deviation_points(backtests=backtests, emitted_models=["AutoARIMA"]))
     assert len(points) == 1
     assert points[0].labels["level"] == "80"
 
