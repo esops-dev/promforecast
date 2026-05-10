@@ -69,20 +69,65 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+        with:
+          # chart-testing diffs against the base branch to find changed
+          # charts; without history its --target-branch comparison sees
+          # nothing and the lint job becomes a no-op.
+          fetch-depth: 0
 
       - uses: azure/setup-helm@v5
         with:
           version: latest
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install chart-testing
+        # chart-testing wraps `helm lint`, schema-checks against the
+        # vendored values.schema.json, and (optionally) installs charts
+        # against a kind cluster. We skip the kind-based install step here
+        # because the deployment is exercised end-to-end by the
+        # docker-compose dev stack and a kind run would push CI past 10min.
+        uses: helm/chart-testing-action@v2.8.0
+
+      - name: Register Helm repositories
+        # ``ct lint`` rebuilds chart dependencies as part of its own pass
+        # (it doesn't trust a pre-existing ``charts/*.tgz`` cache). The
+        # umbrella stack pulls victoria-metrics-single from the upstream
+        # VM chart repo, so that repo MUST be registered with helm before
+        # ``ct lint`` runs — otherwise it bails with "no repository
+        # definition for ...". This step is idempotent and the URL must
+        # match the dependency entry in charts/promforecast-stack/Chart.yaml.
+        run: |
+          helm repo add victoria-metrics https://victoriametrics.github.io/helm-charts/
+          helm repo update
 
       - name: helm dependency update
         run: |
           helm dependency update charts/promforecast
           helm dependency update charts/promforecast-stack
 
-      - name: helm lint
+      - name: ct lint
+        # --validate-maintainers=false: maintainers are tracked in CODEOWNERS
+        # rather than chart metadata.
+        # --check-version-increment=false: the chart-releaser flow handles
+        # version bumps automatically; we don't gate every PR on a manual bump.
+        # --target-branch defaults to ``main``; explicit for clarity.
         run: |
-          helm lint charts/promforecast
-          helm lint charts/promforecast-stack
+          ct lint \
+            --charts charts/promforecast,charts/promforecast-stack \
+            --validate-maintainers=false \
+            --check-version-increment=false \
+            --target-branch ${{ github.event.repository.default_branch }}
+
+      - name: helm lint --strict
+        # Belt and braces — `ct lint` calls `helm lint` but not in strict
+        # mode. Strict mode treats deprecations and recommendation warnings
+        # as failures, which is what we want for a chart we publish.
+        run: |
+          helm lint --strict charts/promforecast
+          helm lint --strict charts/promforecast-stack
 
       - name: Install kubeconform
         run: |
@@ -102,6 +147,59 @@ jobs:
               --set dashboards.enabled=true \
               --set prometheusRules.enabled=true \
             | kubeconform -strict -summary -ignore-missing-schemas
+
+      - name: values.schema.json drift check
+        # The pydantic config schema is the source of truth for the
+        # forecaster's runtime config. The chart's values.schema.json gates
+        # `helm install` against the same field set; the ConfigMap template
+        # passes ``.Values.config`` through to the forecaster verbatim. They
+        # MUST agree — otherwise an operator can `helm install` a config
+        # that crashes the forecaster on boot. This step renders the chart
+        # ConfigMap and validates the embedded config.yaml against the
+        # forecaster's own loader, so any drift fails CI.
+        #
+        # We invoke the setup-python interpreter via the absolute path
+        # ``$pythonLocation/bin/python3`` instead of a bare ``python3``.
+        # The chart-testing-action above provisions its own venv (without
+        # ``pip`` or ``pydantic``) and prepends it to PATH, so a bare
+        # ``python3`` resolves to ct's venv and a bare ``pip`` is missing
+        # entirely. ``$pythonLocation`` is exported by actions/setup-python
+        # and persists across steps, giving us a stable handle on the
+        # Python we actually want.
+        env:
+          # Avoid the literal name ``PY`` here — that's also the heredoc
+          # terminator below, and reading both right next to each other is
+          # already confusing enough.
+          DRIFT_PYTHON: ${{ env.pythonLocation }}/bin/python3
+        run: |
+          "$DRIFT_PYTHON" -m pip install --quiet pyyaml pydantic
+          "$DRIFT_PYTHON" - <<'PY'
+          import pathlib, subprocess, sys, yaml
+          # Render the chart with the example node-capacity groups so we
+          # exercise more than the default ``groups: []``.
+          example = yaml.safe_load(pathlib.Path("examples/configs/node-capacity.yaml").read_text())
+          values_override = pathlib.Path("/tmp/chart-values.yaml")
+          values_override.write_text(yaml.safe_dump({"config": {"groups": example["groups"]}}))
+          rendered = subprocess.check_output(
+              ["helm", "template", "charts/promforecast", "-f", str(values_override)],
+              text=True,
+          )
+          docs = list(yaml.safe_load_all(rendered))
+          cm = next(
+              d for d in docs
+              if d and d.get("kind") == "ConfigMap" and "config.yaml" in d.get("data", {})
+          )
+          tmp = pathlib.Path("/tmp/chart-config.yaml")
+          tmp.write_text(cm["data"]["config.yaml"])
+          sys.path.insert(0, "forecaster/src")
+          import promforecast.config as cfg_module
+          try:
+              cfg_module.load(tmp)
+              print("OK: chart-rendered config validates against the forecaster's pydantic schema")
+          except Exception as exc:
+              print(f"chart values.yaml does not validate against the forecaster schema:\n  {exc}")
+              sys.exit(1)
+          PY
 
       - name: Dashboards are valid JSON
         run: |
