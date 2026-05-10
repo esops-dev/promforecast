@@ -158,15 +158,22 @@ jobs:
         # ConfigMap and validates the embedded config.yaml against the
         # forecaster's own loader, so any drift fails CI.
         #
-        # ``python3 -m pip`` (rather than a bare ``pip``) anchors the
-        # install to the interpreter that runs the heredoc. The
-        # chart-testing-action above provisions its own venv and can
-        # leave ``pip`` and ``python3`` pointing at different Pythons,
-        # which would otherwise produce a ``ModuleNotFoundError: pydantic``
-        # immediately after a "Successfully installed" line.
+        # We invoke the setup-python interpreter via the absolute path
+        # ``$pythonLocation/bin/python3`` instead of a bare ``python3``.
+        # The chart-testing-action above provisions its own venv (without
+        # ``pip`` or ``pydantic``) and prepends it to PATH, so a bare
+        # ``python3`` resolves to ct's venv and a bare ``pip`` is missing
+        # entirely. ``$pythonLocation`` is exported by actions/setup-python
+        # and persists across steps, giving us a stable handle on the
+        # Python we actually want.
+        env:
+          # Avoid the literal name ``PY`` here — that's also the heredoc
+          # terminator below, and reading both right next to each other is
+          # already confusing enough.
+          DRIFT_PYTHON: ${{ env.pythonLocation }}/bin/python3
         run: |
-          python3 -m pip install --quiet pyyaml pydantic
-          python3 - <<'PY'
+          "$DRIFT_PYTHON" -m pip install --quiet pyyaml pydantic
+          "$DRIFT_PYTHON" - <<'PY'
           import pathlib, subprocess, sys, yaml
           # Render the chart with the example node-capacity groups so we
           # exercise more than the default ``groups: []``.
