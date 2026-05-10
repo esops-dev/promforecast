@@ -43,3 +43,22 @@ def test_each_model_satisfies_protocol() -> None:
     for name in ("AutoARIMA", "AutoETS", "MSTL", "SeasonalNaive"):
         model = model_registry.build(name, season_length=288)
         assert callable(model.fit_predict)
+
+
+def test_build_accepts_per_model_params() -> None:
+    """``params`` must reach the model's constructor (stored for later
+    forwarding to ``statsforecast``)."""
+    model = model_registry.build("AutoARIMA", season_length=288, params={"max_p": 3})
+    assert isinstance(model, AutoARIMAModel)
+    # Internal storage is a private detail but easy enough to assert via the
+    # captured kwargs — the runner relies on this being kept verbatim.
+    assert model._params == {"max_p": 3}  # type: ignore[attr-defined]
+
+
+def test_build_stores_params_for_pass_through_at_fit_time() -> None:
+    """Wrappers accept ``**params`` and don't validate at build time — typos
+    surface as a ``TypeError`` at the first ``fit_predict`` call, where the
+    runner wraps them into the standard fit-failure path. We assert here that
+    arbitrary keys are accepted at build so wrappers stay shimless."""
+    model = model_registry.build("SeasonalNaive", season_length=288, params={"garbage": 1})
+    assert model._params == {"garbage": 1}  # type: ignore[attr-defined]

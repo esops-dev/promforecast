@@ -10,12 +10,14 @@ from __future__ import annotations
 import re
 from datetime import timedelta
 from pathlib import Path
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
 import yaml
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field
 
 from ._naming import validate_metric_name
+
+CALENDAR_FEATURE_TYPES = ("hour_of_day", "day_of_week", "is_weekend")
 
 _PROM_DURATION_RE = re.compile(
     r"^\s*(?:(\d+)d)?(?:(\d+)h)?(?:(\d+)m(?!s))?(?:(\d+)s)?(?:(\d+)ms)?\s*$"
@@ -130,6 +132,35 @@ class EmissionConfig(BaseModel):
     quality: bool = True
 
 
+class ModelSpec(BaseModel):
+    """A single configured model, with optional per-model parameter overrides.
+
+    A bare string in YAML (``- AutoARIMA``) is coerced to ``ModelSpec(name=...)``
+    by :func:`_coerce_model_spec` so existing configs keep working unchanged.
+    Power users can override individual hyperparameters via ``params:``;
+    those are forwarded to the model's ``fit_predict`` as keyword arguments.
+
+    Unknown ``params`` keys are accepted by the schema (each model decides
+    which ones it actually uses) so the registry can evolve without forcing
+    a schema bump for every new tunable.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    params: dict[str, Any] = Field(default_factory=dict)
+
+
+def _coerce_model_spec(value: object) -> object:
+    """Accept ``- AutoARIMA`` shorthand alongside the full ``{name: ...}`` dict."""
+    if isinstance(value, str):
+        return {"name": value}
+    return value
+
+
+ModelSpecField = Annotated[ModelSpec, BeforeValidator(_coerce_model_spec)]
+
+
 class DefaultsConfig(BaseModel):
     """Cascaded defaults applied to every group."""
 
@@ -138,7 +169,9 @@ class DefaultsConfig(BaseModel):
     lookback: Duration = timedelta(days=14)
     step: Duration = timedelta(minutes=5)
     horizon: Duration = timedelta(hours=24)
-    models: list[str] = Field(default_factory=lambda: ["AutoARIMA", "SeasonalNaive"])
+    models: list[ModelSpecField] = Field(
+        default_factory=lambda: [ModelSpec(name="AutoARIMA"), ModelSpec(name="SeasonalNaive")]
+    )
     season_length: int = 288
     confidence_levels: list[int] = Field(default_factory=lambda: [80, 95])
     min_points: int = 200
@@ -147,6 +180,22 @@ class DefaultsConfig(BaseModel):
 
 
 class RegressorConfig(BaseModel):
+    """Exogenous regressor wired into a query.
+
+    Two flavours:
+
+    * ``type: calendar`` — built-in deterministic features
+      (``hour_of_day``, ``day_of_week``, ``is_weekend``). ``id`` doubles as
+      the feature name and must match one of those built-ins.
+    * ``type: custom`` (default) — a PromQL query whose returned series is
+      aligned to the primary query's time index. ``promql`` is required.
+
+    ``required`` flips the failure mode from graceful (skip the regressor,
+    keep forecasting) to fatal-per-series (the whole series is skipped if
+    the regressor can't be resolved). Failures are counted regardless via
+    ``forecast_regressor_failures_total``.
+    """
+
     model_config = ConfigDict(extra="forbid")
 
     id: str
@@ -171,6 +220,43 @@ class GroupConfig(BaseModel):
     queries: list[QueryConfig]
 
 
+class RemoteWriteSinkConfig(BaseModel):
+    """Optional push sink that writes the *full* forecast curve to a TSDB.
+
+    Posts each forecast row as a Prometheus-format line with an explicit
+    future millisecond timestamp to ``url`` after every successful run.
+    Combined with VictoriaMetrics' ``-futureRetention`` flag (set to ``2d``
+    by default in the ``promforecast-stack`` umbrella chart), this makes
+    forecast curves first-class historical data: graphable, queryable, and
+    feedable into recording rules. The ``/metrics`` exporter remains the
+    pull-mode default and continues to expose snapshot gauges in parallel.
+
+    The default endpoint shape (``/api/v1/import/prometheus``) is the
+    VictoriaMetrics text-import endpoint — same data path as a Prometheus
+    federation push, no protobuf/snappy dependency required. Mimir/Thanos
+    users can point ``url`` at their equivalent ingest endpoints.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    url: str = ""
+    timeout: Duration = timedelta(seconds=30)
+    headers: dict[str, str] = Field(default_factory=dict)
+    # Rows per HTTP body. The default keeps each request well under the
+    # typical TSDB ingest cap; tighten it for shops behind aggressive
+    # ingress proxies.
+    chunk_size: int = Field(default=10_000, ge=1)
+
+
+class SinkConfig(BaseModel):
+    """Forecast output sinks. The ``/metrics`` exporter is always on."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    remote_write: RemoteWriteSinkConfig = RemoteWriteSinkConfig()
+
+
 class Config(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -178,6 +264,7 @@ class Config(BaseModel):
     server: ServerConfig = ServerConfig()
     safety: SafetyConfig = SafetyConfig()
     defaults: DefaultsConfig = DefaultsConfig()
+    sink: SinkConfig = SinkConfig()
     groups: list[GroupConfig]
 
 
@@ -198,7 +285,35 @@ def load(path: str | Path) -> Config:
             f"datasource.auth.type={config.datasource.auth.type!r} is not implemented yet; "
             "only 'none' is supported"
         )
+    if config.sink.remote_write.enabled and not config.sink.remote_write.url:
+        # Catch the common misconfiguration ("enabled but forgot the url")
+        # at load time rather than letting the first push silently 404.
+        raise ValueError("sink.remote_write.enabled is true but sink.remote_write.url is empty")
     for group in config.groups:
         for query in group.queries:
             validate_metric_name(query.id)
+            for reg in query.regressors:
+                _validate_regressor(group_name=group.name, query_id=query.id, reg=reg)
     return config
+
+
+def _validate_regressor(*, group_name: str, query_id: str, reg: RegressorConfig) -> None:
+    """Per-regressor sanity checks.
+
+    Calendar regressors must use one of the supported feature names and
+    must not carry a ``promql:`` (it would be silently ignored). Custom
+    regressors must carry a non-empty ``promql:`` (otherwise the runner
+    has nothing to query). Both checks fail the load with a message that
+    points at the offending group/query so operators can find it quickly.
+    """
+    label = f"groups[{group_name}].queries[{query_id}].regressors[{reg.id}]"
+    if reg.type == "calendar":
+        if reg.id not in CALENDAR_FEATURE_TYPES:
+            raise ValueError(
+                f"{label}: calendar regressor id must be one of "
+                f"{CALENDAR_FEATURE_TYPES}; got {reg.id!r}"
+            )
+        if reg.promql:
+            raise ValueError(f"{label}: calendar regressors must not set promql")
+    elif not reg.promql:
+        raise ValueError(f"{label}: custom regressors require a non-empty promql")

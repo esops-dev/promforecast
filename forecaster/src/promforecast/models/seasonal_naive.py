@@ -6,7 +6,7 @@ model's backtest MAPE exceeds the configured threshold.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     import pandas as pd
@@ -15,8 +15,9 @@ if TYPE_CHECKING:
 class SeasonalNaiveModel:
     name = "SeasonalNaive"
 
-    def __init__(self, season_length: int = 288) -> None:
+    def __init__(self, season_length: int = 288, **params: Any) -> None:
         self._season_length = season_length
+        self._params = params
 
     def fit_predict(
         self,
@@ -30,7 +31,7 @@ class SeasonalNaiveModel:
         from statsforecast.models import SeasonalNaive  # noqa: PLC0415
 
         sf = StatsForecast(
-            models=[SeasonalNaive(season_length=self._season_length)],
+            models=[SeasonalNaive(season_length=self._season_length, **self._params)],
             freq=freq,
             n_jobs=1,
         )

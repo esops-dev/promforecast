@@ -15,11 +15,12 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import structlog
 
 from . import models as model_registry
+from . import regressors as regressors_mod
 from .accuracy import (
     AccuracyResult,
     HorizonSpec,
@@ -28,10 +29,11 @@ from .accuracy import (
     horizons_from_durations,
     overall_mape,
 )
-from .config import GroupConfig
+from .config import GroupConfig, ModelSpec
 from .exporter import (
     AccuracyPoint,
     DeviationPoint,
+    EnsembleWeightPoint,
     Exporter,
     ForecastPoint,
     GroupSnapshot,
@@ -40,7 +42,8 @@ from .exporter import (
     validate_metric_name,
 )
 from .point_factory import BacktestOutcome, BandSummary, SeriesPointFactory
-from .selector import select
+from .selector import ensemble_weights, select
+from .sink import ForecastCurvePoint, ForecastSink, SinkError
 from .source import PromSource, SeriesFrame
 
 if TYPE_CHECKING:
@@ -70,6 +73,10 @@ class _FitResult:
     accuracy: list[AccuracyPoint] = field(default_factory=list)
     deviation: list[DeviationPoint] = field(default_factory=list)
     quality: list[QualityPoint] = field(default_factory=list)
+    ensemble: list[EnsembleWeightPoint] = field(default_factory=list)
+    # Full forecast curve (every horizon step) per emitted model. Consumed
+    # only by the ``remote_write`` sink — the snapshot exporter ignores it.
+    curve: list[ForecastCurvePoint] = field(default_factory=list)
     # Per-model wall-clock fit time (seconds), aggregated to a single
     # number per (query, model) by ``_RunContext`` below. Surfaces as
     # ``forecast_fit_duration_seconds`` for fit-time observability.
@@ -78,6 +85,10 @@ class _FitResult:
     # this series; bumped into the per-(query, model) counter on the run
     # context.
     slow_fits: set[str] = field(default_factory=set)
+    # Per-(regressor_id, reason) regressor-resolution failures recorded for
+    # this series. Aggregated to (query_id, regressor_id, reason) on the
+    # run context.
+    regressor_failures: list[tuple[str, str]] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -139,6 +150,8 @@ class _RunContext:
     accuracy_points: list[AccuracyPoint] = field(default_factory=list)
     deviation_points: list[DeviationPoint] = field(default_factory=list)
     quality_points: list[QualityPoint] = field(default_factory=list)
+    ensemble_weight_points: list[EnsembleWeightPoint] = field(default_factory=list)
+    curve_points: list[ForecastCurvePoint] = field(default_factory=list)
     series_count: int = 0
     dropped: dict[str, int] = field(default_factory=dict)
     failures: dict[str, int] = field(default_factory=dict)
@@ -151,6 +164,10 @@ class _RunContext:
     # series in this group run. Reset every run; the exporter merges with
     # the previous snapshot's counter to keep a monotonic counter view.
     slow_fits: dict[tuple[str, str], int] = field(default_factory=dict)
+    # Cumulative regressor-resolution failure counter per
+    # (query_id, regressor_id, reason). Merged with the previous snapshot
+    # in ``run_group`` so the counter stays monotonic across runs.
+    regressor_failures: dict[tuple[str, str, str], int] = field(default_factory=dict)
 
 
 def _compute_global_budgets(groups: list[GroupConfig], max_total_series: int) -> dict[str, int]:
@@ -212,11 +229,13 @@ class Runner:
         source: PromSource,
         exporter: Exporter,
         executor: ThreadPoolExecutor | None = None,
+        sink: ForecastSink | None = None,
     ) -> None:
         self._config = config
         self._source = source
         self._exporter = exporter
         self._executor = executor or ThreadPoolExecutor(max_workers=4)
+        self._sink = sink
         self._locks: dict[str, asyncio.Lock] = {g.name: asyncio.Lock() for g in config.groups}
         # Per-group task: keyed by group.name, holds the long-lived loop. We
         # key per-group (rather than a flat list) so apply_config can diff and
@@ -234,20 +253,6 @@ class Runner:
         # Reload coordination: a single lock so concurrent reload requests
         # (e.g. /-/reload + SIGHUP arriving together) serialise cleanly.
         self._reload_lock = asyncio.Lock()
-        self._warn_ensemble_if_configured(config)
-
-    @staticmethod
-    def _warn_ensemble_if_configured(config: Config) -> None:
-        if config.defaults.accuracy.auto_select == "ensemble":
-            # Surfaced once at boot/reload so an operator who picked
-            # ``ensemble`` doesn't quietly get explicit-mode behaviour.
-            # Keeping the value accepted (rather than rejecting it in the
-            # schema) means configs written today won't break when ensemble
-            # support lands later.
-            logger.warning(
-                "ensemble_auto_select_not_yet_implemented",
-                effective_behaviour="explicit",
-            )
 
     async def start(self) -> None:
         """Run each group once immediately, then on the configured interval."""
@@ -319,7 +324,6 @@ class Runner:
             )
             self._locks = {g.name: asyncio.Lock() for g in new_config.groups}
             self._exporter.retain_groups(set(new_by_name))
-            self._warn_ensemble_if_configured(new_config)
 
             interval = new_config.server.refresh_interval.total_seconds()
             for group in new_config.groups:
@@ -450,6 +454,20 @@ class Runner:
             )
             for key, count in ctx.slow_fits.items():
                 merged_slow[key] = merged_slow.get(key, 0) + count
+            # Same monotonicity treatment for regressor failures, pruned to
+            # (query, regressor) tuples that still exist in the live config.
+            current_regressor_pairs = {(q.id, r.id) for q in group.queries for r in q.regressors}
+            merged_regressor_failures: dict[tuple[str, str, str], int] = (
+                {
+                    key: count
+                    for key, count in previous_snapshot.regressor_failures.items()
+                    if (key[0], key[1]) in current_regressor_pairs
+                }
+                if previous_snapshot is not None
+                else {}
+            )
+            for rkey, rcount in ctx.regressor_failures.items():
+                merged_regressor_failures[rkey] = merged_regressor_failures.get(rkey, 0) + rcount
             self._exporter.update(
                 GroupSnapshot(
                     group=group.name,
@@ -457,11 +475,13 @@ class Runner:
                     accuracy_points=ctx.accuracy_points,
                     deviation_points=ctx.deviation_points,
                     quality_points=ctx.quality_points,
+                    ensemble_weights=ctx.ensemble_weight_points,
                     last_run_timestamp=time.time(),
                     run_duration_seconds=duration,
                     series_count=ctx.series_count,
                     series_dropped=ctx.dropped,
                     failures=ctx.failures,
+                    regressor_failures=merged_regressor_failures,
                     # ``fit_durations`` is a gauge — only this run's samples
                     # belong on /metrics. Removed queries simply disappear
                     # from the exposition until they reappear in config.
@@ -477,9 +497,33 @@ class Runner:
                 accuracy_points=len(ctx.accuracy_points),
                 deviation_points=len(ctx.deviation_points),
                 quality_points=len(ctx.quality_points),
+                ensemble_weight_points=len(ctx.ensemble_weight_points),
+                curve_points=len(ctx.curve_points),
                 dropped=dict(ctx.dropped),
                 failures=dict(ctx.failures),
+                regressor_failures=len(ctx.regressor_failures),
             )
+
+            # Push to optional remote_write sink *after* the snapshot is
+            # exposed via /metrics so a sink failure never delays the
+            # standard exposition. Sink errors are bounded into the
+            # ``forecast_remote_write_failures_total`` counter so dashboards
+            # can alert on chronic push failures without crashing the run.
+            if self._sink is not None and ctx.curve_points:
+                try:
+                    await self._sink.write(ctx.curve_points)
+                except SinkError as exc:
+                    log.warning(
+                        "remote_write_failed",
+                        reason=exc.reason,
+                        error=str(exc),
+                        points=len(ctx.curve_points),
+                    )
+                    self._exporter.increment_remote_write_failure(group.name, exc.reason)
+                except Exception as exc:
+                    log.exception("remote_write_unexpected_error")
+                    self._exporter.increment_remote_write_failure(group.name, "unexpected")
+                    del exc  # logged via exception(); avoid unused-name lint
 
     async def _run_query(
         self,
@@ -525,41 +569,109 @@ class Runner:
             ctx.global_remaining = max(0, ctx.global_remaining - len(allowed))
         ctx.series_count += len(allowed)
 
+        # Prefetch every PromQL regressor *once* per primary query — not
+        # per series. Without this split a query that returned 100 series
+        # with two PromQL regressors would issue 200 redundant TSDB
+        # requests every refresh interval; the prefetch caps it at 2.
+        try:
+            prefetch = await self._prefetch_query_regressors(query)
+        except regressors_mod.RegressorError as exc:
+            # A required regressor's PromQL failed at fetch time. Every
+            # series of this query depended on it, so skip the whole
+            # query rather than emitting N copies of the same failure.
+            qlog.warning(
+                "required_regressor_failed_query",
+                reason=exc.reason,
+                error=str(exc),
+            )
+            ctx.failures["required_regressor"] = ctx.failures.get("required_regressor", 0) + 1
+            return
+        # Optional PromQL fetch failures: counted *once* per query (not
+        # per series) so flaky regressors don't multiply the counter by
+        # the cardinality of the primary query.
+        for failure in prefetch.failures:
+            rkey = (query.id, failure.regressor_id, failure.reason)
+            ctx.regressor_failures[rkey] = ctx.regressor_failures.get(rkey, 0) + 1
+
         min_points = self._config.defaults.min_points
         for frame in allowed:
             if len(frame.values) < min_points:
                 ctx.dropped["min_points"] = ctx.dropped.get("min_points", 0) + 1
                 continue
-            try:
-                fit_result = await self._fit_series(query, frame, group.name)
-            except InvalidMetricNameError:
-                qlog.exception("invalid_metric_name")
-                ctx.failures["invalid_metric_name"] = ctx.failures.get("invalid_metric_name", 0) + 1
+            stop_query = await self._run_one_series(query, group, frame, ctx, qlog, prefetch)
+            if stop_query:
                 return
-            except TimeoutError:
-                # ``safety.fit_timeout`` exceeded — distinct from a generic
-                # fit error so dashboards can split "model crashed" from
-                # "model is too slow" without log scraping.
-                qlog.error(
-                    "fit_timed_out",
-                    labels=frame.labels,
-                    timeout_s=self._config.safety.fit_timeout.total_seconds(),
-                )
-                ctx.failures["fit_timeout"] = ctx.failures.get("fit_timeout", 0) + 1
-                continue
-            except Exception:
-                qlog.exception("fit_failed", labels=frame.labels)
-                ctx.failures["fit_error"] = ctx.failures.get("fit_error", 0) + 1
-                continue
-            ctx.points.extend(fit_result.points)
-            ctx.accuracy_points.extend(fit_result.accuracy)
-            ctx.deviation_points.extend(fit_result.deviation)
-            ctx.quality_points.extend(fit_result.quality)
-            for model_name, fit_seconds in fit_result.fit_durations.items():
-                ctx.fit_durations[(query.id, model_name)] = fit_seconds
-            for model_name in fit_result.slow_fits:
-                key = (query.id, model_name)
-                ctx.slow_fits[key] = ctx.slow_fits.get(key, 0) + 1
+
+    async def _prefetch_query_regressors(self, query: QueryConfig) -> regressors_mod.PromQLPrefetch:
+        """Run every custom regressor's PromQL once per primary query."""
+        d = self._config.defaults
+        if not query.regressors:
+            return regressors_mod.PromQLPrefetch(fetched={}, failures=[])
+        end = datetime.now(tz=UTC)
+        start = end - d.lookback
+        step_seconds = max(1, int(d.step.total_seconds()))
+        return await regressors_mod.prefetch_promql(
+            regressors=query.regressors,
+            source=self._source,
+            query_start=start,
+            query_end=end,
+            step_seconds=step_seconds,
+            query_timeout_seconds=self._config.safety.query_timeout.total_seconds(),
+        )
+
+    async def _run_one_series(
+        self,
+        query: QueryConfig,
+        group: GroupConfig,
+        frame: SeriesFrame,
+        ctx: _RunContext,
+        qlog: structlog.stdlib.BoundLogger,
+        prefetch: regressors_mod.PromQLPrefetch,
+    ) -> bool:
+        """Fit one series and merge its results into ``ctx``.
+
+        Returns ``True`` when the caller must abandon the rest of the query
+        (currently only the ``invalid_metric_name`` case, which is a
+        config-level bug — once one series trips it, the rest will too).
+        Returns ``False`` for per-series failures that should not stop the
+        loop.
+        """
+        try:
+            fit_result = await self._fit_series(query, frame, group.name, prefetch)
+        except InvalidMetricNameError:
+            qlog.exception("invalid_metric_name")
+            ctx.failures["invalid_metric_name"] = ctx.failures.get("invalid_metric_name", 0) + 1
+            return True
+        except regressors_mod.RegressorError as exc:
+            # A required *calendar* regressor failed during alignment
+            # (PromQL ones were caught at prefetch time). Skip this series
+            # only — calendar failures are deterministic per timestamp set
+            # but we don't assume the rest of the query has the same one.
+            qlog.warning(
+                "required_regressor_failed",
+                labels=frame.labels,
+                reason=exc.reason,
+                error=str(exc),
+            )
+            ctx.failures["required_regressor"] = ctx.failures.get("required_regressor", 0) + 1
+            return False
+        except TimeoutError:
+            # ``safety.fit_timeout`` exceeded — distinct from a generic
+            # fit error so dashboards can split "model crashed" from
+            # "model is too slow" without log scraping.
+            qlog.error(
+                "fit_timed_out",
+                labels=frame.labels,
+                timeout_s=self._config.safety.fit_timeout.total_seconds(),
+            )
+            ctx.failures["fit_timeout"] = ctx.failures.get("fit_timeout", 0) + 1
+            return False
+        except Exception:
+            qlog.exception("fit_failed", labels=frame.labels)
+            ctx.failures["fit_error"] = ctx.failures.get("fit_error", 0) + 1
+            return False
+        _merge_fit_into_ctx(ctx, fit_result, query.id)
+        return False
 
     async def _fetch(self, query: QueryConfig) -> list[SeriesFrame]:
         d = self._config.defaults
@@ -577,6 +689,7 @@ class Runner:
         query: QueryConfig,
         frame: SeriesFrame,
         group_name: str,
+        prefetch: regressors_mod.PromQLPrefetch,
     ) -> _FitResult:
         import pandas as pd  # noqa: PLC0415
 
@@ -600,6 +713,16 @@ class Runner:
             levels=levels,
         )
 
+        result = _FitResult()
+
+        # Align pre-fetched PromQL + apply calendar features for *this*
+        # series. ``prefetch`` is shared across every series of the
+        # primary query, so this is a cheap dataframe operation; the
+        # expensive PromQL fan-out already happened once in ``_run_query``.
+        regressors_frame = self._align_regressors_for_series(
+            query=query, frame=frame, result=result, prefetch=prefetch
+        )
+
         accuracy_horizons = horizons_from_durations(list(d.accuracy.horizons), d.step)
         auto_select_enabled = bool(d.accuracy.auto_select)
         needs = _BacktestNeeds(
@@ -609,11 +732,12 @@ class Runner:
             quality=d.emission.quality,
         )
 
+        model_specs = list(d.models)
         backtests: dict[str, BacktestOutcome] = {}
         if needs.any and accuracy_horizons:
             backtests = await self._run_backtests(
                 df=df,
-                models=list(d.models),
+                models=model_specs,
                 horizons=accuracy_horizons,
                 freq=freq,
                 levels=levels,
@@ -621,14 +745,15 @@ class Runner:
                 group_name=group_name,
                 query_id=query.id,
                 needs=needs,
+                regressors=regressors_frame,
             )
 
         backtest_results: dict[str, list[AccuracyResult]] = {
             name: outcome.results for name, outcome in backtests.items()
         }
 
-        result = _FitResult()
-        if auto_select_enabled and d.accuracy.auto_select != "ensemble":
+        is_ensemble = d.accuracy.auto_select == "ensemble"
+        if auto_select_enabled and not is_ensemble:
             forecast_points = await self._auto_select_and_forecast(
                 df=df,
                 query=query,
@@ -639,11 +764,26 @@ class Runner:
                 levels=levels,
                 backtest_results=backtest_results,
                 result=result,
+                regressors=regressors_frame,
+            )
+        elif is_ensemble:
+            forecast_points = await self._ensemble_forecast(
+                df=df,
+                models=model_specs,
+                query=query,
+                factory=factory,
+                group_name=group_name,
+                horizon=horizon,
+                freq=freq,
+                levels=levels,
+                backtest_results=backtest_results,
+                result=result,
+                regressors=regressors_frame,
             )
         else:
             forecast_points = await self._explicit_forecast(
                 df=df,
-                models=list(d.models),
+                models=model_specs,
                 query=query,
                 factory=factory,
                 group_name=group_name,
@@ -651,6 +791,7 @@ class Runner:
                 freq=freq,
                 levels=levels,
                 result=result,
+                regressors=regressors_frame,
             )
 
         result.points = forecast_points
@@ -660,7 +801,10 @@ class Runner:
 
         # Restrict deviation/quality to the model(s) actually emitted as
         # forecasts. In auto-select mode that's the winner; in explicit mode
-        # it's all configured models.
+        # it's all configured models. ``ensemble`` is treated as another
+        # emitted model — it doesn't have backtest data of its own, so it's
+        # filtered out by the deviation/quality helpers (they look up
+        # ``backtests[model_name]``).
         emitted_models = sorted({p.labels.get("model", "") for p in forecast_points})
         emitted_models = [m for m in emitted_models if m]
 
@@ -679,11 +823,48 @@ class Runner:
 
         return result
 
+    def _align_regressors_for_series(
+        self,
+        *,
+        query: QueryConfig,
+        frame: SeriesFrame,
+        result: _FitResult,
+        prefetch: regressors_mod.PromQLPrefetch,
+    ) -> pd.DataFrame | None:
+        """Align pre-fetched PromQL + materialise calendar features per series.
+
+        The expensive PromQL fan-out already happened in
+        :meth:`_prefetch_query_regressors`; this method is a pure pandas
+        operation. Required-calendar failures (a config that escaped the
+        boot validator) raise as :class:`RegressorError` and the caller
+        skips just this series.
+
+        Returning ``None`` is the signal to downstream model fits "no
+        exogenous frame this run".
+        """
+        if not query.regressors:
+            return None
+        outcome = regressors_mod.align_for_series(
+            regressors=query.regressors,
+            prefetch=prefetch,
+            timestamps=frame.timestamps,
+        )
+        for failure in outcome.failures:
+            logger.info(
+                "regressor_skipped",
+                query=query.id,
+                regressor=failure.regressor_id,
+                reason=failure.reason,
+                error=failure.message,
+            )
+            result.regressor_failures.append((failure.regressor_id, failure.reason))
+        return outcome.frame
+
     async def _explicit_forecast(
         self,
         *,
         df: pd.DataFrame,
-        models: list[str],
+        models: list[ModelSpec],
         query: QueryConfig,
         factory: SeriesPointFactory,
         group_name: str,
@@ -691,6 +872,7 @@ class Runner:
         freq: str,
         levels: list[int],
         result: _FitResult,
+        regressors: pd.DataFrame | None = None,
     ) -> list[ForecastPoint]:
         # Fits run concurrently against the shared executor: per-series wall
         # time becomes ``max(fit_time)`` instead of ``sum(fit_time)`` whenever
@@ -699,19 +881,20 @@ class Runner:
         # serial pass already touched.
         d = self._config.defaults
 
-        async def _timed(model_name: str) -> tuple[str, pd.DataFrame, float]:
+        async def _timed(spec: ModelSpec) -> tuple[str, pd.DataFrame, float]:
             t0 = time.monotonic()
             forecast = await self._fit_one(
-                model_name=model_name,
+                spec=spec,
                 df=df,
                 horizon=horizon,
                 freq=freq,
                 levels=levels,
                 season_length=d.season_length,
+                regressors=regressors,
             )
-            return model_name, forecast, time.monotonic() - t0
+            return spec.name, forecast, time.monotonic() - t0
 
-        tasks = [_timed(name) for name in models]
+        tasks = [_timed(spec) for spec in models]
         outcomes = await asyncio.gather(*tasks, return_exceptions=True)
         out: list[ForecastPoint] = []
         for outcome in outcomes:
@@ -733,6 +916,7 @@ class Runner:
                 fit_seconds=fit_seconds,
             )
             out.extend(factory.forecast_points(forecast, model_name, selection=None))
+            result.curve.extend(factory.forecast_curve_points(forecast, model_name, selection=None))
         return out
 
     async def _auto_select_and_forecast(
@@ -747,6 +931,7 @@ class Runner:
         levels: list[int],
         backtest_results: dict[str, list[AccuracyResult]],
         result: _FitResult,
+        regressors: pd.DataFrame | None = None,
     ) -> list[ForecastPoint]:
         d = self._config.defaults
         backtest_mape = {
@@ -759,14 +944,20 @@ class Runner:
             fallback_mape_threshold=d.accuracy.fallback_mape_threshold,
             backtest_mape=backtest_mape,
         )
+        # Look up params for the chosen model. The fallback model may live
+        # outside ``defaults.models`` (e.g. SeasonalNaive used as the safety
+        # net for AutoARIMA-only setups); ``_resolve_spec`` returns an empty
+        # params dict in that case so the fallback runs with stock defaults.
+        spec = _resolve_spec(d.models, selection.model)
         t0 = time.monotonic()
         forecast = await self._fit_one(
-            model_name=selection.model,
+            spec=spec,
             df=df,
             horizon=horizon,
             freq=freq,
             levels=levels,
             season_length=d.season_length,
+            regressors=regressors,
         )
         fit_seconds = time.monotonic() - t0
         result.fit_durations[selection.model] = fit_seconds
@@ -777,7 +968,108 @@ class Runner:
             model_name=selection.model,
             fit_seconds=fit_seconds,
         )
+        result.curve.extend(
+            factory.forecast_curve_points(forecast, selection.model, selection=selection)
+        )
         return list(factory.forecast_points(forecast, selection.model, selection=selection))
+
+    async def _ensemble_forecast(
+        self,
+        *,
+        df: pd.DataFrame,
+        models: list[ModelSpec],
+        query: QueryConfig,
+        factory: SeriesPointFactory,
+        group_name: str,
+        horizon: int,
+        freq: str,
+        levels: list[int],
+        backtest_results: dict[str, list[AccuracyResult]],
+        result: _FitResult,
+        regressors: pd.DataFrame | None = None,
+    ) -> list[ForecastPoint]:
+        """Combine every model's forecast into an inverse-MAPE weighted average.
+
+        Emits both the component models (so users can compare and inspect)
+        *and* a synthetic ``ensemble`` model whose ``yhat``/bands are the
+        weighted average across components, weighted by ``1 / MAPE``.
+
+        Component models that fail to fit are simply excluded from the
+        ensemble; if every model fails the result has no ensemble row but
+        keeps whatever component forecasts succeeded. Bands are averaged
+        with the same weights — this is conservative (a wide individual
+        band drags the ensemble's wider) but stays well-defined when only
+        some models report a given confidence level.
+        """
+
+        d = self._config.defaults
+
+        async def _timed(spec: ModelSpec) -> tuple[str, pd.DataFrame, float]:
+            t0 = time.monotonic()
+            forecast = await self._fit_one(
+                spec=spec,
+                df=df,
+                horizon=horizon,
+                freq=freq,
+                levels=levels,
+                season_length=d.season_length,
+                regressors=regressors,
+            )
+            return spec.name, forecast, time.monotonic() - t0
+
+        outcomes = await asyncio.gather(*(_timed(spec) for spec in models), return_exceptions=True)
+        component_forecasts: dict[str, pd.DataFrame] = {}
+        out: list[ForecastPoint] = []
+        for outcome in outcomes:
+            if isinstance(outcome, BaseException):
+                logger.exception(
+                    "fit_failed_in_ensemble_mode",
+                    group=group_name,
+                    query=query.id,
+                    exc_info=outcome,
+                )
+                continue
+            model_name, forecast, fit_seconds = outcome
+            result.fit_durations[model_name] = fit_seconds
+            self._record_slow_fit_if_needed(
+                result=result,
+                group=group_name,
+                query_id=query.id,
+                model_name=model_name,
+                fit_seconds=fit_seconds,
+            )
+            component_forecasts[model_name] = forecast
+            out.extend(factory.forecast_points(forecast, model_name, selection=None))
+            result.curve.extend(factory.forecast_curve_points(forecast, model_name, selection=None))
+
+        if not component_forecasts:
+            return out
+
+        # Compute inverse-MAPE weights restricted to models that produced a
+        # forecast this run; otherwise a backtested-but-failed-to-fit model
+        # would leak into the ensemble's denominator.
+        scoreable_mape = {
+            name: mape
+            for name, results in backtest_results.items()
+            if name in component_forecasts and (mape := overall_mape(results)) is not None
+        }
+        weights = ensemble_weights(scoreable_mape) or {
+            name: 1.0 / len(component_forecasts) for name in component_forecasts
+        }
+        weights = {name: w for name, w in weights.items() if name in component_forecasts}
+        if not weights:
+            return out
+        # Renormalise after the filter so the sum is back to 1.0; equal
+        # weights from the empty-MAPE branch are already normalised.
+        total = sum(weights.values())
+        if total > 0:
+            weights = {n: w / total for n, w in weights.items()}
+
+        ensemble_df = _combine_ensemble(component_forecasts, weights, levels)
+        out.extend(factory.forecast_points(ensemble_df, "ensemble", selection=None))
+        result.curve.extend(factory.forecast_curve_points(ensemble_df, "ensemble", selection=None))
+        result.ensemble = list(factory.ensemble_weight_points(weights))
+        return out
 
     def _record_slow_fit_if_needed(
         self,
@@ -816,7 +1108,7 @@ class Runner:
         self,
         *,
         df: pd.DataFrame,
-        models: list[str],
+        models: list[ModelSpec],
         horizons: list[HorizonSpec],
         freq: str,
         levels: list[int],
@@ -824,6 +1116,7 @@ class Runner:
         group_name: str,
         query_id: str,
         needs: _BacktestNeeds,
+        regressors: pd.DataFrame | None = None,
     ) -> dict[str, BacktestOutcome]:
         """Backtest each configured model. Per-model failures are isolated.
 
@@ -851,8 +1144,8 @@ class Runner:
         loop = asyncio.get_running_loop()
         timeout = self._config.safety.fit_timeout.total_seconds()
 
-        async def _one(model_name: str) -> tuple[pd.DataFrame, pd.DataFrame] | None:
-            model = model_registry.build(model_name, season_length=season_length)
+        async def _one(spec: ModelSpec) -> tuple[pd.DataFrame, pd.DataFrame] | None:
+            model = model_registry.build(spec.name, season_length=season_length, params=spec.params)
             return await asyncio.wait_for(
                 loop.run_in_executor(
                     self._executor, _run_backtest, model, df, eval_steps, freq, levels
@@ -860,9 +1153,10 @@ class Runner:
                 timeout=timeout,
             )
 
-        outcomes = await asyncio.gather(*(_one(name) for name in models), return_exceptions=True)
+        outcomes = await asyncio.gather(*(_one(spec) for spec in models), return_exceptions=True)
         results: dict[str, BacktestOutcome] = {}
-        for model_name, outcome in zip(models, outcomes, strict=True):
+        model_names = [spec.name for spec in models]
+        for model_name, outcome in zip(model_names, outcomes, strict=True):
             if isinstance(outcome, BaseException):
                 logger.exception(
                     "backtest_failed",
@@ -908,15 +1202,16 @@ class Runner:
     async def _fit_one(
         self,
         *,
-        model_name: str,
+        spec: ModelSpec,
         df: pd.DataFrame,
         horizon: int,
         freq: str,
         levels: list[int],
         season_length: int,
+        regressors: pd.DataFrame | None = None,
     ) -> pd.DataFrame:
         loop = asyncio.get_running_loop()
-        model = model_registry.build(model_name, season_length=season_length)
+        model = model_registry.build(spec.name, season_length=season_length, params=spec.params)
         return await asyncio.wait_for(
             loop.run_in_executor(
                 self._executor,
@@ -926,6 +1221,7 @@ class Runner:
                 horizon,
                 freq,
                 levels,
+                regressors,
             ),
             timeout=self._config.safety.fit_timeout.total_seconds(),
         )
@@ -949,6 +1245,9 @@ class Runner:
                 await task
         self._executor.shutdown(wait=False, cancel_futures=True)
         await self._source.aclose()
+        if self._sink is not None:
+            with contextlib.suppress(Exception):
+                await self._sink.aclose()
 
 
 def _run_fit(
@@ -957,8 +1256,100 @@ def _run_fit(
     horizon: int,
     freq: str,
     levels: list[int],
+    regressors: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
-    return model.fit_predict(df=df, horizon=horizon, freq=freq, levels=levels)
+    return model.fit_predict(
+        df=df, horizon=horizon, freq=freq, levels=levels, regressors=regressors
+    )
+
+
+def _merge_fit_into_ctx(ctx: _RunContext, fit_result: _FitResult, query_id: str) -> None:
+    """Splice a ``_FitResult`` into the per-group ``_RunContext``.
+
+    Pulled out of ``_run_query`` so that hot path stays readable; keeps the
+    point-list extends and per-(query, model) counter bumps in one place.
+    """
+    ctx.points.extend(fit_result.points)
+    ctx.accuracy_points.extend(fit_result.accuracy)
+    ctx.deviation_points.extend(fit_result.deviation)
+    ctx.quality_points.extend(fit_result.quality)
+    ctx.ensemble_weight_points.extend(fit_result.ensemble)
+    ctx.curve_points.extend(fit_result.curve)
+    for model_name, fit_seconds in fit_result.fit_durations.items():
+        ctx.fit_durations[(query_id, model_name)] = fit_seconds
+    for model_name in fit_result.slow_fits:
+        key = (query_id, model_name)
+        ctx.slow_fits[key] = ctx.slow_fits.get(key, 0) + 1
+    for regressor_id, reason in fit_result.regressor_failures:
+        rkey = (query_id, regressor_id, reason)
+        ctx.regressor_failures[rkey] = ctx.regressor_failures.get(rkey, 0) + 1
+
+
+def _resolve_spec(specs: list[ModelSpec], name: str) -> ModelSpec:
+    """Look up a configured ``ModelSpec`` by name; defaults to params=``{}``.
+
+    The fallback model is allowed to live outside ``defaults.models`` (a
+    SeasonalNaive safety net for an AutoARIMA-only setup is the canonical
+    case). We synthesise an empty-params spec so the fallback runs with
+    stock model defaults rather than failing the lookup.
+    """
+    for spec in specs:
+        if spec.name == name:
+            return spec
+    return ModelSpec(name=name)
+
+
+def _combine_ensemble(
+    component_forecasts: dict[str, pd.DataFrame],
+    weights: dict[str, float],
+    levels: list[int],
+) -> pd.DataFrame:
+    """Build a single forecast frame from inverse-MAPE-weighted components.
+
+    Aligns on ``unique_id`` + ``ds``. Each numeric column is the weighted
+    sum across components present at that row; missing columns (a model
+    that didn't emit a level we requested) contribute weight 0 so the
+    ensemble doesn't quietly inherit one component's missing band.
+    """
+    import pandas as pd  # noqa: PLC0415
+
+    base_cols = ["unique_id", "ds"]
+    value_cols = ["yhat"] + [
+        f"yhat_{kind}_{level}" for kind in ("lower", "upper") for level in levels
+    ]
+
+    import numpy as np  # noqa: PLC0415
+
+    accumulator: pd.DataFrame | None = None
+    weight_accumulator: dict[str, np.ndarray[Any, Any]] | None = None
+    for name, weight in weights.items():
+        df = component_forecasts.get(name)
+        if df is None or df.empty:
+            continue
+        if accumulator is None or weight_accumulator is None:
+            accumulator = df[base_cols].reset_index(drop=True).copy()
+            weight_accumulator = {col: np.zeros(len(df), dtype=float) for col in value_cols}
+            for col in value_cols:
+                accumulator[col] = 0.0
+        for col in value_cols:
+            if col not in df.columns:
+                continue
+            # Switch to numpy arrays for the accumulation: pandas would
+            # try to align on the (matching) index every iteration, which
+            # both wastes work and confuses pandas-stubs about the
+            # resulting dtype.
+            current = accumulator[col].to_numpy(dtype=float)
+            accumulator[col] = current + df[col].to_numpy(dtype=float) * weight
+            weight_accumulator[col] = weight_accumulator[col] + weight
+    if accumulator is None or weight_accumulator is None:
+        # No usable components — return an empty frame the caller can detect.
+        return pd.DataFrame(columns=[*base_cols, *value_cols])
+    # Convert weight sums back to plain Series for the divide-by-weight step;
+    # rows where total weight is 0 retain NaN rather than dividing by zero.
+    for col in value_cols:
+        denom = pd.Series(weight_accumulator[col])
+        accumulator[col] = accumulator[col] / denom.where(denom > 0, other=float("nan"))
+    return accumulator
 
 
 def _run_backtest(

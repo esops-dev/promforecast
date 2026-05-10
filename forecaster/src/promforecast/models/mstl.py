@@ -10,7 +10,7 @@ to match the rest of the registry.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from .seasonal_naive import _normalize
 
@@ -21,8 +21,9 @@ if TYPE_CHECKING:
 class MSTLModel:
     name = "MSTL"
 
-    def __init__(self, season_length: int = 288) -> None:
+    def __init__(self, season_length: int = 288, **params: Any) -> None:
         self._season_length = season_length
+        self._params = params
 
     def fit_predict(
         self,
@@ -40,6 +41,7 @@ class MSTLModel:
                 MSTL(
                     season_length=self._season_length,
                     trend_forecaster=AutoETS(season_length=1),
+                    **self._params,
                 ),
             ],
             freq=freq,

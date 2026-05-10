@@ -100,7 +100,7 @@ def run_validate(
     write(f"    groups:  {len(cfg.groups)}")
     queries = sum(len(g.queries) for g in cfg.groups)
     write(f"    queries: {queries}")
-    write(f"    models:  {', '.join(cfg.defaults.models)}")
+    write(f"    models:  {', '.join(spec.name for spec in cfg.defaults.models)}")
 
     estimate = _estimate_cardinality(cfg)
     write("")
@@ -149,9 +149,15 @@ def _estimate_cardinality(cfg: Config) -> CardinalityEstimate:
 
     # Each forecast: 1 yhat row + 2 (lower/upper) per confidence level.
     per_series_forecast = n_models * (1 + 2 * n_levels)
-    # Auto-select emits a single winner; explicit emits all configured models.
-    if cfg.defaults.accuracy.auto_select and cfg.defaults.accuracy.auto_select != "ensemble":
+    # Mode-specific output cardinality:
+    #   * single auto-select: only the winner is emitted
+    #   * ensemble: every component PLUS a synthetic ``ensemble`` model row
+    #   * explicit: every configured model
+    auto_select = cfg.defaults.accuracy.auto_select
+    if auto_select and auto_select != "ensemble":
         per_series_forecast = 1 + 2 * n_levels
+    elif auto_select == "ensemble":
+        per_series_forecast = (n_models + 1) * (1 + 2 * n_levels)
 
     forecast_lines = queries * series_cap * per_series_forecast
     accuracy_lines = (
@@ -160,8 +166,15 @@ def _estimate_cardinality(cfg: Config) -> CardinalityEstimate:
         else 0
     )
     # Deviation: one per (series, model, level) on the *emitted* models —
-    # in auto-select mode that's 1 model; in explicit mode it's n_models.
-    emitted_models = 1 if cfg.defaults.accuracy.auto_select else n_models
+    # in auto-select mode that's 1 model; ensemble emits every component
+    # (plus the synthetic "ensemble" row, which has no backtest data and
+    # is dropped by the deviation helper); explicit emits every model.
+    if auto_select and auto_select != "ensemble":
+        emitted_models = 1
+    elif auto_select == "ensemble":
+        emitted_models = n_models  # synthetic "ensemble" row has no devation data
+    else:
+        emitted_models = n_models
     deviation_lines = (
         queries * series_cap * emitted_models * n_levels * 2  # ratio + outside_band
         if cfg.defaults.emission.deviation
@@ -252,7 +265,8 @@ def _fit_sample(cfg: Config, frame: SeriesFrame, write: Writer) -> int:
 
     from . import models as model_registry  # noqa: PLC0415
 
-    model_name = cfg.defaults.models[0]
+    spec = cfg.defaults.models[0]
+    model_name = spec.name
     write(f"    fitting first model: {model_name}")
 
     df = pd.DataFrame(
@@ -269,7 +283,9 @@ def _fit_sample(cfg: Config, frame: SeriesFrame, write: Writer) -> int:
     )
     levels = list(cfg.defaults.confidence_levels)
     try:
-        model = model_registry.build(model_name, season_length=cfg.defaults.season_length)
+        model = model_registry.build(
+            model_name, season_length=cfg.defaults.season_length, params=spec.params
+        )
         t0 = time.monotonic()
         forecast = model.fit_predict(df=df, horizon=horizon, freq=freq, levels=levels)
         fit_seconds = time.monotonic() - t0

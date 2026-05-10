@@ -8,10 +8,20 @@ defaults:
   lookback: 28d
   step: 5m
   horizon: 24h
-  models: [AutoARIMA, AutoETS, SeasonalNaive]
+  # Mix the shorthand and full ModelSpec forms — the full form lets you
+  # tune individual model hyperparameters without writing custom code.
+  models:
+    - SeasonalNaive
+    - name: AutoARIMA
+      params:
+        max_p: 5
+        max_q: 5
+    - AutoETS
   season_length: 288
   accuracy:
-    auto_select: true
+    # Combine all three models per series, weighted by inverse-MAPE.
+    # The component models are still emitted alongside the ensemble row.
+    auto_select: ensemble
     fallback_model: SeasonalNaive
     fallback_mape_threshold: 30
 
@@ -22,6 +32,13 @@ groups:
       - id: http_requests_per_second
         promql: |
           sum by (service) (rate(http_requests_total[5m]))
+        # Calendar features cost nothing and most consumer-facing
+        # services have strong intraday and weekly patterns.
+        regressors:
+          - id: hour_of_day
+            type: calendar
+          - id: is_weekend
+            type: calendar
 
       - id: http_5xx_per_second
         promql: |
