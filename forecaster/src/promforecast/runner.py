@@ -57,6 +57,13 @@ logger = structlog.get_logger(__name__)
 
 OverflowStrategy = Literal["drop_lowest_priority", "reject", "sample"]
 
+# A fit is considered "slow" once its wall-clock crosses this fraction of
+# ``safety.fit_timeout``. We pick 0.5 (half) so the warning fires comfortably
+# before the timeout actually kills the fit - long enough that operators
+# can observe a degraded model before alerts go red, short enough that
+# noise-induced 5-10% wobble doesn't trip it.
+SLOW_FIT_RATIO = 0.5
+
 
 @dataclass
 class _FitResult:
@@ -66,6 +73,14 @@ class _FitResult:
     accuracy: list[AccuracyPoint] = field(default_factory=list)
     deviation: list[DeviationPoint] = field(default_factory=list)
     quality: list[QualityPoint] = field(default_factory=list)
+    # Per-model wall-clock fit time (seconds), aggregated to a single
+    # number per (query, model) by ``_RunContext`` below. Surfaces as
+    # ``forecast_fit_duration_seconds`` for fit-time observability.
+    fit_durations: dict[str, float] = field(default_factory=dict)
+    # Set of model names whose fit crossed the slow-fit threshold during
+    # this series; bumped into the per-(query, model) counter on the run
+    # context.
+    slow_fits: set[str] = field(default_factory=set)
 
 
 @dataclass(frozen=True)
@@ -96,6 +111,20 @@ class _BacktestOutcome:
     last_bands: dict[int, _BandSummary]
 
 
+@dataclass(frozen=True)
+class ReloadResult:
+    """Summary of what changed during ``Runner.apply_config``.
+
+    Returned to the operator (e.g. via the ``/-/reload`` endpoint response)
+    so they can confirm the diff matches their intent without diffing
+    /metrics output by hand.
+    """
+
+    added: list[str] = field(default_factory=list)
+    removed: list[str] = field(default_factory=list)
+    changed: list[str] = field(default_factory=list)
+
+
 @dataclass
 class _RunContext:
     """Mutable accumulator threaded through ``_run_query`` calls.
@@ -113,6 +142,14 @@ class _RunContext:
     dropped: dict[str, int] = field(default_factory=dict)
     failures: dict[str, int] = field(default_factory=dict)
     global_remaining: int = 0
+    # Most-recent fit duration per (query_id, model_name). Multiple series
+    # under the same query keep overwriting each other intentionally — at
+    # snapshot time we want a representative most-recent number, not a sum.
+    fit_durations: dict[tuple[str, str], float] = field(default_factory=dict)
+    # Cumulative slow-fit counter per (query_id, model_name) across the
+    # series in this group run. Reset every run; the exporter merges with
+    # the previous snapshot's counter to keep a monotonic counter view.
+    slow_fits: dict[tuple[str, str], int] = field(default_factory=dict)
 
 
 def _compute_global_budgets(groups: list[GroupConfig], max_total_series: int) -> dict[str, int]:
@@ -180,16 +217,32 @@ class Runner:
         self._exporter = exporter
         self._executor = executor or ThreadPoolExecutor(max_workers=4)
         self._locks: dict[str, asyncio.Lock] = {g.name: asyncio.Lock() for g in config.groups}
-        self._tasks: list[asyncio.Task[None]] = []
+        # Per-group task: keyed by group.name, holds the long-lived loop. We
+        # key per-group (rather than a flat list) so apply_config can diff and
+        # restart only the groups whose definition changed.
+        self._tasks: dict[str, asyncio.Task[None]] = {}
+        # Per-group cooperative-stop signals. apply_config sets these before
+        # waiting for the loop to drain, instead of cancelling the task —
+        # cancellation would tear down a mid-flight ``run_group`` and lose
+        # the snapshot it was about to write.
+        self._stop_events: dict[str, asyncio.Event] = {}
         self._stopped = asyncio.Event()
         self._global_budgets = _compute_global_budgets(
             list(config.groups), config.safety.max_total_series
         )
+        # Reload coordination: a single lock so concurrent reload requests
+        # (e.g. /-/reload + SIGHUP arriving together) serialise cleanly.
+        self._reload_lock = asyncio.Lock()
+        self._warn_ensemble_if_configured(config)
+
+    @staticmethod
+    def _warn_ensemble_if_configured(config: Config) -> None:
         if config.defaults.auto_select == "ensemble":
-            # Surfaced once at boot so an operator who picked ``ensemble``
-            # doesn't quietly get explicit-mode behaviour. Keeping the value
-            # accepted (rather than rejecting it in the schema) means configs
-            # written today won't break when ensemble support lands later.
+            # Surfaced once at boot/reload so an operator who picked
+            # ``ensemble`` doesn't quietly get explicit-mode behaviour.
+            # Keeping the value accepted (rather than rejecting it in the
+            # schema) means configs written today won't break when ensemble
+            # support lands later.
             logger.warning(
                 "ensemble_auto_select_not_yet_implemented",
                 effective_behaviour="explicit",
@@ -199,25 +252,176 @@ class Runner:
         """Run each group once immediately, then on the configured interval."""
         interval = self._config.server.refresh_interval.total_seconds()
         for group in self._config.groups:
-            self._tasks.append(asyncio.create_task(self._loop(group, interval)))
+            self._spawn_group_loop(group, interval)
 
-    async def _loop(self, group: GroupConfig, interval_seconds: float) -> None:
-        while not self._stopped.is_set():
+    def _spawn_group_loop(self, group: GroupConfig, interval_seconds: float) -> None:
+        """Create the stop event + task for one group. Idempotent per name."""
+        ev = asyncio.Event()
+        self._stop_events[group.name] = ev
+        self._tasks[group.name] = asyncio.create_task(self._loop(group, interval_seconds, ev))
+
+    async def apply_config(self, new_config: Config) -> ReloadResult:
+        """Swap in a new validated config, draining in-flight runs first.
+
+        Validate-before-swap is the caller's contract: ``new_config`` must
+        already be a fully-validated :class:`Config`. This method only
+        performs the runtime swap so a parse failure can't kill in-flight
+        runs.
+
+        The drain is *cooperative*: the per-group stop events are set, then
+        we wait for each loop to finish its current ``run_group`` and exit
+        on its own. This is deliberate — interrupting a fit mid-flight
+        wastes the executor work that has already happened and loses the
+        snapshot the run was about to write. A bounded grace period
+        (``2 * safety.fit_timeout``, with a 60s floor) caps the worst case;
+        any task that hasn't drained by then is hard-cancelled.
+
+        Identical configs are a fast no-op (no drain, no restart).
+
+        Returns a :class:`ReloadResult` summarising what changed. Removed
+        groups have their snapshots cleared from the exporter so /metrics no
+        longer shows their series.
+        """
+        async with self._reload_lock:
+            old = self._config
+            old_by_name = {g.name: g for g in old.groups}
+            new_by_name = {g.name: g for g in new_config.groups}
+
+            added = sorted(set(new_by_name) - set(old_by_name))
+            removed = sorted(set(old_by_name) - set(new_by_name))
+            changed = sorted(
+                name
+                for name in set(new_by_name) & set(old_by_name)
+                if old_by_name[name] != new_by_name[name]
+            )
+
+            log = logger.bind(added=added, removed=removed, changed=changed)
+
+            # Fast no-op path: pydantic models compare structurally, so an
+            # equal config means nothing changed and we shouldn't drain.
+            # This matters when a ConfigMap is re-projected with identical
+            # bytes (kubelet behaviour) — no group should pause.
+            if new_config == old:
+                log.info("config_reload_no_op")
+                return ReloadResult()
+
+            log.info("config_reload_apply")
+
+            await self._drain_all_groups(grace_seconds=self._drain_grace_seconds(old))
+
+            # All loops are quiescent — safe to swap config + budgets without
+            # racing readers. Loops that read self._config later will all see
+            # the new value consistently.
+            self._config = new_config
+            self._global_budgets = _compute_global_budgets(
+                list(new_config.groups), new_config.safety.max_total_series
+            )
+            self._locks = {g.name: asyncio.Lock() for g in new_config.groups}
+            self._exporter.retain_groups(set(new_by_name))
+            self._warn_ensemble_if_configured(new_config)
+
+            interval = new_config.server.refresh_interval.total_seconds()
+            for group in new_config.groups:
+                self._spawn_group_loop(group, interval)
+
+            return ReloadResult(added=added, removed=removed, changed=changed)
+
+    @staticmethod
+    def _drain_grace_seconds(config: Config) -> float:
+        """How long to wait for an in-flight run to finish before hard-cancelling.
+
+        We pick ``max(60s, 2 * fit_timeout)`` so a single backtest+forecast
+        round (typically capped at fit_timeout) has comfortable headroom,
+        and we always wait at least a minute even if fit_timeout is set
+        very low. Tests can override fit_timeout to drive this down.
+        """
+        return max(60.0, 2.0 * config.safety.fit_timeout.total_seconds())
+
+    async def _drain_all_groups(self, *, grace_seconds: float) -> None:
+        """Signal every group to stop after its current run, then await drain.
+
+        Loops that are currently sleeping will exit immediately when their
+        stop event fires. Loops mid-``run_group`` will finish the run, write
+        their snapshot, and exit on the next iteration check. Anything still
+        running after ``grace_seconds`` is hard-cancelled to keep reload
+        latency bounded.
+        """
+        for ev in self._stop_events.values():
+            ev.set()
+        tasks = list(self._tasks.values())
+        self._tasks.clear()
+        self._stop_events.clear()
+        if not tasks:
+            return
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*tasks, return_exceptions=True),
+                timeout=grace_seconds,
+            )
+        except TimeoutError:
+            logger.warning(
+                "config_reload_drain_timeout",
+                grace_s=grace_seconds,
+                still_running=sum(1 for t in tasks if not t.done()),
+            )
+            for task in tasks:
+                task.cancel()
+            for task in tasks:
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await task
+
+    async def _loop(
+        self,
+        group: GroupConfig,
+        interval_seconds: float,
+        stop_event: asyncio.Event,
+    ) -> None:
+        while not stop_event.is_set() and not self._stopped.is_set():
             try:
                 await self.run_group(group)
+            except asyncio.CancelledError:
+                # Hard cancellation during shutdown / drain timeout: let it
+                # propagate so ``_drain_all_groups`` and ``stop`` can finish.
+                raise
             except Exception:
                 logger.exception("group_run_failed", group=group.name)
                 self._exporter.increment_failure(group.name, reason="group_error")
-            try:
-                await asyncio.wait_for(self._stopped.wait(), timeout=interval_seconds)
-            except TimeoutError:
-                continue
+            await self._sleep_until_stopped_or(stop_event, interval_seconds)
+
+    async def _sleep_until_stopped_or(
+        self,
+        stop_event: asyncio.Event,
+        timeout_seconds: float,
+    ) -> None:
+        """Sleep up to ``timeout_seconds``; return early on either stop signal.
+
+        Implementing this with ``asyncio.wait`` (rather than two nested
+        ``wait_for`` calls) keeps the cancellation semantics simple: when
+        ``timeout`` expires we cancel the unsignalled waiters explicitly so
+        no orphan tasks linger across loop iterations.
+        """
+        waiters = [
+            asyncio.create_task(stop_event.wait()),
+            asyncio.create_task(self._stopped.wait()),
+        ]
+        try:
+            await asyncio.wait(
+                waiters,
+                timeout=timeout_seconds,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        finally:
+            for waiter in waiters:
+                if not waiter.done():
+                    waiter.cancel()
+                    with contextlib.suppress(asyncio.CancelledError, Exception):
+                        await waiter
 
     async def run_group(self, group: GroupConfig) -> None:
         """Execute a single group: query, fit, select, export."""
         async with self._locks[group.name]:
             started = time.monotonic()
-            log = logger.bind(group=group.name)
+            log = logger.bind(group=group.name, query_count=len(group.queries))
             log.info("group_run_start")
 
             ctx = _RunContext(global_remaining=self._global_budgets.get(group.name, 0))
@@ -225,6 +429,26 @@ class Runner:
                 await self._run_query(query, group, ctx, log)
 
             duration = time.monotonic() - started
+            # Counter semantics: merge this run's slow_fits with the previous
+            # snapshot's so the exposed counter never decreases. Without the
+            # merge each run would reset to 0 — Prometheus would treat that
+            # as a counter-reset and rate() would lie. We *prune* the merge
+            # to (query, model) tuples whose query still exists in the
+            # current group config; otherwise a hot-reload that drops a
+            # query would leak its old slow_fits label set forever.
+            previous_snapshot = self._exporter.snapshot_for(group.name)
+            current_query_ids = {q.id for q in group.queries}
+            merged_slow: dict[tuple[str, str], int] = (
+                {
+                    key: count
+                    for key, count in previous_snapshot.slow_fits.items()
+                    if key[0] in current_query_ids
+                }
+                if previous_snapshot is not None
+                else {}
+            )
+            for key, count in ctx.slow_fits.items():
+                merged_slow[key] = merged_slow.get(key, 0) + count
             self._exporter.update(
                 GroupSnapshot(
                     group=group.name,
@@ -237,6 +461,11 @@ class Runner:
                     series_count=ctx.series_count,
                     series_dropped=ctx.dropped,
                     failures=ctx.failures,
+                    # ``fit_durations`` is a gauge — only this run's samples
+                    # belong on /metrics. Removed queries simply disappear
+                    # from the exposition until they reappear in config.
+                    fit_durations=ctx.fit_durations,
+                    slow_fits=merged_slow,
                 )
             )
             log.info(
@@ -244,6 +473,11 @@ class Runner:
                 duration_s=round(duration, 3),
                 series=ctx.series_count,
                 points=len(ctx.points),
+                accuracy_points=len(ctx.accuracy_points),
+                deviation_points=len(ctx.deviation_points),
+                quality_points=len(ctx.quality_points),
+                dropped=dict(ctx.dropped),
+                failures=dict(ctx.failures),
             )
 
     async def _run_query(
@@ -253,10 +487,18 @@ class Runner:
         ctx: _RunContext,
         log: structlog.stdlib.BoundLogger,
     ) -> None:
+        qlog = log.bind(query=query.id)
         try:
             frames = await self._fetch(query)
+        except TimeoutError:
+            qlog.error(
+                "query_timed_out",
+                timeout_s=self._config.safety.query_timeout.total_seconds(),
+            )
+            ctx.failures["query_timeout"] = ctx.failures.get("query_timeout", 0) + 1
+            return
         except Exception:
-            log.exception("query_failed", id=query.id)
+            qlog.exception("query_failed")
             ctx.failures["query_error"] = ctx.failures.get("query_error", 0) + 1
             return
 
@@ -271,6 +513,13 @@ class Runner:
         allowed, dropped_n = _apply_overflow(frames, effective_cap, safety.series_overflow)
         if dropped_n:
             ctx.dropped[cap_reason] = ctx.dropped.get(cap_reason, 0) + dropped_n
+            qlog.info(
+                "series_dropped",
+                reason=cap_reason,
+                dropped=dropped_n,
+                returned=len(frames),
+                allowed=len(allowed),
+            )
         if global_cap_enabled:
             ctx.global_remaining = max(0, ctx.global_remaining - len(allowed))
         ctx.series_count += len(allowed)
@@ -283,17 +532,33 @@ class Runner:
             try:
                 fit_result = await self._fit_series(query, frame, group.name)
             except InvalidMetricNameError:
-                log.exception("invalid_metric_name", id=query.id)
+                qlog.exception("invalid_metric_name")
                 ctx.failures["invalid_metric_name"] = ctx.failures.get("invalid_metric_name", 0) + 1
                 return
+            except TimeoutError:
+                # ``safety.fit_timeout`` exceeded — distinct from a generic
+                # fit error so dashboards can split "model crashed" from
+                # "model is too slow" without log scraping.
+                qlog.error(
+                    "fit_timed_out",
+                    labels=frame.labels,
+                    timeout_s=self._config.safety.fit_timeout.total_seconds(),
+                )
+                ctx.failures["fit_timeout"] = ctx.failures.get("fit_timeout", 0) + 1
+                continue
             except Exception:
-                log.exception("fit_failed", id=query.id, labels=frame.labels)
+                qlog.exception("fit_failed", labels=frame.labels)
                 ctx.failures["fit_error"] = ctx.failures.get("fit_error", 0) + 1
                 continue
             ctx.points.extend(fit_result.points)
             ctx.accuracy_points.extend(fit_result.accuracy)
             ctx.deviation_points.extend(fit_result.deviation)
             ctx.quality_points.extend(fit_result.quality)
+            for model_name, fit_seconds in fit_result.fit_durations.items():
+                ctx.fit_durations[(query.id, model_name)] = fit_seconds
+            for model_name in fit_result.slow_fits:
+                key = (query.id, model_name)
+                ctx.slow_fits[key] = ctx.slow_fits.get(key, 0) + 1
 
     async def _fetch(self, query: QueryConfig) -> list[SeriesFrame]:
         d = self._config.defaults
@@ -345,12 +610,15 @@ class Runner:
                 freq=freq,
                 levels=levels,
                 season_length=d.season_length,
+                group_name=group_name,
+                query_id=query.id,
             )
 
         backtest_results: dict[str, list[AccuracyResult]] = {
             name: outcome.results for name, outcome in backtests.items()
         }
 
+        result = _FitResult()
         if auto_select_enabled and d.auto_select != "ensemble":
             forecast_points = await self._auto_select_and_forecast(
                 df=df,
@@ -361,6 +629,7 @@ class Runner:
                 freq=freq,
                 levels=levels,
                 backtest_results=backtest_results,
+                result=result,
             )
         else:
             forecast_points = await self._explicit_forecast(
@@ -372,9 +641,10 @@ class Runner:
                 horizon=horizon,
                 freq=freq,
                 levels=levels,
+                result=result,
             )
 
-        result = _FitResult(points=forecast_points)
+        result.points = forecast_points
 
         if d.evaluate and backtest_results:
             result.accuracy = list(
@@ -434,6 +704,7 @@ class Runner:
         horizon: int,
         freq: str,
         levels: list[int],
+        result: _FitResult,
     ) -> list[ForecastPoint]:
         # Fits run concurrently against the shared executor: per-series wall
         # time becomes ``max(fit_time)`` instead of ``sum(fit_time)`` whenever
@@ -441,8 +712,10 @@ class Runner:
         # so this doesn't risk overloading anything beyond what a single
         # serial pass already touched.
         d = self._config.defaults
-        tasks = [
-            self._fit_one(
+
+        async def _timed(model_name: str) -> tuple[str, pd.DataFrame, float]:
+            t0 = time.monotonic()
+            forecast = await self._fit_one(
                 model_name=model_name,
                 df=df,
                 horizon=horizon,
@@ -450,18 +723,29 @@ class Runner:
                 levels=levels,
                 season_length=d.season_length,
             )
-            for model_name in models
-        ]
+            return model_name, forecast, time.monotonic() - t0
+
+        tasks = [_timed(name) for name in models]
         outcomes = await asyncio.gather(*tasks, return_exceptions=True)
         out: list[ForecastPoint] = []
-        for model_name, forecast in zip(models, outcomes, strict=True):
-            if isinstance(forecast, BaseException):
+        for outcome in outcomes:
+            if isinstance(outcome, BaseException):
                 logger.exception(
                     "fit_failed_in_explicit_mode",
-                    model=model_name,
-                    exc_info=forecast,
+                    group=group_name,
+                    query=query.id,
+                    exc_info=outcome,
                 )
                 continue
+            model_name, forecast, fit_seconds = outcome
+            result.fit_durations[model_name] = fit_seconds
+            self._record_slow_fit_if_needed(
+                result=result,
+                group=group_name,
+                query_id=query.id,
+                model_name=model_name,
+                fit_seconds=fit_seconds,
+            )
             out.extend(
                 _forecast_to_points(
                     forecast=forecast,
@@ -486,6 +770,7 @@ class Runner:
         freq: str,
         levels: list[int],
         backtest_results: dict[str, list[AccuracyResult]],
+        result: _FitResult,
     ) -> list[ForecastPoint]:
         d = self._config.defaults
         backtest_mape = {
@@ -498,6 +783,7 @@ class Runner:
             fallback_mape_threshold=d.fallback_mape_threshold,
             backtest_mape=backtest_mape,
         )
+        t0 = time.monotonic()
         forecast = await self._fit_one(
             model_name=selection.model,
             df=df,
@@ -505,6 +791,15 @@ class Runner:
             freq=freq,
             levels=levels,
             season_length=d.season_length,
+        )
+        fit_seconds = time.monotonic() - t0
+        result.fit_durations[selection.model] = fit_seconds
+        self._record_slow_fit_if_needed(
+            result=result,
+            group=group_name,
+            query_id=query.id,
+            model_name=selection.model,
+            fit_seconds=fit_seconds,
         )
         return list(
             _forecast_to_points(
@@ -518,6 +813,39 @@ class Runner:
             )
         )
 
+    def _record_slow_fit_if_needed(
+        self,
+        *,
+        result: _FitResult,
+        group: str,
+        query_id: str,
+        model_name: str,
+        fit_seconds: float,
+    ) -> None:
+        """Log + tag a fit that crossed the slow-fit threshold.
+
+        See ``SLOW_FIT_RATIO`` for the threshold rationale. We log at WARN
+        and add the model name to ``result.slow_fits`` so the run-context
+        accumulator can bump the per-(query, model) counter; rendering as
+        a counter (not a gauge) is the right shape for ``rate(...)`` alerts.
+        """
+        timeout_seconds = self._config.safety.fit_timeout.total_seconds()
+        if timeout_seconds <= 0:
+            return
+        threshold = timeout_seconds * SLOW_FIT_RATIO
+        if fit_seconds < threshold:
+            return
+        result.slow_fits.add(model_name)
+        logger.warning(
+            "fit_slow",
+            group=group,
+            query=query_id,
+            model=model_name,
+            fit_seconds=round(fit_seconds, 3),
+            threshold_seconds=round(threshold, 3),
+            timeout_seconds=round(timeout_seconds, 3),
+        )
+
     async def _run_backtests(
         self,
         *,
@@ -527,6 +855,8 @@ class Runner:
         freq: str,
         levels: list[int],
         season_length: int,
+        group_name: str,
+        query_id: str,
     ) -> dict[str, _BacktestOutcome]:
         """Backtest each configured model. Per-model failures are isolated.
 
@@ -567,7 +897,13 @@ class Runner:
         results: dict[str, _BacktestOutcome] = {}
         for model_name, outcome in zip(models, outcomes, strict=True):
             if isinstance(outcome, BaseException):
-                logger.exception("backtest_failed", model=model_name, exc_info=outcome)
+                logger.exception(
+                    "backtest_failed",
+                    group=group_name,
+                    query=query_id,
+                    model=model_name,
+                    exc_info=outcome,
+                )
                 continue
             if outcome is None:
                 continue
@@ -617,11 +953,20 @@ class Runner:
         )
 
     async def stop(self) -> None:
-        """Shut down the scheduler and cancel in-flight runs."""
+        """Shut down the scheduler and cancel in-flight runs.
+
+        Unlike a config reload, process shutdown does not give in-flight
+        runs a grace period: SIGTERM gets ten seconds in Kubernetes by
+        default, and we'd rather drop a half-finished snapshot than
+        delay the termination.
+        """
         self._stopped.set()
-        for task in self._tasks:
+        tasks = list(self._tasks.values())
+        self._tasks.clear()
+        self._stop_events.clear()
+        for task in tasks:
             task.cancel()
-        for task in self._tasks:
+        for task in tasks:
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await task
         self._executor.shutdown(wait=False, cancel_futures=True)

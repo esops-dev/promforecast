@@ -1,0 +1,14 @@
+# chart-testing config — see https://github.com/helm/chart-testing
+# Lives under .github/ so it's colocated with workflows and CODEOWNERS.
+
+# Chart roots that ct should consider. The umbrella stack chart vendors
+# the forecaster chart at packaging time, so we lint both independently.
+chart-dirs:
+  - charts
+
+# Skip chart-testing's optional install/upgrade steps. The end-to-end
+# install path is exercised by the docker-compose dev stack and the
+# kubeconform render check; spinning up a kind cluster on every PR for a
+# chart whose templates are mostly k8s primitives doesn't pay for itself.
+validate-maintainers: false
+check-version-increment: false

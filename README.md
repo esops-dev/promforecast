@@ -33,6 +33,13 @@ helm install promforecast promforecast/promforecast-stack
 This installs VictoriaMetrics, the forecaster, and example dashboards.
 For an existing TSDB, install only `promforecast/promforecast`.
 
+Editing the YAML config does **not** require a pod restart: the
+forecaster watches the mounted ConfigMap, validates the new config
+in-place, and rolls back on validation failure (`kubectl apply` to the
+ConfigMap is enough). `POST /-/reload` and `SIGHUP` trigger the same
+path. See [`docs/cli.md`](docs/cli.md) for `promforecast validate`,
+which CI users can run against a config file before merging.
+
 See [`docs/`](docs/) for configuration, model selection, and operational
 guidance.
 

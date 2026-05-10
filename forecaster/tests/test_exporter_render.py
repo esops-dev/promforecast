@@ -15,8 +15,18 @@ from promforecast.exporter import (
 
 
 def test_render_empty_is_well_formed() -> None:
-    out = Exporter().render()
-    assert out == b""
+    """No groups + no reload yet → only the always-on reload telemetry."""
+    out = Exporter().render().decode()
+    # Reload telemetry families are always emitted so dashboards can show
+    # "never reloaded" (timestamp 0) without 404'ing the panel on boot.
+    assert "forecast_config_last_reload_timestamp_seconds 0.0" in out
+    assert "forecast_config_reload_success 1.0" in out
+    assert "forecast_config_reload_failures_total 0.0" in out
+    # No forecast/accuracy/deviation/quality samples.
+    assert "_forecast " not in out
+    assert "forecast_accuracy_" not in out
+    assert "forecast_deviation_" not in out
+    assert "forecast_quality_" not in out
 
 
 def test_render_includes_forecast_metric_and_op_metrics() -> None:
