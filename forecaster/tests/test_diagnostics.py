@@ -13,9 +13,11 @@ from typing import TYPE_CHECKING
 import pytest
 
 from promforecast.config import (
+    AccuracyConfig,
     Config,
     DatasourceConfig,
     DefaultsConfig,
+    EmissionConfig,
     GroupConfig,
     QueryConfig,
     SafetyConfig,
@@ -86,10 +88,8 @@ def _config() -> Config:
             min_points=10,
             models=["SeasonalNaive"],
             confidence_levels=[80],
-            evaluate=False,
-            emit_deviation=False,
-            emit_quality=False,
-            accuracy_horizons=[],
+            accuracy=AccuracyConfig(evaluate=False, horizons=[]),
+            emission=EmissionConfig(deviation=False, quality=False),
         ),
         groups=[GroupConfig(name="g", queries=[QueryConfig(id="m", promql="up")])],
     )
@@ -255,10 +255,8 @@ async def test_slow_fits_counter_prunes_removed_query_labels(
             min_points=10,
             models=["SeasonalNaive"],
             confidence_levels=[80],
-            evaluate=False,
-            emit_deviation=False,
-            emit_quality=False,
-            accuracy_horizons=[],
+            accuracy=AccuracyConfig(evaluate=False, horizons=[]),
+            emission=EmissionConfig(deviation=False, quality=False),
         ),
         groups=[
             GroupConfig(

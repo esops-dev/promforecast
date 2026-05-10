@@ -1,6 +1,6 @@
 """Actual-vs-forecast deviation metrics.
 
-When ``emit_deviation: true`` the forecaster compares the most recent actual
+When ``emission.deviation: true`` the forecaster compares the most recent actual
 value of a series to the forecast band emitted on the previous run and emits:
 
 - ``forecast_deviation_ratio``: signed normalised distance from the centre of

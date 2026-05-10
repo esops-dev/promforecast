@@ -19,15 +19,17 @@ defaults:
   models: [AutoARIMA, AutoETS, SeasonalNaive]
   season_length: 288
   confidence_levels: [80, 95]
-  evaluate: true
-  accuracy_horizons: [1h, 6h, 24h]
-  # Pick the lowest-MAPE model per series; fall back to SeasonalNaive when
-  # the winner's MAPE is above 50% (likely a bad fit, don't dress it up).
-  auto_select: true
-  fallback_model: SeasonalNaive
-  fallback_mape_threshold: 50
-  emit_deviation: true
-  emit_quality: true
+  accuracy:
+    evaluate: true
+    horizons: [1h, 6h, 24h]
+    # Pick the lowest-MAPE model per series; fall back to SeasonalNaive when
+    # the winner's MAPE is above 50% (likely a bad fit, don't dress it up).
+    auto_select: true
+    fallback_model: SeasonalNaive
+    fallback_mape_threshold: 50
+  emission:
+    deviation: true
+    quality: true
 
 groups:
   - name: node_capacity

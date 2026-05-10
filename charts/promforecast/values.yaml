@@ -52,13 +52,15 @@ config:
     season_length: 288
     confidence_levels: [80, 95]
     min_points: 200
-    evaluate: true
-    accuracy_horizons: [1h, 6h, 24h]
-    auto_select: false
-    fallback_model: SeasonalNaive
-    fallback_mape_threshold: 50
-    emit_deviation: true
-    emit_quality: true
+    accuracy:
+      evaluate: true
+      horizons: [1h, 6h, 24h]
+      auto_select: false
+      fallback_model: SeasonalNaive
+      fallback_mape_threshold: 50
+    emission:
+      deviation: true
+      quality: true
 
   groups: []
 

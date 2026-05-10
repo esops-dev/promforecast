@@ -90,14 +90,48 @@ class SafetyConfig(BaseModel):
     query_timeout: Duration = timedelta(seconds=30)
 
 
-class DefaultsConfig(BaseModel):
-    """Cascaded defaults applied to every group.
+class AccuracyConfig(BaseModel):
+    """Backtesting + model-selection knobs.
 
-    Note on backtest cost: ``evaluate``, ``auto_select``, ``emit_deviation``,
-    and ``emit_quality`` all rely on the per-fit hold-out backtest. Turning
-    *any* of them on costs one extra fit per (series, model). Set all four
-    to ``false`` to skip backtests entirely when CPU is tight.
+    Grouped together because they share one underlying cost: the per-fit
+    hold-out backtest. ``evaluate``, ``auto_select`` (any non-false value),
+    and the deviation/quality emitters in :class:`EmissionConfig` all rely
+    on it. Set ``evaluate: false`` and disable both emission flags to skip
+    backtesting entirely when CPU is tight.
     """
+
+    model_config = ConfigDict(extra="forbid")
+
+    evaluate: bool = True
+    horizons: list[Duration] = Field(
+        default_factory=lambda: [
+            timedelta(hours=1),
+            timedelta(hours=6),
+            timedelta(hours=24),
+        ]
+    )
+    auto_select: bool | Literal["ensemble"] = False
+    fallback_model: str = "SeasonalNaive"
+    fallback_mape_threshold: float | None = 50.0
+
+
+class EmissionConfig(BaseModel):
+    """Per-metric-family on/off toggles.
+
+    Both rely on backtest data (see :class:`AccuracyConfig`); turning them
+    on without ``accuracy.evaluate`` is allowed because the backtest will be
+    run on demand for the deviation/quality summaries even if the per-horizon
+    MAPE/MASE samples are not exposed.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    deviation: bool = True
+    quality: bool = True
+
+
+class DefaultsConfig(BaseModel):
+    """Cascaded defaults applied to every group."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -108,19 +142,8 @@ class DefaultsConfig(BaseModel):
     season_length: int = 288
     confidence_levels: list[int] = Field(default_factory=lambda: [80, 95])
     min_points: int = 200
-    evaluate: bool = True
-    accuracy_horizons: list[Duration] = Field(
-        default_factory=lambda: [
-            timedelta(hours=1),
-            timedelta(hours=6),
-            timedelta(hours=24),
-        ]
-    )
-    auto_select: bool | Literal["ensemble"] = False
-    fallback_model: str = "SeasonalNaive"
-    fallback_mape_threshold: float | None = 50.0
-    emit_deviation: bool = True
-    emit_quality: bool = True
+    accuracy: AccuracyConfig = AccuracyConfig()
+    emission: EmissionConfig = EmissionConfig()
 
 
 class RegressorConfig(BaseModel):

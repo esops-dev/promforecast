@@ -16,9 +16,10 @@ compatibility shim.
 
 from __future__ import annotations
 
+import math
 import threading
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from prometheus_client import CollectorRegistry, generate_latest
 from prometheus_client.core import CounterMetricFamily, GaugeMetricFamily
@@ -26,7 +27,7 @@ from prometheus_client.core import CounterMetricFamily, GaugeMetricFamily
 from ._naming import InvalidMetricNameError, validate_metric_name
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Callable, Iterator
 
 __all__ = [
     "AccuracyPoint",
@@ -212,6 +213,36 @@ class _SnapshotCollector:
         yield from _reload_families(reload_state)
 
 
+def _emit_gauge_family(
+    points: list[Any],
+    metric_name: str,
+    description: str,
+    value_fn: Callable[[Any], float],
+    *,
+    skip_fn: Callable[[Any], bool] | None = None,
+) -> Iterator[GaugeMetricFamily]:
+    """Build one GaugeMetricFamily from a flat list of points.
+
+    Each metric family in the snapshot follows the same recipe — derive the
+    union of label keys (defensively, in case future code adds optional
+    labels), build the family, then iterate. ``value_fn`` extracts the
+    sample value; ``skip_fn`` (optional) drops points that should not be
+    emitted at all (e.g. NaN ratios).
+
+    Yields nothing when the input is empty so callers can ``yield from``
+    unconditionally.
+    """
+    if not points:
+        return
+    label_keys = sorted({k for p in points for k in p.labels})
+    family = GaugeMetricFamily(metric_name, description, labels=label_keys)
+    for point in points:
+        if skip_fn is not None and skip_fn(point):
+            continue
+        family.add_metric([point.labels.get(k, "") for k in label_keys], value_fn(point))
+    yield family
+
+
 def _forecast_families(
     groups: list[GroupSnapshot],
 ) -> Iterator[GaugeMetricFamily]:
@@ -219,8 +250,8 @@ def _forecast_families(
 
     Within a single forecast metric name (e.g. ``node_cpu_busy_pct_forecast``)
     every sample comes from the same TSDB query, so the label-key set is
-    consistent. We compute the union defensively in case future code adds
-    optional labels.
+    consistent. We bucket by metric name first, then defer to
+    :func:`_emit_gauge_family` for the per-bucket rendering.
     """
     by_metric: dict[str, list[ForecastPoint]] = {}
     for snap in groups:
@@ -228,11 +259,12 @@ def _forecast_families(
             by_metric.setdefault(point.metric, []).append(point)
 
     for metric_name, points in sorted(by_metric.items()):
-        label_keys = sorted({k for p in points for k in p.labels})
-        family = GaugeMetricFamily(metric_name, "promforecast forecast value.", labels=label_keys)
-        for point in points:
-            family.add_metric([point.labels.get(k, "") for k in label_keys], point.value)
-        yield family
+        yield from _emit_gauge_family(
+            points,
+            metric_name,
+            "promforecast forecast value.",
+            value_fn=lambda p: p.value,
+        )
 
 
 def _accuracy_families(
@@ -244,33 +276,21 @@ def _accuracy_families(
     rather than emitted: ``NaN`` round-trips through Prometheus exposition
     fine but pollutes alerts and dashboards.
     """
-    import math  # noqa: PLC0415
-
-    accuracy_points = [(snap, p) for snap in groups for p in snap.accuracy_points]
-    if not accuracy_points:
-        return
-
-    label_keys = sorted({k for _, p in accuracy_points for k in p.labels})
-
-    mape_family = GaugeMetricFamily(
+    points = [p for snap in groups for p in snap.accuracy_points]
+    yield from _emit_gauge_family(
+        points,
         "forecast_accuracy_mape",
         "Mean absolute percentage error from the most recent backtest, in percent.",
-        labels=label_keys,
+        value_fn=lambda p: p.mape,
+        skip_fn=lambda p: not math.isfinite(p.mape),
     )
-    mase_family = GaugeMetricFamily(
+    yield from _emit_gauge_family(
+        points,
         "forecast_accuracy_mase",
         "Mean absolute scaled error from the most recent backtest.",
-        labels=label_keys,
+        value_fn=lambda p: p.mase,
+        skip_fn=lambda p: not math.isfinite(p.mase),
     )
-
-    for _, point in accuracy_points:
-        values = [point.labels.get(k, "") for k in label_keys]
-        if math.isfinite(point.mape):
-            mape_family.add_metric(values, point.mape)
-        if math.isfinite(point.mase):
-            mase_family.add_metric(values, point.mase)
-    yield mape_family
-    yield mase_family
 
 
 def _deviation_families(
@@ -283,59 +303,36 @@ def _deviation_families(
     ``forecast_deviation_outside_band == 1`` works even when the band is
     pathological.
     """
-    import math  # noqa: PLC0415
-
-    deviation_points = [(snap, p) for snap in groups for p in snap.deviation_points]
-    if not deviation_points:
-        return
-
-    label_keys = sorted({k for _, p in deviation_points for k in p.labels})
-
-    ratio_family = GaugeMetricFamily(
+    points = [p for snap in groups for p in snap.deviation_points]
+    yield from _emit_gauge_family(
+        points,
         "forecast_deviation_ratio",
         "Signed deviation of the most recent actual from the forecast band, "
         "as (actual - yhat) / (yhat_upper - yhat_lower).",
-        labels=label_keys,
+        value_fn=lambda p: p.ratio,
+        skip_fn=lambda p: not math.isfinite(p.ratio),
     )
-    outside_family = GaugeMetricFamily(
+    yield from _emit_gauge_family(
+        points,
         "forecast_deviation_outside_band",
         "1 if the most recent actual is outside the forecast band, else 0.",
-        labels=label_keys,
+        value_fn=lambda p: 1.0 if p.outside_band else 0.0,
     )
-
-    for _, point in deviation_points:
-        values = [point.labels.get(k, "") for k in label_keys]
-        if math.isfinite(point.ratio):
-            ratio_family.add_metric(values, point.ratio)
-        outside_family.add_metric(values, 1.0 if point.outside_band else 0.0)
-    yield ratio_family
-    yield outside_family
 
 
 def _quality_families(
     groups: list[GroupSnapshot],
 ) -> Iterator[GaugeMetricFamily]:
     """Render ``forecast_quality_score`` gauges (0..1 per series/model)."""
-    import math  # noqa: PLC0415
-
-    quality_points = [(snap, p) for snap in groups for p in snap.quality_points]
-    if not quality_points:
-        return
-
-    label_keys = sorted({k for _, p in quality_points for k in p.labels})
-
-    family = GaugeMetricFamily(
+    points = [p for snap in groups for p in snap.quality_points]
+    yield from _emit_gauge_family(
+        points,
         "forecast_quality_score",
         "Composite forecast quality score in [0, 1] combining backtest MAPE, "
         "confidence-band width, and lookback data coverage.",
-        labels=label_keys,
+        value_fn=lambda p: p.score,
+        skip_fn=lambda p: not math.isfinite(p.score),
     )
-    for _, point in quality_points:
-        if not math.isfinite(point.score):
-            continue
-        values = [point.labels.get(k, "") for k in label_keys]
-        family.add_metric(values, point.score)
-    yield family
 
 
 def _operational_families(

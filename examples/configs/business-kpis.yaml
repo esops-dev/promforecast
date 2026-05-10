@@ -10,9 +10,10 @@ defaults:
   horizon: 24h
   models: [AutoARIMA, AutoETS, SeasonalNaive]
   season_length: 288
-  auto_select: true
-  fallback_model: SeasonalNaive
-  fallback_mape_threshold: 30
+  accuracy:
+    auto_select: true
+    fallback_model: SeasonalNaive
+    fallback_mape_threshold: 30
 
 groups:
   - name: business_kpis

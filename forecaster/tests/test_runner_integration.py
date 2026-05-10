@@ -14,9 +14,11 @@ from typing import TYPE_CHECKING
 import pytest
 
 from promforecast.config import (
+    AccuracyConfig,
     Config,
     DatasourceConfig,
     DefaultsConfig,
+    EmissionConfig,
     GroupConfig,
     QueryConfig,
     SafetyConfig,
@@ -208,9 +210,11 @@ async def test_run_group_auto_select_emits_winner_with_best_model_label(
             min_points=10,
             models=["AutoARIMA", "SeasonalNaive"],
             confidence_levels=[80],
-            auto_select=True,
-            evaluate=True,
-            fallback_mape_threshold=None,
+            accuracy=AccuracyConfig(
+                evaluate=True,
+                auto_select=True,
+                fallback_mape_threshold=None,
+            ),
         ),
         groups=[GroupConfig(name="g", queries=[QueryConfig(id="m", promql="up")])],
     )
@@ -227,8 +231,8 @@ async def test_run_group_auto_select_emits_winner_with_best_model_label(
     monkeypatch.setattr(model_registry, "build", _fake_build)
 
     # Series of [0..59], hold-out is last 288 (24h) — but len < 288, so we
-    # use a short accuracy_horizon to make backtest viable.
-    cfg.defaults.accuracy_horizons = [timedelta(minutes=10)]
+    # use a short accuracy horizon to make backtest viable.
+    cfg.defaults.accuracy.horizons = [timedelta(minutes=10)]
     source = _FakeSource({"up": [_ramp_frame(60)]})
     exporter = Exporter()
     runner = Runner(config=cfg, source=source, exporter=exporter)
@@ -261,11 +265,13 @@ async def test_run_group_auto_select_falls_back_when_winner_exceeds_threshold(
             min_points=10,
             models=["AutoARIMA"],
             confidence_levels=[80],
-            auto_select=True,
-            evaluate=True,
-            fallback_model="SeasonalNaive",
-            fallback_mape_threshold=10.0,
-            accuracy_horizons=[timedelta(minutes=10)],
+            accuracy=AccuracyConfig(
+                evaluate=True,
+                auto_select=True,
+                fallback_model="SeasonalNaive",
+                fallback_mape_threshold=10.0,
+                horizons=[timedelta(minutes=10)],
+            ),
         ),
         groups=[GroupConfig(name="g", queries=[QueryConfig(id="m", promql="up")])],
     )
@@ -306,9 +312,11 @@ async def test_run_group_explicit_mode_emits_one_per_model(
             min_points=10,
             models=["AutoARIMA", "SeasonalNaive"],
             confidence_levels=[80],
-            auto_select=False,
-            evaluate=False,
-            accuracy_horizons=[timedelta(minutes=10)],
+            accuracy=AccuracyConfig(
+                evaluate=False,
+                auto_select=False,
+                horizons=[timedelta(minutes=10)],
+            ),
         ),
         groups=[GroupConfig(name="g", queries=[QueryConfig(id="m", promql="up")])],
     )
@@ -356,13 +364,14 @@ async def test_run_group_skips_quality_for_unbacktested_fallback_model(
             # never gets backtested.
             models=["AutoARIMA"],
             confidence_levels=[80],
-            auto_select=True,
-            evaluate=True,
-            emit_quality=True,
-            emit_deviation=True,
-            fallback_model="SeasonalNaive",
-            fallback_mape_threshold=10.0,
-            accuracy_horizons=[timedelta(minutes=10)],
+            accuracy=AccuracyConfig(
+                evaluate=True,
+                auto_select=True,
+                fallback_model="SeasonalNaive",
+                fallback_mape_threshold=10.0,
+                horizons=[timedelta(minutes=10)],
+            ),
+            emission=EmissionConfig(quality=True, deviation=True),
         ),
         groups=[GroupConfig(name="g", queries=[QueryConfig(id="m", promql="up")])],
     )
@@ -407,11 +416,12 @@ async def test_run_group_emits_deviation_and_quality_metrics(
             min_points=10,
             models=["SeasonalNaive"],
             confidence_levels=[80],
-            auto_select=False,
-            evaluate=True,
-            emit_deviation=True,
-            emit_quality=True,
-            accuracy_horizons=[timedelta(minutes=10)],
+            accuracy=AccuracyConfig(
+                evaluate=True,
+                auto_select=False,
+                horizons=[timedelta(minutes=10)],
+            ),
+            emission=EmissionConfig(deviation=True, quality=True),
         ),
         groups=[GroupConfig(name="g", queries=[QueryConfig(id="m", promql="up")])],
     )
@@ -449,11 +459,12 @@ async def test_run_group_emit_deviation_and_quality_disabled_suppresses_metrics(
             min_points=10,
             models=["SeasonalNaive"],
             confidence_levels=[80],
-            auto_select=False,
-            evaluate=False,
-            emit_deviation=False,
-            emit_quality=False,
-            accuracy_horizons=[timedelta(minutes=10)],
+            accuracy=AccuracyConfig(
+                evaluate=False,
+                auto_select=False,
+                horizons=[timedelta(minutes=10)],
+            ),
+            emission=EmissionConfig(deviation=False, quality=False),
         ),
         groups=[GroupConfig(name="g", queries=[QueryConfig(id="m", promql="up")])],
     )
@@ -471,6 +482,53 @@ async def test_run_group_emit_deviation_and_quality_disabled_suppresses_metrics(
     assert "forecast_deviation_ratio" not in body
     assert "forecast_deviation_outside_band" not in body
     assert "forecast_quality_score" not in body
+
+
+@pytest.mark.asyncio
+async def test_backtests_skip_summary_when_only_accuracy_consumer_is_on(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When only accuracy emission is enabled, ``_run_backtests`` must not
+    pay the cost of summarising the trailing band — only deviation and
+    quality need that step. This locks in the needs-bitmap behaviour."""
+    from promforecast import models as model_registry  # noqa: PLC0415
+    from promforecast import runner as runner_module  # noqa: PLC0415
+
+    cfg = Config(
+        datasource=DatasourceConfig(url="http://x"),
+        server=ServerConfig(),
+        safety=SafetyConfig(),
+        defaults=DefaultsConfig(
+            min_points=10,
+            models=["SeasonalNaive"],
+            confidence_levels=[80],
+            accuracy=AccuracyConfig(
+                evaluate=True,
+                auto_select=False,
+                horizons=[timedelta(minutes=10)],
+            ),
+            emission=EmissionConfig(deviation=False, quality=False),
+        ),
+        groups=[GroupConfig(name="g", queries=[QueryConfig(id="m", promql="up")])],
+    )
+    monkeypatch.setattr(
+        model_registry, "build", lambda name, season_length: _FakeModel(name, value=1.0)
+    )
+
+    summary_calls: list[None] = []
+    real_summary = runner_module._summarise_backtest
+
+    def _spy_summary(**kwargs: object) -> object:
+        summary_calls.append(None)
+        return real_summary(**kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(runner_module, "_summarise_backtest", _spy_summary)
+
+    source = _FakeSource({"up": [_ramp_frame(60)]})
+    runner = Runner(config=cfg, source=source, exporter=Exporter())
+    await runner.run_group(cfg.groups[0])
+
+    assert summary_calls == [], "trailing-band summary should be skipped when no consumer wants it"
 
 
 @pytest.mark.asyncio
