@@ -9,6 +9,7 @@ The docs follow the [Diataxis](https://diataxis.fr/) framework:
 
 ## Index
 
+- [Config schema](config-schema.md) — `apiVersion` and the v1.0 stability commitment
 - [Models](models.md) — built-in forecasters, auto-select, accuracy metrics
 - [CLI](cli.md) — `promforecast run` and `promforecast validate`
 - [Development](development.md) — local toolchain, CI overview, adding models

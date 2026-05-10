@@ -14,13 +14,16 @@ Two flavours are supported:
 
 Resolution is split into two phases:
 
-* :func:`prefetch_promql` runs once **per query** to fetch every custom
-  regressor's PromQL. The fan-out is independent of how many series the
-  primary query returned, which is critical: without this split a query
-  returning 100 series with 2 PromQL regressors would issue 200 redundant
-  requests against the TSDB every refresh interval.
-* :func:`align_for_series` runs **per series** and is cheap: it picks the
-  matching pre-fetched frames, aligns them via ``merge_asof``, and
+* :func:`prefetch_promql` runs once **per query** to (a) fetch every
+  custom regressor's PromQL and (b) collapse each fetched response to a
+  sorted ``(ds, v)`` frame. Both pieces of work are independent of how
+  many series the primary query returned, which is critical: without
+  this split a query returning 100 series with 2 PromQL regressors
+  would issue 200 redundant TSDB requests *and* repeat the per-regressor
+  groupby/sort 100 times every refresh interval.
+* :func:`align_for_series` runs **per series** and is cheap *because*
+  the prefetch already did the reduction: it picks the pre-aggregated
+  frame, runs ``merge_asof`` against the per-series timestamps, and
   materialises calendar features.
 
 The module is intentionally narrow: it only resolves *historical* regressor
@@ -91,10 +94,22 @@ class PromQLPrefetch:
     ``no_source`` carries the regressor-ids whose PromQL was skipped
     because the runner had no datasource (offline tests, dry-run); these
     are reported as a distinct failure reason.
+
+    ``aggregated`` carries the per-regressor reduction (mean across
+    returned series, grouped + sorted by ``ds``) that per-series alignment
+    needs. We compute it once per query so a primary query returning N
+    series doesn't repeat the reduction N times — that loop dominated the
+    refresh CPU profile when regressors had many points or many returned
+    series. Mapping is keyed by regressor id; an entry is absent when the
+    pre-fetch produced no usable rows. ``None`` means the prefetch path
+    was bypassed (legacy callers / tests construct ``PromQLPrefetch``
+    directly with raw frames); :func:`align_for_series` falls back to
+    building it on the fly in that case.
     """
 
     fetched: dict[str, list[SeriesFrame]]
     failures: list[RegressorFailure]
+    aggregated: dict[str, pd.DataFrame] | None = None
 
 
 @dataclass
@@ -178,7 +193,51 @@ async def prefetch_promql(
             continue
         assert isinstance(outcome, list)
         fetched[reg.id] = outcome
-    return PromQLPrefetch(fetched=fetched, failures=failures)
+    # Reduce each regressor's frames to a sorted (ds, v) frame *once* per
+    # primary query. Per-series alignment becomes a cheap merge_asof against
+    # this pre-aggregated frame instead of re-running groupby+sort N times,
+    # where N is the primary query's series count.
+    aggregated = _aggregate_fetched(fetched)
+    return PromQLPrefetch(fetched=fetched, failures=failures, aggregated=aggregated)
+
+
+def _aggregate_fetched(
+    fetched: dict[str, list[SeriesFrame]],
+) -> dict[str, pd.DataFrame]:
+    """Collapse each regressor's series frames to a sorted ``(ds, v)`` frame.
+
+    A regressor is omitted from the result when none of its frames yielded
+    a usable row — :func:`align_for_series` then treats it the same as a
+    missing pre-fetch.
+    """
+    aggregated: dict[str, pd.DataFrame] = {}
+    for reg_id, frames in fetched.items():
+        df = _aggregate_frames(frames)
+        if df is not None:
+            aggregated[reg_id] = df
+    return aggregated
+
+
+def _aggregate_frames(frames: list[SeriesFrame]) -> pd.DataFrame | None:
+    """Mean-across-series + sort-by-ds reduction. ``None`` when no rows.
+
+    PromQL regressors typically already aggregate (e.g. ``count by ()``)
+    but we don't rely on that — collapsing to a per-timestamp mean is the
+    safe default. NaN values were already filtered upstream by
+    :func:`source._parse_matrix`, so we don't re-check here.
+    """
+    import pandas as pd  # noqa: PLC0415
+
+    rows: list[tuple[pd.Timestamp, float]] = []
+    for frame in frames:
+        for ts, val in zip(frame.timestamps, frame.values, strict=True):
+            rows.append((pd.Timestamp(ts), float(val)))
+    if not rows:
+        return None
+    src_grouped: pd.DataFrame = (
+        pd.DataFrame(rows, columns=["ds", "v"]).groupby("ds", as_index=False).mean()
+    )
+    return src_grouped.sort_values(by="ds").reset_index(drop=True)
 
 
 def align_for_series(
@@ -214,12 +273,12 @@ def align_for_series(
                     raise RegressorError(cal_failure.reason, cal_failure.message)
                 failures.append(cal_failure)
             continue
-        frames = prefetch.fetched.get(reg.id)
-        if frames is None:
+        aggregated = _resolve_aggregated(prefetch, reg.id)
+        if aggregated is None:
             # Pre-fetch failed for this optional regressor — already counted
             # in ``prefetch.failures``. Drop the column and move on.
             continue
-        out[reg.id] = _aligned_values(frames, out["ds"])
+        out[reg.id] = _aligned_values(aggregated, out["ds"])
 
     if len(out.columns) <= 1:  # only the ``ds`` column → no regressors usable
         return ResolveOutcome(frame=None, failures=failures)
@@ -314,27 +373,35 @@ def _calendar_feature(name: str, ds: pd.Series[Any]) -> pd.Series[Any]:
     return result
 
 
-def _aligned_values(frames: list[SeriesFrame], ds: pd.Series[Any]) -> pd.Series[Any]:
-    """Reduce a multi-series PromQL result to a single value-per-timestamp.
+def _resolve_aggregated(prefetch: PromQLPrefetch, reg_id: str) -> pd.DataFrame | None:
+    """Return the pre-aggregated frame for ``reg_id`` (or build one lazily).
 
-    PromQL regressors typically aggregate (e.g. ``count by () (deploys)``)
-    but we can't rely on that. We collapse to a per-timestamp mean across
-    every returned series, then nearest-neighbour-align to ``ds``. NaNs
-    propagate through to the frame so downstream models see a missing
-    value rather than a fabricated zero.
+    ``prefetch_promql`` populates ``aggregated`` eagerly so the production
+    path skips the reduction entirely. Direct ``PromQLPrefetch(...)``
+    callers (tests, future helpers) leave it ``None``; we then fall back
+    to building the aggregation on demand from ``fetched`` so behaviour
+    stays identical.
+    """
+    if prefetch.aggregated is not None:
+        return prefetch.aggregated.get(reg_id)
+    frames = prefetch.fetched.get(reg_id)
+    if frames is None:
+        return None
+    return _aggregate_frames(frames)
+
+
+def _aligned_values(src_sorted: pd.DataFrame, ds: pd.Series[Any]) -> pd.Series[Any]:
+    """Nearest-asof-align a pre-aggregated regressor frame onto ``ds``.
+
+    The expensive collapse-and-sort already happened once per primary
+    query in :func:`_aggregate_frames`; this is a per-series ``merge_asof``
+    + reset_index. NaNs propagate through to the frame so downstream
+    models see a missing value rather than a fabricated zero.
     """
     import pandas as pd  # noqa: PLC0415
 
-    rows: list[tuple[pd.Timestamp, float]] = []
-    for frame in frames:
-        for ts, val in zip(frame.timestamps, frame.values, strict=True):
-            rows.append((pd.Timestamp(ts), float(val)))
-    if not rows:
+    if src_sorted.empty:
         return pd.Series([float("nan")] * len(ds))
-    src_grouped: pd.DataFrame = (
-        pd.DataFrame(rows, columns=["ds", "v"]).groupby("ds", as_index=False).mean()
-    )
-    src_sorted: pd.DataFrame = src_grouped.sort_values(by="ds").reset_index(drop=True)
     target_frame: pd.DataFrame = pd.DataFrame({"ds": ds}).reset_index(drop=True)
     target_sorted: pd.DataFrame = target_frame.sort_values(by="ds")
     aligned: pd.DataFrame = pd.merge_asof(target_sorted, src_sorted, on="ds", direction="nearest")

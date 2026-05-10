@@ -22,6 +22,7 @@ def _write(tmp_path: Path, body: str) -> Path:
 
 
 _GOOD_CONFIG = """
+apiVersion: promforecast.io/v1alpha1
 datasource:
   url: http://vm:8428/
 defaults:
@@ -60,6 +61,7 @@ def test_validate_returns_one_on_schema_error(tmp_path: Path) -> None:
     path = _write(
         tmp_path,
         """
+apiVersion: promforecast.io/v1alpha1
 datasource:
   url: http://vm:8428/
 groups:
@@ -128,6 +130,7 @@ def test_validate_dry_run_reports_failure_when_datasource_unreachable(tmp_path: 
     path = _write(
         tmp_path,
         """
+apiVersion: promforecast.io/v1alpha1
 datasource:
   url: http://127.0.0.1:1
   timeout: 1s

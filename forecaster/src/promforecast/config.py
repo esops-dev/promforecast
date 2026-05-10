@@ -8,16 +8,33 @@ check enforces this.
 from __future__ import annotations
 
 import re
+import warnings
 from datetime import timedelta
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
+import structlog
 import yaml
-from pydantic import BaseModel, BeforeValidator, ConfigDict, Field
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, model_validator
 
 from ._naming import validate_metric_name
 
+logger = structlog.get_logger(__name__)
+
 CALENDAR_FEATURE_TYPES = ("hour_of_day", "day_of_week", "is_weekend")
+
+# Versioned schema. ``apiVersion`` mirrors the Kubernetes convention so a
+# config file declares which schema it conforms to and the loader can route
+# between versions when a stable schema lands. Today only ``v1alpha1``
+# exists; configs without an ``apiVersion`` are accepted but emit a
+# one-shot warning so operators add it before the schema is frozen.
+CURRENT_API_VERSION = "promforecast.io/v1alpha1"
+SUPPORTED_API_VERSIONS: frozenset[str] = frozenset({CURRENT_API_VERSION})
+
+
+class UnsupportedApiVersionError(ValueError):
+    """Raised when the config declares an ``apiVersion`` we don't recognise."""
+
 
 _PROM_DURATION_RE = re.compile(
     r"^\s*(?:(\d+)d)?(?:(\d+)h)?(?:(\d+)m(?!s))?(?:(\d+)s)?(?:(\d+)ms)?\s*$"
@@ -50,11 +67,44 @@ class AuthConfig(BaseModel):
 
 
 class DatasourceConfig(BaseModel):
+    """TSDB read endpoint.
+
+    ``max_concurrent_requests`` caps in-flight PromQL fetches across every
+    group so a fan-out (many groups times many regressors) can't accidentally
+    open hundreds of concurrent TCP connections to the TSDB. The default
+    of 8 is comfortable for a single-replica forecaster talking to a
+    single-node VictoriaMetrics; tune up if profiling shows query queueing,
+    tune down if your TSDB is shared and rate-sensitive.
+
+    ``max_keepalive_connections`` shapes the underlying httpx pool so the
+    semaphore limit and the pool limit agree: with a smaller pool than the
+    semaphore, the pool itself becomes the implicit bottleneck and the
+    intent of the semaphore knob is obscured.
+    """
+
     model_config = ConfigDict(extra="forbid")
 
     url: str
     timeout: Duration = timedelta(seconds=30)
     auth: AuthConfig = AuthConfig()
+    max_concurrent_requests: int = Field(default=8, ge=1)
+    max_keepalive_connections: int = Field(default=8, ge=1)
+
+    @model_validator(mode="after")
+    def _check_keepalive_le_concurrent(self) -> DatasourceConfig:
+        # httpx allows keepalive > total but the keepalive cap is
+        # bounded by the total cap at runtime, so the larger value is
+        # just misleading config. Reject at load time so the operator
+        # sees the mistake instead of silently watching one knob have
+        # no effect.
+        if self.max_keepalive_connections > self.max_concurrent_requests:
+            raise ValueError(
+                "datasource.max_keepalive_connections "
+                f"({self.max_keepalive_connections}) must be <= "
+                f"max_concurrent_requests ({self.max_concurrent_requests}); "
+                "the keepalive cap can't exceed the total connection cap."
+            )
+        return self
 
 
 class ReloadConfig(BaseModel):
@@ -274,6 +324,29 @@ class RemoteWriteSinkConfig(BaseModel):
     # typical TSDB ingest cap; tighten it for shops behind aggressive
     # ingress proxies.
     chunk_size: int = Field(default=10_000, ge=1)
+    # HTTP pool sizing for the push client. The sink instance is shared
+    # across groups, and groups push concurrently when their refresh
+    # intervals overlap, so the pool needs headroom above the per-group
+    # sequential pattern. Defaults to 4 / 2 — comfortable for a handful
+    # of groups; bump for deployments with many groups whose schedules
+    # align. Exposed as discrete fields (rather than a single derived
+    # value) so deployments can tune connections vs. keepalive
+    # independently when fronted by an HTTP proxy that limits idle
+    # connections more aggressively than total connections.
+    max_connections: int = Field(default=4, ge=1)
+    max_keepalive_connections: int = Field(default=2, ge=1)
+
+    @model_validator(mode="after")
+    def _check_keepalive_le_connections(self) -> RemoteWriteSinkConfig:
+        # Same intent as the datasource validator — keepalive > total
+        # is a no-op at runtime; reject so the misconfig is visible.
+        if self.max_keepalive_connections > self.max_connections:
+            raise ValueError(
+                "sink.remote_write.max_keepalive_connections "
+                f"({self.max_keepalive_connections}) must be <= "
+                f"max_connections ({self.max_connections})."
+            )
+        return self
 
 
 class SinkConfig(BaseModel):
@@ -285,8 +358,18 @@ class SinkConfig(BaseModel):
 
 
 class Config(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    # ``populate_by_name=True`` lets in-Python construction use ``api_version``
+    # while YAML keeps the Kubernetes-idiomatic ``apiVersion`` spelling.
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
 
+    # Default keeps existing in-Python ``Config(...)`` usage (tests, dry-run
+    # scaffolding) compatible — the YAML loader peeks at ``apiVersion``
+    # before pydantic validation, so the field's default is only ever
+    # observed when no YAML is involved.
+    api_version: Literal["promforecast.io/v1alpha1"] = Field(
+        default="promforecast.io/v1alpha1",
+        alias="apiVersion",
+    )
     datasource: DatasourceConfig
     server: ServerConfig = ServerConfig()
     safety: SafetyConfig = SafetyConfig()
@@ -304,8 +387,18 @@ def load(path: str | Path) -> Config:
     than ``none`` are accepted by the schema (so configs stay forward-
     compatible) but rejected here so a misconfigured ``bearer`` doesn't
     silently send unauthenticated requests.
+
+    The ``apiVersion`` field is enforced before pydantic validation so an
+    unsupported version is rejected with a precise error message rather
+    than the noisier ``Literal[...]`` mismatch pydantic would produce. A
+    missing ``apiVersion`` is accepted (and back-filled with the current
+    version) but emits a one-shot warning so operators add it before the
+    schema is frozen.
     """
     raw = yaml.safe_load(Path(path).read_text())
+    if not isinstance(raw, dict):
+        raise ValueError(f"config file must contain a YAML mapping at top level: {path}")
+    raw = _check_api_version(raw, source=str(path))
     config = Config.model_validate(raw)
     if config.datasource.auth.type != "none":
         raise NotImplementedError(
@@ -323,6 +416,46 @@ def load(path: str | Path) -> Config:
             for reg in query.regressors:
                 _validate_regressor(group_name=group.name, query_id=query.id, reg=reg)
     return config
+
+
+def _check_api_version(raw: dict[str, Any], *, source: str) -> dict[str, Any]:
+    """Validate (and inject) the top-level ``apiVersion`` declaration.
+
+    * Missing ``apiVersion`` -> warn once, default to the current version.
+      This keeps pre-versioning configs working through the v0.x line so an
+      upgrade isn't gated on a config edit, but nudges operators to add it
+      before the schema freezes.
+    * Unknown ``apiVersion`` -> raise :class:`UnsupportedApiVersionError`
+      with the offending value and the supported set, so a typo
+      (``promforecast.io/v1`` before v1 ships) fails clearly rather than
+      bottoming out in a generic pydantic ``Literal`` error.
+
+    Returns the (possibly mutated) raw dict so the caller can hand it to
+    pydantic without an extra copy.
+    """
+    declared = raw.get("apiVersion")
+    if declared is None:
+        warnings.warn(
+            f"config {source}: missing 'apiVersion' field; "
+            f"defaulting to {CURRENT_API_VERSION!r}. "
+            "Add 'apiVersion: promforecast.io/v1alpha1' to silence this warning "
+            "and pin the schema for future upgrades.",
+            DeprecationWarning,
+            stacklevel=3,
+        )
+        logger.warning(
+            "config_api_version_missing",
+            source=source,
+            assumed=CURRENT_API_VERSION,
+        )
+        raw["apiVersion"] = CURRENT_API_VERSION
+        return raw
+    if declared not in SUPPORTED_API_VERSIONS:
+        supported = ", ".join(sorted(SUPPORTED_API_VERSIONS))
+        raise UnsupportedApiVersionError(
+            f"config {source}: unsupported apiVersion {declared!r}; supported versions: {supported}"
+        )
+    return raw
 
 
 def _validate_query_overrides(*, group_name: str, query: QueryConfig) -> None:
@@ -389,8 +522,13 @@ def sanitised_dump(config: Config) -> dict[str, Any]:
     everything they need to confirm the running config matches their git
     revision — without /config leaking a bearer token if one is later added
     to ``datasource.auth`` or to a custom remote_write header.
+
+    ``by_alias=True`` so the JSON keys match the YAML the operator wrote
+    (e.g. ``apiVersion``, not the Python field name ``api_version``); the
+    point of /config is to confirm the deployed config, and a key-name
+    drift between input and output would defeat that.
     """
-    payload = config.model_dump(mode="json")
+    payload = config.model_dump(mode="json", by_alias=True)
     auth = payload.get("datasource", {}).get("auth")
     if isinstance(auth, dict) and auth.get("type") not in (None, "none"):
         payload["datasource"]["auth"] = {"type": auth.get("type"), "credentials": _SECRET_REDACTION}
