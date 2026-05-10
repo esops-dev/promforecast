@@ -157,8 +157,15 @@ jobs:
         # that crashes the forecaster on boot. This step renders the chart
         # ConfigMap and validates the embedded config.yaml against the
         # forecaster's own loader, so any drift fails CI.
+        #
+        # ``python3 -m pip`` (rather than a bare ``pip``) anchors the
+        # install to the interpreter that runs the heredoc. The
+        # chart-testing-action above provisions its own venv and can
+        # leave ``pip`` and ``python3`` pointing at different Pythons,
+        # which would otherwise produce a ``ModuleNotFoundError: pydantic``
+        # immediately after a "Successfully installed" line.
         run: |
-          pip install pyyaml pydantic
+          python3 -m pip install --quiet pyyaml pydantic
           python3 - <<'PY'
           import pathlib, subprocess, sys, yaml
           # Render the chart with the example node-capacity groups so we
