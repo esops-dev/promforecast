@@ -117,6 +117,11 @@ def run(config_path: Path, log_level: str) -> None:
     logger.info("config_loaded", path=str(config_path), groups=len(cfg.groups))
 
     exporter = Exporter()
+    # Snapshot the SHA-256 of the bytes we just loaded so /metrics carries
+    # the running config's identity from the very first scrape. The reloader
+    # refreshes this whenever a new config is applied; no other code path
+    # writes the hash.
+    exporter.set_config_hash(_compute_config_hash(config_path))
     source = PromSource(
         url=cfg.datasource.url,
         timeout_seconds=cfg.datasource.timeout.total_seconds(),
@@ -136,6 +141,7 @@ def run(config_path: Path, log_level: str) -> None:
         reloader,
         watcher=watcher,
         reload_enabled=cfg.server.reload.enabled,
+        expose_config_endpoint=cfg.server.expose_config_endpoint,
     )
     host, port = _parse_listen(cfg.server.listen)
     server = uvicorn.Server(
@@ -176,6 +182,7 @@ def _build_app(
     *,
     watcher: ConfigMapWatcher | None = None,
     reload_enabled: bool,
+    expose_config_endpoint: bool = False,
 ) -> FastAPI:
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
@@ -185,8 +192,17 @@ def _build_app(
     app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
 
     @app.get("/healthz")
-    async def healthz() -> dict[str, str]:
-        return {"status": "ok"}
+    async def healthz() -> dict[str, object]:
+        # Surface the running config's identity on /healthz too: a quick
+        # ``curl -s /healthz | jq .config_hash`` confirms the deployment is
+        # running the expected revision without scraping /metrics first.
+        timestamp, success, _ = exporter._reload_state()
+        return {
+            "status": "ok",
+            "config_hash": exporter._config_hash_state(),
+            "config_last_reload_timestamp": timestamp,
+            "config_last_reload_success": success,
+        }
 
     @app.get("/metrics")
     async def metrics() -> Response:
@@ -219,7 +235,42 @@ def _build_app(
                 }
             )
 
+    if expose_config_endpoint:
+
+        @app.get("/config")
+        async def config_endpoint() -> Response:
+            """Return the running, sanitised config plus its content hash.
+
+            Off by default; opt-in via ``server.expose_config_endpoint`` so
+            an operator must explicitly accept exposing the parsed config
+            (with credentials redacted) on the unauthenticated metrics
+            port. Useful for debugging "is the deployment actually running
+            what I think it is?" without shelling into the pod.
+            """
+            return JSONResponse(
+                {
+                    "config_hash": exporter._config_hash_state(),
+                    "config": config_module.sanitised_dump(runner._config),
+                }
+            )
+
     return app
+
+
+def _compute_config_hash(path: Path) -> str:
+    """SHA-256 of the raw config file bytes, hex-encoded.
+
+    Returns an empty string if the file disappears between load and hash
+    (a tight race that the standard load already guards against). The
+    same digest function is used by the ConfigMap watcher; both stay in
+    lockstep so the metric agrees with what the watcher sees on disk.
+    """
+    import hashlib  # noqa: PLC0415
+
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except FileNotFoundError:
+        return ""
 
 
 async def _serve(

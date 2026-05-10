@@ -36,6 +36,12 @@ config:
     reload:
       enabled: true
       watch_configmap: true
+    # Off by default. Flip to true to expose a sanitised JSON view of the
+    # parsed config + its SHA-256 hash on `GET /config`. Useful for
+    # confirming "what is this pod actually running?" without `kubectl
+    # exec`. The endpoint is unauthenticated like /metrics, so only
+    # enable it when the metrics port is on a trusted network.
+    expose_config_endpoint: false
 
   safety:
     max_series_per_query: 500
@@ -66,6 +72,11 @@ config:
     emission:
       deviation: true
       quality: true
+      # Per-regressor explainability share, emitted as
+      # `<id>_forecast_contribution_ratio{regressor=...}`. No-op when a
+      # query has no regressors configured; otherwise one sample per
+      # series-regressor whose values sum to 1 across regressors.
+      contribution: true
 
   # Optional remote_write sink: writes the *full* forecast curve to a TSDB
   # with future timestamps. The /metrics exporter remains the pull default

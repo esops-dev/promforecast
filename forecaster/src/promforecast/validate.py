@@ -29,6 +29,7 @@ from typing import IO, TYPE_CHECKING
 
 from . import config as config_module
 from .accuracy import horizons_from_durations
+from .config import effective_season_length, effective_step
 
 if TYPE_CHECKING:
     from .config import Config
@@ -54,6 +55,7 @@ class CardinalityEstimate:
     accuracy_lines: int
     deviation_lines: int
     quality_lines: int
+    contribution_lines: int
     operational_lines: int
 
     @property
@@ -63,6 +65,7 @@ class CardinalityEstimate:
             + self.accuracy_lines
             + self.deviation_lines
             + self.quality_lines
+            + self.contribution_lines
             + self.operational_lines
         )
 
@@ -113,6 +116,7 @@ def run_validate(
     write(f"  accuracy lines     {estimate.accuracy_lines:>8}")
     write(f"  deviation lines    {estimate.deviation_lines:>8}")
     write(f"  quality lines      {estimate.quality_lines:>8}")
+    write(f"  contribution lines {estimate.contribution_lines:>8}")
     write(f"  operational lines  {estimate.operational_lines:>8}")
     write(f"  total              {estimate.total:>8}")
     if cfg.safety.max_total_series and estimate.total > cfg.safety.max_total_series:
@@ -181,6 +185,16 @@ def _estimate_cardinality(cfg: Config) -> CardinalityEstimate:
         else 0
     )
     quality_lines = queries * series_cap * emitted_models if cfg.defaults.emission.quality else 0
+    # Contribution: only emitted for queries that actually configure
+    # regressors; the count is the *worst case* assuming every series of
+    # those queries fans out one row per regressor. Calendar regressors are
+    # included in the count because they're always present after alignment.
+    contribution_lines = 0
+    if cfg.defaults.emission.contribution:
+        for group in cfg.groups:
+            for query in group.queries:
+                if query.regressors:
+                    contribution_lines += series_cap * len(query.regressors)
     # Operational: 7 gauges + N reasons per group; we ballpark 7 per group.
     operational_lines = 7 * len(cfg.groups)
 
@@ -193,6 +207,7 @@ def _estimate_cardinality(cfg: Config) -> CardinalityEstimate:
         accuracy_lines=accuracy_lines,
         deviation_lines=deviation_lines,
         quality_lines=quality_lines,
+        contribution_lines=contribution_lines,
         operational_lines=operational_lines,
     )
 
@@ -228,7 +243,8 @@ async def _dry_run(
     try:
         end = datetime.now(tz=UTC)
         start = end - cfg.defaults.lookback
-        step_seconds = max(1, int(cfg.defaults.step.total_seconds()))
+        sample_step = effective_step(query, cfg.defaults)
+        step_seconds = max(1, int(sample_step.total_seconds()))
         t0 = time.monotonic()
         try:
             frames = await source.query_range(query.promql, start, end, step_seconds)
@@ -260,6 +276,11 @@ def _fit_sample(cfg: Config, frame: SeriesFrame, write: Writer) -> int:
     Imports of heavy modelling deps are lazy so ``promforecast validate``
     on a config-only PR doesn't pay the import cost when ``--dry-run`` is
     not requested.
+
+    The first query of the first group's per-query ``step`` /
+    ``season_length`` overrides apply here too — otherwise dry-running a
+    multi-frequency config would silently fit at the default cadence and
+    hand the operator misleading numbers.
     """
     import pandas as pd  # noqa: PLC0415
 
@@ -269,6 +290,10 @@ def _fit_sample(cfg: Config, frame: SeriesFrame, write: Writer) -> int:
     model_name = spec.name
     write(f"    fitting first model: {model_name}")
 
+    query = cfg.groups[0].queries[0]
+    sample_step = effective_step(query, cfg.defaults)
+    sample_season_length = effective_season_length(query, cfg.defaults, step=sample_step)
+
     df = pd.DataFrame(
         {
             "unique_id": ["s"] * len(frame.values),
@@ -276,15 +301,15 @@ def _fit_sample(cfg: Config, frame: SeriesFrame, write: Writer) -> int:
             "y": frame.values,
         }
     )
-    freq = _pandas_freq_seconds(int(cfg.defaults.step.total_seconds()))
+    freq = _pandas_freq_seconds(int(sample_step.total_seconds()))
     horizon = max(
         1,
-        int(cfg.defaults.horizon.total_seconds() // cfg.defaults.step.total_seconds()),
+        int(cfg.defaults.horizon.total_seconds() // sample_step.total_seconds()),
     )
     levels = list(cfg.defaults.confidence_levels)
     try:
         model = model_registry.build(
-            model_name, season_length=cfg.defaults.season_length, params=spec.params
+            model_name, season_length=sample_season_length, params=spec.params
         )
         t0 = time.monotonic()
         forecast = model.fit_predict(df=df, horizon=horizon, freq=freq, levels=levels)
@@ -302,7 +327,7 @@ def _fit_sample(cfg: Config, frame: SeriesFrame, write: Writer) -> int:
         yhat_str = f"{yhat:.4f}" if yhat is not None and math.isfinite(float(yhat)) else "NaN"
         write(f"      {ts}  yhat={yhat_str}")
 
-    horizons = horizons_from_durations(list(cfg.defaults.accuracy.horizons), cfg.defaults.step)
+    horizons = horizons_from_durations(list(cfg.defaults.accuracy.horizons), sample_step)
     if horizons and len(df) > horizons[0].steps + 1:
         rc = _backtest_preview(model, df, horizons[0].steps, freq, levels, write)
         return rc

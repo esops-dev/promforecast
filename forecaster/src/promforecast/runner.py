@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 import structlog
 
+from . import contribution as contribution_mod
 from . import models as model_registry
 from . import regressors as regressors_mod
 from .accuracy import (
@@ -29,9 +30,15 @@ from .accuracy import (
     horizons_from_durations,
     overall_mape,
 )
-from .config import GroupConfig, ModelSpec
+from .config import (
+    GroupConfig,
+    ModelSpec,
+    effective_season_length,
+    effective_step,
+)
 from .exporter import (
     AccuracyPoint,
+    ContributionPoint,
     DeviationPoint,
     EnsembleWeightPoint,
     Exporter,
@@ -74,6 +81,7 @@ class _FitResult:
     deviation: list[DeviationPoint] = field(default_factory=list)
     quality: list[QualityPoint] = field(default_factory=list)
     ensemble: list[EnsembleWeightPoint] = field(default_factory=list)
+    contribution: list[ContributionPoint] = field(default_factory=list)
     # Full forecast curve (every horizon step) per emitted model. Consumed
     # only by the ``remote_write`` sink — the snapshot exporter ignores it.
     curve: list[ForecastCurvePoint] = field(default_factory=list)
@@ -151,6 +159,7 @@ class _RunContext:
     deviation_points: list[DeviationPoint] = field(default_factory=list)
     quality_points: list[QualityPoint] = field(default_factory=list)
     ensemble_weight_points: list[EnsembleWeightPoint] = field(default_factory=list)
+    contribution_points: list[ContributionPoint] = field(default_factory=list)
     curve_points: list[ForecastCurvePoint] = field(default_factory=list)
     series_count: int = 0
     dropped: dict[str, int] = field(default_factory=dict)
@@ -476,6 +485,7 @@ class Runner:
                     deviation_points=ctx.deviation_points,
                     quality_points=ctx.quality_points,
                     ensemble_weights=ctx.ensemble_weight_points,
+                    contribution_points=ctx.contribution_points,
                     last_run_timestamp=time.time(),
                     run_duration_seconds=duration,
                     series_count=ctx.series_count,
@@ -498,6 +508,7 @@ class Runner:
                 deviation_points=len(ctx.deviation_points),
                 quality_points=len(ctx.quality_points),
                 ensemble_weight_points=len(ctx.ensemble_weight_points),
+                contribution_points=len(ctx.contribution_points),
                 curve_points=len(ctx.curve_points),
                 dropped=dict(ctx.dropped),
                 failures=dict(ctx.failures),
@@ -603,13 +614,19 @@ class Runner:
                 return
 
     async def _prefetch_query_regressors(self, query: QueryConfig) -> regressors_mod.PromQLPrefetch:
-        """Run every custom regressor's PromQL once per primary query."""
+        """Run every custom regressor's PromQL once per primary query.
+
+        Regressors share the primary query's step so their values align
+        cleanly with the series time index — a regressor sampled at a
+        different cadence would either alias under merge_asof or force a
+        second alignment pass for no real benefit.
+        """
         d = self._config.defaults
         if not query.regressors:
             return regressors_mod.PromQLPrefetch(fetched={}, failures=[])
         end = datetime.now(tz=UTC)
         start = end - d.lookback
-        step_seconds = max(1, int(d.step.total_seconds()))
+        step_seconds = max(1, int(effective_step(query, d).total_seconds()))
         return await regressors_mod.prefetch_promql(
             regressors=query.regressors,
             source=self._source,
@@ -678,7 +695,7 @@ class Runner:
         s = self._config.safety
         end = datetime.now(tz=UTC)
         start = end - d.lookback
-        step_seconds = max(1, int(d.step.total_seconds()))
+        step_seconds = max(1, int(effective_step(query, d).total_seconds()))
         return await asyncio.wait_for(
             self._source.query_range(query.promql, start, end, step_seconds),
             timeout=s.query_timeout.total_seconds(),
@@ -703,8 +720,13 @@ class Runner:
                 "y": frame.values,
             }
         )
-        freq = _pandas_freq(d.step)
-        horizon = max(1, int(d.horizon.total_seconds() // d.step.total_seconds()))
+        # Per-query overrides cascade onto the cached defaults: step controls
+        # both the pandas freq string and how many forecast steps live inside
+        # the configured horizon, season_length controls model seasonality.
+        eff_step = effective_step(query, d)
+        eff_season_length = effective_season_length(query, d, step=eff_step)
+        freq = _pandas_freq(eff_step)
+        horizon = max(1, int(d.horizon.total_seconds() // eff_step.total_seconds()))
         levels = list(d.confidence_levels)
         factory = SeriesPointFactory(
             metric_id=query.id,
@@ -723,7 +745,7 @@ class Runner:
             query=query, frame=frame, result=result, prefetch=prefetch
         )
 
-        accuracy_horizons = horizons_from_durations(list(d.accuracy.horizons), d.step)
+        accuracy_horizons = horizons_from_durations(list(d.accuracy.horizons), eff_step)
         auto_select_enabled = bool(d.accuracy.auto_select)
         needs = _BacktestNeeds(
             accuracy=d.accuracy.evaluate,
@@ -741,7 +763,7 @@ class Runner:
                 horizons=accuracy_horizons,
                 freq=freq,
                 levels=levels,
-                season_length=d.season_length,
+                season_length=eff_season_length,
                 group_name=group_name,
                 query_id=query.id,
                 needs=needs,
@@ -762,6 +784,7 @@ class Runner:
                 horizon=horizon,
                 freq=freq,
                 levels=levels,
+                season_length=eff_season_length,
                 backtest_results=backtest_results,
                 result=result,
                 regressors=regressors_frame,
@@ -776,6 +799,7 @@ class Runner:
                 horizon=horizon,
                 freq=freq,
                 levels=levels,
+                season_length=eff_season_length,
                 backtest_results=backtest_results,
                 result=result,
                 regressors=regressors_frame,
@@ -790,6 +814,7 @@ class Runner:
                 horizon=horizon,
                 freq=freq,
                 levels=levels,
+                season_length=eff_season_length,
                 result=result,
                 regressors=regressors_frame,
             )
@@ -814,12 +839,20 @@ class Runner:
         if needs.quality:
             expected_points = max(
                 1,
-                int(d.lookback.total_seconds() // max(1, int(d.step.total_seconds()))),
+                int(d.lookback.total_seconds() // max(1, int(eff_step.total_seconds()))),
             )
             coverage = min(1.0, len(frame.values) / float(expected_points))
             result.quality = list(
                 factory.quality_points(backtests, emitted_models, frame.values, coverage)
             )
+
+        if d.emission.contribution and regressors_frame is not None:
+            contributions = contribution_mod.compute_contributions(
+                y=list(frame.values),
+                regressors=regressors_frame,
+            )
+            if contributions:
+                result.contribution = list(factory.contribution_points(contributions))
 
         return result
 
@@ -871,6 +904,7 @@ class Runner:
         horizon: int,
         freq: str,
         levels: list[int],
+        season_length: int,
         result: _FitResult,
         regressors: pd.DataFrame | None = None,
     ) -> list[ForecastPoint]:
@@ -879,7 +913,6 @@ class Runner:
         # the pool has spare workers. The pool itself caps total concurrency,
         # so this doesn't risk overloading anything beyond what a single
         # serial pass already touched.
-        d = self._config.defaults
 
         async def _timed(spec: ModelSpec) -> tuple[str, pd.DataFrame, float]:
             t0 = time.monotonic()
@@ -889,7 +922,7 @@ class Runner:
                 horizon=horizon,
                 freq=freq,
                 levels=levels,
-                season_length=d.season_length,
+                season_length=season_length,
                 regressors=regressors,
             )
             return spec.name, forecast, time.monotonic() - t0
@@ -929,6 +962,7 @@ class Runner:
         horizon: int,
         freq: str,
         levels: list[int],
+        season_length: int,
         backtest_results: dict[str, list[AccuracyResult]],
         result: _FitResult,
         regressors: pd.DataFrame | None = None,
@@ -956,7 +990,7 @@ class Runner:
             horizon=horizon,
             freq=freq,
             levels=levels,
-            season_length=d.season_length,
+            season_length=season_length,
             regressors=regressors,
         )
         fit_seconds = time.monotonic() - t0
@@ -984,6 +1018,7 @@ class Runner:
         horizon: int,
         freq: str,
         levels: list[int],
+        season_length: int,
         backtest_results: dict[str, list[AccuracyResult]],
         result: _FitResult,
         regressors: pd.DataFrame | None = None,
@@ -1002,8 +1037,6 @@ class Runner:
         some models report a given confidence level.
         """
 
-        d = self._config.defaults
-
         async def _timed(spec: ModelSpec) -> tuple[str, pd.DataFrame, float]:
             t0 = time.monotonic()
             forecast = await self._fit_one(
@@ -1012,7 +1045,7 @@ class Runner:
                 horizon=horizon,
                 freq=freq,
                 levels=levels,
-                season_length=d.season_length,
+                season_length=season_length,
                 regressors=regressors,
             )
             return spec.name, forecast, time.monotonic() - t0
@@ -1274,6 +1307,7 @@ def _merge_fit_into_ctx(ctx: _RunContext, fit_result: _FitResult, query_id: str)
     ctx.deviation_points.extend(fit_result.deviation)
     ctx.quality_points.extend(fit_result.quality)
     ctx.ensemble_weight_points.extend(fit_result.ensemble)
+    ctx.contribution_points.extend(fit_result.contribution)
     ctx.curve_points.extend(fit_result.curve)
     for model_name, fit_seconds in fit_result.fit_durations.items():
         ctx.fit_durations[(query_id, model_name)] = fit_seconds
