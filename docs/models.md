@@ -86,6 +86,34 @@ defaults:
 Bare strings are equivalent to `{ name: "<model>", params: {} }`.  
 Supported keys are whatever the underlying `statsforecast` model accepts. Unknown keys surface as fit-time errors tagged `fit_error` in `forecast_failures_total`.
 
+## Multi-frequency support
+
+`step` and `season_length` cascade from `defaults` onto every query, but a query can override either one when its natural cadence doesn't match the rest of the config:
+
+```yaml
+defaults:
+  step: 5m
+  season_length: 288        # daily seasonality at 5-minute step
+
+groups:
+  - name: mixed
+    queries:
+      - id: node_cpu_busy_pct       # uses defaults
+        promql: 100 - rate(node_cpu_seconds_total{mode="idle"}[5m]) * 100
+      - id: hourly_business_kpi     # 1h cadence, daily seasonality (24)
+        promql: business_kpi
+        step: 1h
+        season_length: 24
+      - id: hourly_with_auto        # let the forecaster pick the seasonality
+        promql: business_kpi
+        step: 1h
+        season_length: auto
+```
+
+`season_length: auto` derives a daily seasonality from the effective step (`86400 / step_seconds`); steps of a day or longer fall back to a weekly cycle (`7`).
+
+The override flows through every per-query path: PromQL fetch step, regressor pre-fetch step, accuracy horizons (`accuracy.horizons` are still measured in wall-clock duration, but step-aware), and the model's `season_length` parameter.
+
 ## Exogenous regressors
 
 Per-query `regressors:` lets you feed external drivers into a forecast. Two types are supported:
@@ -113,6 +141,18 @@ groups:
 Failures increment `forecast_regressor_failures_total{group, query, regressor, reason}` (optional) or `forecast_failures_total{reason="required_regressor"}` (required).
 
 The built-in `statsforecast` wrappers currently ignore regressors, but the pipeline is ready for third-party models (`promforecast-prophet`, etc.).
+
+### Per-regressor contribution metric
+
+When a query has at least one regressor, the forecaster also emits a normalised explainability share per regressor:
+
+```
+<id>_forecast_contribution_ratio{regressor="hour_of_day", group, ...}
+```
+
+Values live in `[0, 1]`; the ratios across regressors of a single series sum to 1 when at least one regressor produces a finite Pearson correlation against the series actuals. Constant regressors and constant targets land at `0.0` rather than dragging the rest of the share down. Disable via `defaults.emission.contribution: false`.
+
+Because the built-in models don't expose per-regressor coefficients, the metric is a data-only proxy: |Pearson correlation|, normalised across the configured regressors. It's a useful first-order view today and a stable name for plug-in models that later derive a real per-coefficient contribution.
 
 ## remote_write sink
 

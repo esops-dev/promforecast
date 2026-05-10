@@ -9,17 +9,29 @@ Starts the forecaster: parses and validates the YAML config, builds the model re
 
 Exposed endpoints:
 
-| Endpoint       | Method | Purpose                                      |
-|----------------|--------|----------------------------------------------|
-| `/healthz`     | GET    | Liveness probe                               |
-| `/metrics`     | GET    | Prometheus exposition format                 |
-| `/-/reload`    | POST   | Validate-then-reload config (atomic swap)    |
+| Endpoint       | Method | Purpose                                                              |
+|----------------|--------|----------------------------------------------------------------------|
+| `/healthz`     | GET    | Liveness probe; also returns `config_hash` and last-reload telemetry |
+| `/metrics`     | GET    | Prometheus exposition format                                         |
+| `/-/reload`    | POST   | Validate-then-reload config (atomic swap)                            |
+| `/config`      | GET    | Sanitised JSON view of the running config (opt-in)                   |
 
 **Reload behavior**  
 - `SIGHUP` triggers the same reload as `/-/reload`.  
 - When `server.reload.watch_configmap: true` (default), the `--config` file is polled every second. Any content change triggers an automatic reload.  
 - Kubernetes ConfigMap projections are atomic, so `kubectl apply` is enough — no pod restart required.  
 - A failed reload leaves the previous config running and increments `forecast_config_reload_failures_total`. The HTTP endpoint returns `400` with the validation error.
+
+**Config identity surfaces**
+
+The forecaster exposes the running config's identity in three places so operators can confirm a deployment is running the expected revision without `kubectl exec`:
+
+- `forecast_config_hash{sha256="<hex>"} 1.0` on `/metrics` (info-style gauge; family is omitted before the first successful load).
+- `forecast_config_last_reload_timestamp_seconds`, `forecast_config_reload_success`, and `forecast_config_reload_failures_total` on `/metrics` for reload telemetry.
+- `/healthz` returns `{ "status": "ok", "config_hash": "...", "config_last_reload_timestamp": <unix>, "config_last_reload_success": true }`.
+- `/config` (opt-in via `server.expose_config_endpoint: true`) returns the parsed config as JSON with `datasource.auth.*` and `sink.remote_write.headers` redacted. The endpoint is unauthenticated like `/metrics`, so only enable it when the metrics port is on a trusted network.
+
+A successful reload refreshes the hash to the new file's digest; failed reloads keep the previous hash so `/metrics` always reflects what the runner is actually executing.
 
 ## `promforecast validate`
 
@@ -64,7 +76,8 @@ Estimated cardinality (worst case at max_series_per_query):
   accuracy lines       16000
   deviation lines       8000
   quality lines         1600
+  contribution lines    1000
   operational lines       21
-  total                33621
+  total                34621
   WARN: total exceeds safety.max_total_series (5000); series_overflow will drop the excess
 ```

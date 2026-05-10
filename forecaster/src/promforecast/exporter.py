@@ -31,6 +31,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "AccuracyPoint",
+    "ContributionPoint",
     "DeviationPoint",
     "EnsembleWeightPoint",
     "Exporter",
@@ -90,6 +91,22 @@ class QualityPoint:
 
 
 @dataclass(frozen=True)
+class ContributionPoint:
+    """Per-regressor explainability sample.
+
+    Rendered as ``<id>_forecast_contribution_ratio`` (gauge, 0..1) so the
+    metric name carries the primary metric's identity, and the
+    ``regressor`` label distinguishes contributors. Ratios across all
+    regressors of a series sum to 1 when at least one regressor produced a
+    finite correlation.
+    """
+
+    metric: str
+    labels: dict[str, str]
+    value: float
+
+
+@dataclass(frozen=True)
 class EnsembleWeightPoint:
     """Per-model contribution weight inside an ensemble forecast.
 
@@ -112,6 +129,7 @@ class GroupSnapshot:
     deviation_points: list[DeviationPoint] = field(default_factory=list)
     quality_points: list[QualityPoint] = field(default_factory=list)
     ensemble_weights: list[EnsembleWeightPoint] = field(default_factory=list)
+    contribution_points: list[ContributionPoint] = field(default_factory=list)
     last_run_timestamp: float = 0.0
     run_duration_seconds: float = 0.0
     series_count: int = 0
@@ -149,6 +167,11 @@ class Exporter:
         self._reload_timestamp: float = 0.0
         self._reload_success: bool = True
         self._reload_failures: int = 0
+        # SHA-256 of the currently-loaded config file, hex-encoded. Empty
+        # until the first successful load. Surfaces as the
+        # ``forecast_config_hash{sha256="..."}`` info-style gauge so dashboards
+        # can confirm a deployment is running the expected revision.
+        self._config_hash: str = ""
         # Per-(group, reason) push-sink failure counter. The reason set is
         # bounded by the sink (``timeout``, ``http_error``, ``encode_error``)
         # so cardinality is small and predictable.
@@ -197,6 +220,18 @@ class Exporter:
         with self._lock:
             self._reload_failures += 1
 
+    def set_config_hash(self, sha256_hex: str) -> None:
+        """Replace the recorded config hash.
+
+        ``sha256_hex`` is rendered as the ``sha256`` label on
+        ``forecast_config_hash``; an empty string disables emission of the
+        family entirely. The exporter doesn't validate that the value really
+        is a hex digest — callers compute it from raw config bytes and pass
+        it through untouched.
+        """
+        with self._lock:
+            self._config_hash = sha256_hex
+
     def increment_remote_write_failure(self, group: str, reason: str) -> None:
         """Bump the remote_write push-sink failure counter for ``group``."""
         with self._lock:
@@ -225,6 +260,10 @@ class Exporter:
         with self._lock:
             return self._reload_timestamp, self._reload_success, self._reload_failures
 
+    def _config_hash_state(self) -> str:
+        with self._lock:
+            return self._config_hash
+
     def _remote_write_state(self) -> dict[tuple[str, str], int]:
         with self._lock:
             return dict(self._remote_write_failures)
@@ -240,13 +279,16 @@ class _SnapshotCollector:
         groups = self._exporter._snapshot()
         reload_state = self._exporter._reload_state()
         remote_write_state = self._exporter._remote_write_state()
+        config_hash = self._exporter._config_hash_state()
         yield from _forecast_families(groups)
         yield from _accuracy_families(groups)
         yield from _deviation_families(groups)
         yield from _quality_families(groups)
         yield from _ensemble_families(groups)
+        yield from _contribution_families(groups)
         yield from _operational_families(groups)
         yield from _reload_families(reload_state)
+        yield from _config_hash_families(config_hash)
         yield from _remote_write_families(remote_write_state)
 
 
@@ -390,6 +432,31 @@ def _ensemble_families(
     )
 
 
+def _contribution_families(
+    groups: list[GroupSnapshot],
+) -> Iterator[GaugeMetricFamily]:
+    """Render ``<id>_forecast_contribution_ratio`` gauges, one family per id.
+
+    The metric name is derived from the primary metric's id (the same shape
+    forecast points use), and the ``regressor`` label discriminates the
+    contributors. Bucketing by metric name first matches the forecast-family
+    rendering and keeps label sets uniform within each family.
+    """
+    by_metric: dict[str, list[ContributionPoint]] = {}
+    for snap in groups:
+        for point in snap.contribution_points:
+            by_metric.setdefault(point.metric, []).append(point)
+    for metric_name, points in sorted(by_metric.items()):
+        yield from _emit_gauge_family(
+            points,
+            metric_name,
+            "Per-regressor explainability share for the forecast in [0, 1]; "
+            "ratios across regressors of a series sum to 1 when finite.",
+            value_fn=lambda p: p.value,
+            skip_fn=lambda p: not math.isfinite(p.value),
+        )
+
+
 def _operational_families(
     groups: list[GroupSnapshot],
 ) -> Iterator[GaugeMetricFamily | CounterMetricFamily]:
@@ -513,6 +580,28 @@ def _reload_families(
     )
     failure_counter.add_metric([], float(failures))
     yield failure_counter
+
+
+def _config_hash_families(
+    sha256_hex: str,
+) -> Iterator[GaugeMetricFamily]:
+    """Render ``forecast_config_hash{sha256="..."} 1.0``.
+
+    Skipped entirely when no config has been loaded yet (the empty-hash
+    case). Info-style gauges are rendered as a constant ``1`` so dashboards
+    can join on the label without doing arithmetic on the value, which is
+    the established Prometheus convention for "info" metrics.
+    """
+    if not sha256_hex:
+        return
+    family = GaugeMetricFamily(
+        "forecast_config_hash",
+        "SHA-256 hash of the currently-loaded config file (info-style; "
+        "value is always 1, the hash lives on the sha256 label).",
+        labels=["sha256"],
+    )
+    family.add_metric([sha256_hex], 1.0)
+    yield family
 
 
 def _remote_write_families(

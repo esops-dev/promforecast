@@ -49,3 +49,18 @@ groups:
           histogram_quantile(0.95,
             sum by (service, le) (rate(http_request_duration_seconds_bucket[5m]))
           )
+
+      # Hourly KPI rolled up by the upstream pipeline. We don't need the
+      # 5-minute resolution (and there isn't any) — overriding step + the
+      # season_length keeps the seasonality aligned to the natural cadence
+      # without forking the whole defaults block.
+      - id: daily_active_users_hourly
+        promql: |
+          sum(daily_active_users)
+        step: 1h
+        season_length: 24
+        regressors:
+          - id: hour_of_day
+            type: calendar
+          - id: day_of_week
+            type: calendar

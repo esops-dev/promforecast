@@ -70,6 +70,11 @@ class ServerConfig(BaseModel):
     listen: str = ":9091"
     refresh_interval: Duration = timedelta(hours=1)
     reload: ReloadConfig = ReloadConfig()
+    # Off by default — the endpoint exposes the parsed (sanitised) config
+    # over HTTP without authentication, which is appropriate inside a trusted
+    # cluster but not on a public address. Operators flip this on when they
+    # need to confirm what the forecaster is *actually* running.
+    expose_config_endpoint: bool = False
 
 
 class SafetyConfig(BaseModel):
@@ -120,16 +125,21 @@ class AccuracyConfig(BaseModel):
 class EmissionConfig(BaseModel):
     """Per-metric-family on/off toggles.
 
-    Both rely on backtest data (see :class:`AccuracyConfig`); turning them
-    on without ``accuracy.evaluate`` is allowed because the backtest will be
-    run on demand for the deviation/quality summaries even if the per-horizon
-    MAPE/MASE samples are not exposed.
+    The deviation and quality toggles rely on backtest data (see
+    :class:`AccuracyConfig`); turning them on without ``accuracy.evaluate``
+    is allowed because the backtest will be run on demand for the
+    deviation/quality summaries even if the per-horizon MAPE/MASE samples
+    are not exposed.
+
+    ``contribution`` controls the per-regressor explainability metric. When
+    a query has no regressors configured, the toggle is a no-op.
     """
 
     model_config = ConfigDict(extra="forbid")
 
     deviation: bool = True
     quality: bool = True
+    contribution: bool = True
 
 
 class ModelSpec(BaseModel):
@@ -205,11 +215,28 @@ class RegressorConfig(BaseModel):
 
 
 class QueryConfig(BaseModel):
+    """A single PromQL query plus optional per-query overrides.
+
+    ``step`` and ``season_length`` shadow the matching keys on
+    :class:`DefaultsConfig` so a single forecaster can mix metrics with very
+    different natural cadences (e.g. 5-minute node CPU vs hourly business
+    KPIs) without forking the config or running multiple instances.
+
+    * ``step``: query/sample cadence as a Prometheus duration. ``None``
+      (default) inherits ``defaults.step``.
+    * ``season_length``: number of steps in one season. ``None`` inherits
+      ``defaults.season_length``; the literal string ``"auto"`` asks the
+      forecaster to derive a daily seasonality from the effective step
+      (e.g. step=5m → 288, step=1h → 24, step=1d → 7).
+    """
+
     model_config = ConfigDict(extra="forbid")
 
     id: str
     promql: str
     regressors: list[RegressorConfig] = Field(default_factory=list)
+    step: Duration | None = None
+    season_length: int | Literal["auto"] | None = None
 
 
 class GroupConfig(BaseModel):
@@ -292,9 +319,101 @@ def load(path: str | Path) -> Config:
     for group in config.groups:
         for query in group.queries:
             validate_metric_name(query.id)
+            _validate_query_overrides(group_name=group.name, query=query)
             for reg in query.regressors:
                 _validate_regressor(group_name=group.name, query_id=query.id, reg=reg)
     return config
+
+
+def _validate_query_overrides(*, group_name: str, query: QueryConfig) -> None:
+    """Reject obviously broken per-query ``step`` / ``season_length``.
+
+    The pydantic schema accepts both fields as optional with broad types so
+    forward-compat configs keep parsing; the semantic checks (positive step,
+    positive season_length) live here so they fail at boot with a precise
+    label rather than blowing up during the first fit.
+    """
+    label = f"groups[{group_name}].queries[{query.id}]"
+    if query.step is not None and query.step.total_seconds() <= 0:
+        raise ValueError(f"{label}: step must be a positive duration")
+    if isinstance(query.season_length, int) and query.season_length <= 0:
+        raise ValueError(f"{label}: season_length must be a positive integer")
+
+
+def effective_step(query: QueryConfig, defaults: DefaultsConfig) -> timedelta:
+    """Resolve the actual step for ``query`` from its override + defaults."""
+    return query.step if query.step is not None else defaults.step
+
+
+def effective_season_length(
+    query: QueryConfig,
+    defaults: DefaultsConfig,
+    *,
+    step: timedelta | None = None,
+) -> int:
+    """Resolve the actual season_length for ``query``.
+
+    Handles three cases in order of precedence:
+
+    1. Query-level integer override -> use as-is.
+    2. Query-level ``"auto"`` -> derive a daily seasonality from the
+       effective step. Sub-daily steps map to ``86400 / step_seconds``;
+       step >= 1 day collapses to 7 (weekly seasonality).
+    3. No query-level override -> inherit ``defaults.season_length``.
+
+    A bottom floor of ``1`` is enforced because statsforecast's models can't
+    handle ``season_length=0``.
+    """
+    sl = query.season_length
+    if isinstance(sl, int):
+        return max(1, sl)
+    if sl == "auto":
+        s = step if step is not None else effective_step(query, defaults)
+        return _derive_season_length_from_step(s)
+    return defaults.season_length
+
+
+_SECRET_REDACTION = "<redacted>"
+
+
+def sanitised_dump(config: Config) -> dict[str, Any]:
+    """Return the parsed config as a JSON-friendly dict with secrets redacted.
+
+    Used by the optional ``/config`` debug endpoint. The redaction list is
+    deliberately small but precise:
+
+    * ``datasource.auth.*`` (credential type + any future credential fields)
+    * ``sink.remote_write.headers`` (auth tokens commonly travel in headers)
+
+    Operators see the metric IDs, PromQL, model/regressor configuration —
+    everything they need to confirm the running config matches their git
+    revision — without /config leaking a bearer token if one is later added
+    to ``datasource.auth`` or to a custom remote_write header.
+    """
+    payload = config.model_dump(mode="json")
+    auth = payload.get("datasource", {}).get("auth")
+    if isinstance(auth, dict) and auth.get("type") not in (None, "none"):
+        payload["datasource"]["auth"] = {"type": auth.get("type"), "credentials": _SECRET_REDACTION}
+    sink = payload.get("sink", {}).get("remote_write")
+    if isinstance(sink, dict):
+        headers = sink.get("headers") or {}
+        if headers:
+            sink["headers"] = {key: _SECRET_REDACTION for key in headers}
+    return payload
+
+
+def _derive_season_length_from_step(step: timedelta) -> int:
+    """Daily-seasonality heuristic for the ``season_length: auto`` shortcut.
+
+    For sub-daily steps return ``round(86400 / step_seconds)``; for steps of
+    a day or longer fall back to a weekly seasonality of 7. Both branches
+    floor at 1 so the result is always a valid season_length.
+    """
+    step_seconds = max(1, int(step.total_seconds()))
+    day_seconds = 86_400
+    if step_seconds < day_seconds:
+        return max(1, round(day_seconds / step_seconds))
+    return 7
 
 
 def _validate_regressor(*, group_name: str, query_id: str, reg: RegressorConfig) -> None:

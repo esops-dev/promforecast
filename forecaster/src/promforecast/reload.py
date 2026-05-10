@@ -21,6 +21,7 @@ swap semantics are identical regardless of source.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -114,11 +115,20 @@ class ConfigReloader:
 
             now = time.time()
             self._exporter.set_reload_state(success=True, timestamp=now)
+            # Refresh the reported config hash *after* a successful swap so
+            # /metrics tracks exactly what the runner is now executing. On
+            # validation/apply failure we leave the previous hash intact —
+            # the metric should reflect the running config, not the rejected
+            # candidate.
+            new_hash = _hash_config_file(self._config_path)
+            if new_hash:
+                self._exporter.set_config_hash(new_hash)
             log.info(
                 "config_reload_succeeded",
                 added=result.added,
                 removed=result.removed,
                 changed=result.changed,
+                config_hash=new_hash,
             )
             return ReloadOutcome(result=result, timestamp=now)
 
@@ -235,9 +245,19 @@ def _content_hash(path: Path) -> str | None:
     path of polling — we accept the cost of reading the whole file when it
     actually changes.
     """
-    import hashlib  # noqa: PLC0415
-
     try:
         return hashlib.sha256(path.read_bytes()).hexdigest()
     except FileNotFoundError:
         return None
+
+
+def _hash_config_file(path: Path) -> str:
+    """Hex SHA-256 of the on-disk config bytes; ``""`` if the file vanishes.
+
+    Used by the reload coordinator to refresh the exporter-side
+    ``forecast_config_hash`` value. Mirrors :func:`_content_hash` but
+    returns the empty string on failure so the caller can ``if new_hash``
+    cleanly without juggling ``Optional``.
+    """
+    digest = _content_hash(path)
+    return digest if digest is not None else ""

@@ -23,6 +23,7 @@ from . import quality as quality_mod
 from .accuracy import overall_mape
 from .exporter import (
     AccuracyPoint,
+    ContributionPoint,
     DeviationPoint,
     EnsembleWeightPoint,
     ForecastPoint,
@@ -36,6 +37,7 @@ if TYPE_CHECKING:
     import pandas as pd
 
     from .accuracy import AccuracyResult
+    from .contribution import ContributionResult
     from .selector import SelectionResult
 
 
@@ -199,6 +201,31 @@ class SeriesPointFactory:
             yield EnsembleWeightPoint(
                 labels={**common, "model": model_name},
                 weight=float(weight),
+            )
+
+    def contribution_points(
+        self,
+        contributions: list[ContributionResult],
+    ) -> Iterable[ContributionPoint]:
+        """Yield one ``<id>_forecast_contribution_ratio`` sample per regressor.
+
+        The label set mirrors the forecast point family (base series labels
+        + ``group``) plus a ``regressor`` discriminator. We deliberately
+        omit ``model`` here: the contribution is a property of the data, not
+        the model. Plug-in models that derive a per-model coefficient can
+        emit a parallel metric in a future revision without colliding.
+        """
+        metric_name = f"{self._metric_id}_forecast_contribution_ratio"
+        for contribution in contributions:
+            labels = {
+                **self._base_common,
+                "group": self._group,
+                "regressor": contribution.regressor_id,
+            }
+            yield ContributionPoint(
+                metric=metric_name,
+                labels=labels,
+                value=float(contribution.ratio),
             )
 
     def _build_common_labels(
