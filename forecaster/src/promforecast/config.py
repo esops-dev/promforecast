@@ -25,11 +25,16 @@ CALENDAR_FEATURE_TYPES = ("hour_of_day", "day_of_week", "is_weekend")
 
 # Versioned schema. ``apiVersion`` mirrors the Kubernetes convention so a
 # config file declares which schema it conforms to and the loader can route
-# between versions when a stable schema lands. Today only ``v1alpha1``
-# exists; configs without an ``apiVersion`` are accepted but emit a
-# one-shot warning so operators add it before the schema is frozen.
-CURRENT_API_VERSION = "promforecast.io/v1alpha1"
-SUPPORTED_API_VERSIONS: frozenset[str] = frozenset({CURRENT_API_VERSION})
+# between versions transparently. ``promforecast.io/v1`` is the stable
+# schema; ``promforecast.io/v1alpha1`` is kept as a backward-compatible
+# alias of v1 (every v1alpha1 config validates unchanged as v1) and loads
+# with a one-shot ``DeprecationWarning`` nudging operators to retag. Any
+# future breaking change will ship under a fresh ``apiVersion`` with both
+# the old and new schemas accepted during a documented deprecation window
+# — see ``docs/config-schema.md`` for the migration policy.
+CURRENT_API_VERSION = "promforecast.io/v1"
+DEPRECATED_API_VERSIONS: frozenset[str] = frozenset({"promforecast.io/v1alpha1"})
+SUPPORTED_API_VERSIONS: frozenset[str] = frozenset({CURRENT_API_VERSION}) | DEPRECATED_API_VERSIONS
 
 
 class UnsupportedApiVersionError(ValueError):
@@ -264,6 +269,27 @@ class RegressorConfig(BaseModel):
     required: bool = False
 
 
+class DiscoveryVariable(BaseModel):
+    """One discovery variable for dynamic series fan-out.
+
+    The variable's ``promql`` is run on every refresh tick and the distinct
+    values of its ``label`` become the variable's value set. The primary
+    query's PromQL is then rendered once per value (Cartesian product when
+    multiple variables are configured) and fed into the normal fetch path.
+
+    Keeping ``promql`` and ``label`` decoupled is deliberate: the discovery
+    query is typically a cheap ``up{job="..."}`` or
+    ``count by (instance)(node_uname_info)`` while the primary query is
+    expensive; we want the cheap probe to drive the expensive fan-out.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    label: str
+    promql: str
+
+
 class QueryConfig(BaseModel):
     """A single PromQL query plus optional per-query overrides.
 
@@ -278,6 +304,10 @@ class QueryConfig(BaseModel):
       ``defaults.season_length``; the literal string ``"auto"`` asks the
       forecaster to derive a daily seasonality from the effective step
       (e.g. step=5m → 288, step=1h → 24, step=1d → 7).
+    * ``discover``: optional discovery variables. When present, the primary
+      ``promql`` is treated as a template; ``$var`` or ``${var}`` markers
+      are substituted with the values produced by each variable's discovery
+      query at runtime. See :mod:`promforecast.discovery`.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -287,6 +317,38 @@ class QueryConfig(BaseModel):
     regressors: list[RegressorConfig] = Field(default_factory=list)
     step: Duration | None = None
     season_length: int | Literal["auto"] | None = None
+    discover: list[DiscoveryVariable] = Field(default_factory=list)
+
+
+class CanaryConfig(BaseModel):
+    """Canary / weighted sampling for a group.
+
+    When ``enabled: true`` the runner samples ``weight`` of every query's
+    series before passing them through the per-query / global overflow
+    caps. Useful for testing a new high-cardinality group against a
+    production TSDB without paying the full fit cost up front, or for
+    running an expensive model across a representative slice of a fleet
+    instead of every host.
+
+    **Precedence with ``safety.series_overflow``**: canary sampling runs
+    *first* and reduces the population; ``max_series_per_query`` and
+    ``max_total_series`` then apply to the sampled set. This ordering
+    matches the intent of canary mode — the operator opts into a smaller
+    population, and the global guards still bound it from above. The
+    sampled-out series surface as
+    ``forecast_series_dropped_total{group, reason="canary"}``.
+
+    Sampling is deterministic per run: we use ``random.sample`` with the
+    default RNG so a single run is reproducible during debugging, but
+    successive runs rotate through the population. A fixed seed would
+    bias the canary to the same N series forever; rotation gives broader
+    coverage over time.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    weight: float = Field(default=0.1, gt=0.0, le=1.0)
 
 
 class GroupConfig(BaseModel):
@@ -294,6 +356,7 @@ class GroupConfig(BaseModel):
 
     name: str
     priority: int = 1
+    canary: CanaryConfig = Field(default_factory=CanaryConfig)
     queries: list[QueryConfig]
 
 
@@ -357,6 +420,143 @@ class SinkConfig(BaseModel):
     remote_write: RemoteWriteSinkConfig = RemoteWriteSinkConfig()
 
 
+class HighAvailabilityConfig(BaseModel):
+    """Leader election + shared-snapshot wiring for multi-replica deployments.
+
+    Off by default. When ``enabled: true`` the forecaster acquires a
+    coordination.k8s.io/v1 Lease before scheduling any work; followers serve
+    ``/metrics`` from the Redis snapshot cache the leader writes after each
+    run. Setting ``enabled: true`` without ``redis.address`` is rejected at
+    load time because followers would have nothing to read from.
+
+    The Lease parameters mirror the defaults the Kubernetes control plane
+    uses (``lease_duration=30s``, ``renew_deadline=20s``, ``retry_period=4s``);
+    they're exposed mostly for tests and very-fast-failover environments.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    lease_name: str = "promforecast-leader"
+    namespace: str = ""
+    identity: str = ""
+    lease_duration_seconds: int = Field(default=30, ge=2)
+    renew_deadline_seconds: int = Field(default=20, ge=1)
+    retry_period_seconds: int = Field(default=4, ge=1)
+
+    class RedisConfig(BaseModel):
+        model_config = ConfigDict(extra="forbid")
+
+        address: str = ""
+        password: str = ""
+        snapshot_ttl: Duration = timedelta(minutes=5)
+
+    redis: RedisConfig = Field(default_factory=RedisConfig)
+
+    @model_validator(mode="after")
+    def _enabled_requires_redis(self) -> HighAvailabilityConfig:
+        # client-go ordering invariant: renew_deadline must be strictly less
+        # than lease_duration. We surface it at config load rather than at
+        # election start so a typo fails fast.
+        if self.renew_deadline_seconds >= self.lease_duration_seconds:
+            raise ValueError(
+                "highAvailability.renew_deadline_seconds must be < lease_duration_seconds"
+            )
+        if self.enabled and not self.redis.address:
+            raise ValueError(
+                "highAvailability.enabled is true but highAvailability.redis.address is empty; "
+                "followers need a Redis backend to serve the leader's snapshot"
+            )
+        return self
+
+
+class OTLPTelemetryConfig(BaseModel):
+    """OTLP exporter target for the optional OpenTelemetry tracer.
+
+    Only the gRPC OTLP transport is exposed today — it's the default for
+    the OTel Collector and matches what every managed APM accepts. The
+    HTTP/protobuf variant is a future addition if a deployment ever needs
+    it.
+
+    ``insecure`` mirrors the OTLP exporter's flag of the same name. The
+    default of ``True`` matches how most in-cluster collectors are
+    deployed (cleartext on the cluster network); flip it for collectors
+    fronted by TLS.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    endpoint: str = ""
+    insecure: bool = True
+    headers: dict[str, str] = Field(default_factory=dict)
+    timeout: Duration = timedelta(seconds=10)
+
+
+class TelemetryConfig(BaseModel):
+    """Optional OpenTelemetry tracing wiring.
+
+    Off by default. When ``enabled: true`` (which is implied by a non-empty
+    ``otlp.endpoint``) the forecaster initialises an OTLP-gRPC exporter at
+    boot and instruments the query → fit → export pipeline with spans
+    tagged ``group``, ``query``, ``model``, ``series_count``, and span
+    durations. When disabled the tracer is a no-op (``nullcontext()``) and
+    the OpenTelemetry package is *not* imported, so a deployment that
+    doesn't want tracing pays zero runtime cost.
+
+    The ``service_name`` becomes the OTel resource attribute
+    ``service.name``; the default matches the binary so an APM out of the
+    box groups every replica under a single service.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    service_name: str = "promforecast"
+    sample_ratio: float = Field(default=1.0, ge=0.0, le=1.0)
+    otlp: OTLPTelemetryConfig = Field(default_factory=OTLPTelemetryConfig)
+
+    @model_validator(mode="after")
+    def _enabled_requires_endpoint(self) -> TelemetryConfig:
+        # Treat ``otlp.endpoint`` as the canonical on switch — flipping
+        # ``enabled: true`` without an endpoint would otherwise start the
+        # SDK against ``localhost:4317`` and silently drop every span.
+        if self.enabled and not self.otlp.endpoint:
+            raise ValueError(
+                "telemetry.enabled is true but telemetry.otlp.endpoint is empty; "
+                "configure an OTLP-gRPC endpoint (e.g. otel-collector:4317)"
+            )
+        return self
+
+
+class QueryCacheConfig(BaseModel):
+    """PromQL query-result cache.
+
+    Off by default — production deployments with one group and one refresh
+    interval gain nothing. The win shows up when many groups (or many
+    queries inside a group) share PromQL prefixes against the same TSDB and
+    the same lookback window: the cache turns the duplicate fetches into a
+    single one.
+
+    ``backend: auto`` picks Redis when HA is enabled (so the cache survives
+    replica restarts and is shared across followers), otherwise the
+    in-process LRU. ``backend: memory`` forces the LRU even with HA on;
+    ``backend: redis`` forces Redis (and requires ``highAvailability``
+    to provide a Redis address, or this section's own ``redis_address``).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    backend: Literal["auto", "memory", "redis"] = "auto"
+    ttl: Duration = timedelta(minutes=5)
+    max_entries: int = Field(default=1024, ge=1)
+    # When ``backend: redis`` is forced and HA is *not* enabled, the cache
+    # needs its own Redis address. When HA is enabled, this is optional and
+    # the HA Redis is reused.
+    redis_address: str = ""
+    redis_password: str = ""
+
+
 class Config(BaseModel):
     # ``populate_by_name=True`` lets in-Python construction use ``api_version``
     # while YAML keeps the Kubernetes-idiomatic ``apiVersion`` spelling.
@@ -365,9 +565,19 @@ class Config(BaseModel):
     # Default keeps existing in-Python ``Config(...)`` usage (tests, dry-run
     # scaffolding) compatible — the YAML loader peeks at ``apiVersion``
     # before pydantic validation, so the field's default is only ever
-    # observed when no YAML is involved.
-    api_version: Literal["promforecast.io/v1alpha1"] = Field(
-        default="promforecast.io/v1alpha1",
+    # observed when no YAML is involved. The Literal accepts both the
+    # stable ``v1`` and the deprecated ``v1alpha1`` so a config that pinned
+    # the alpha tag still parses; the loader emits a DeprecationWarning
+    # when the alpha tag is declared explicitly.
+    api_version: Literal[
+        "promforecast.io/v1",
+        "promforecast.io/v1alpha1",
+    ] = Field(
+        # Inlined as a literal so mypy can narrow the default to the
+        # Literal type — using ``CURRENT_API_VERSION`` (typed ``str``)
+        # would force a cast. Keep the literal in lockstep with
+        # ``CURRENT_API_VERSION`` above.
+        default="promforecast.io/v1",
         alias="apiVersion",
     )
     datasource: DatasourceConfig
@@ -375,6 +585,11 @@ class Config(BaseModel):
     safety: SafetyConfig = SafetyConfig()
     defaults: DefaultsConfig = DefaultsConfig()
     sink: SinkConfig = SinkConfig()
+    high_availability: HighAvailabilityConfig = Field(
+        default_factory=HighAvailabilityConfig, alias="highAvailability"
+    )
+    query_cache: QueryCacheConfig = QueryCacheConfig()
+    telemetry: TelemetryConfig = Field(default_factory=TelemetryConfig)
     groups: list[GroupConfig]
 
 
@@ -422,13 +637,16 @@ def _check_api_version(raw: dict[str, Any], *, source: str) -> dict[str, Any]:
     """Validate (and inject) the top-level ``apiVersion`` declaration.
 
     * Missing ``apiVersion`` -> warn once, default to the current version.
-      This keeps pre-versioning configs working through the v0.x line so an
-      upgrade isn't gated on a config edit, but nudges operators to add it
-      before the schema freezes.
+      Pre-versioning configs keep working without an edit, but the warning
+      nudges operators to pin the schema before the next breaking bump.
+    * ``promforecast.io/v1`` -> the stable schema; loads silently.
+    * ``promforecast.io/v1alpha1`` -> deprecated alias of v1 (the schemas
+      are byte-identical). Loads with a one-shot ``DeprecationWarning``
+      pointing at the migration recipe in ``docs/config-schema.md``.
     * Unknown ``apiVersion`` -> raise :class:`UnsupportedApiVersionError`
-      with the offending value and the supported set, so a typo
-      (``promforecast.io/v1`` before v1 ships) fails clearly rather than
-      bottoming out in a generic pydantic ``Literal`` error.
+      with the offending value and the supported set so a typo fails
+      clearly rather than bottoming out in a generic pydantic ``Literal``
+      error.
 
     Returns the (possibly mutated) raw dict so the caller can hand it to
     pydantic without an extra copy.
@@ -438,7 +656,7 @@ def _check_api_version(raw: dict[str, Any], *, source: str) -> dict[str, Any]:
         warnings.warn(
             f"config {source}: missing 'apiVersion' field; "
             f"defaulting to {CURRENT_API_VERSION!r}. "
-            "Add 'apiVersion: promforecast.io/v1alpha1' to silence this warning "
+            f"Add 'apiVersion: {CURRENT_API_VERSION}' to silence this warning "
             "and pin the schema for future upgrades.",
             DeprecationWarning,
             stacklevel=3,
@@ -449,6 +667,22 @@ def _check_api_version(raw: dict[str, Any], *, source: str) -> dict[str, Any]:
             assumed=CURRENT_API_VERSION,
         )
         raw["apiVersion"] = CURRENT_API_VERSION
+        return raw
+    if declared in DEPRECATED_API_VERSIONS:
+        warnings.warn(
+            f"config {source}: apiVersion {declared!r} is deprecated and will be "
+            f"removed in a future major release; the v1alpha1 schema is identical "
+            f"to {CURRENT_API_VERSION!r}, so changing the apiVersion field is the "
+            "only required edit. See docs/config-schema.md for the migration recipe.",
+            DeprecationWarning,
+            stacklevel=3,
+        )
+        logger.warning(
+            "config_api_version_deprecated",
+            source=source,
+            declared=declared,
+            current=CURRENT_API_VERSION,
+        )
         return raw
     if declared not in SUPPORTED_API_VERSIONS:
         supported = ", ".join(sorted(SUPPORTED_API_VERSIONS))

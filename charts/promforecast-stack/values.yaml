@@ -23,7 +23,7 @@ victoria-metrics-single:
 promforecast:
   enabled: true
   config:
-    apiVersion: promforecast.io/v1alpha1
+    apiVersion: promforecast.io/v1
     datasource:
       url: http://promforecast-stack-victoria-metrics-single-server:8428/
       timeout: 30s

@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import math
 import random
 import time
+from collections.abc import Awaitable, Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -20,8 +22,11 @@ from typing import TYPE_CHECKING, Any, Literal
 import structlog
 
 from . import contribution as contribution_mod
+from . import discovery as discovery_mod
 from . import models as model_registry
 from . import regressors as regressors_mod
+from . import seasonality as seasonality_mod
+from . import telemetry as telemetry_mod
 from .accuracy import (
     AccuracyResult,
     HorizonSpec,
@@ -31,6 +36,7 @@ from .accuracy import (
     overall_mape,
 )
 from .config import (
+    CanaryConfig,
     GroupConfig,
     ModelSpec,
     effective_season_length,
@@ -216,6 +222,34 @@ def _apply_overflow(
     return frames[:cap], len(frames) - cap
 
 
+def _apply_canary(
+    frames: list[SeriesFrame],
+    canary: CanaryConfig,
+) -> tuple[list[SeriesFrame], int]:
+    """Random-sample ``ceil(weight * N)`` frames when canary mode is on.
+
+    Returns ``(kept, dropped)``. ``ceil`` (not ``floor``) so a tiny
+    population doesn't round down to zero — ``weight=0.1`` on a 5-series
+    query still fits one series, which is the useful canary case. The
+    caller emits the drop count as
+    ``forecast_series_dropped_total{reason="canary"}`` so the sampling
+    is observable from /metrics.
+
+    Sampling uses :func:`random.sample` (no fixed seed) so successive runs
+    rotate through the population. A fixed seed would bias the canary to
+    the same N series forever and defeat coverage over time.
+    """
+    if not canary.enabled or not frames:
+        return frames, 0
+    if canary.weight >= 1.0:
+        return frames, 0
+    keep = max(1, math.ceil(len(frames) * canary.weight))
+    if keep >= len(frames):
+        return frames, 0
+    sampled = random.sample(frames, keep)
+    return sampled, len(frames) - keep
+
+
 class Runner:
     """Schedules and executes per-group forecast runs.
 
@@ -239,12 +273,24 @@ class Runner:
         exporter: Exporter,
         executor: ThreadPoolExecutor | None = None,
         sink: ForecastSink | None = None,
+        tracer: telemetry_mod.Tracer | None = None,
     ) -> None:
         self._config = config
         self._source = source
         self._exporter = exporter
         self._executor = executor or ThreadPoolExecutor(max_workers=4)
         self._sink = sink
+        # ``tracer`` is the optional OpenTelemetry facade. We accept None
+        # here (rather than mandating one) so call sites that don't care
+        # about tracing — tests, ad-hoc tools — don't have to construct a
+        # disabled tracer themselves. The disabled tracer is a free
+        # singleton; instantiating one in every test is harmless but
+        # noisy.
+        self._tracer = tracer or telemetry_mod.disabled()
+        # Optional async hook called after every successful group run.
+        # Used by HA mode to publish the rendered /metrics payload to the
+        # shared snapshot cache; ``None`` in single-replica deployments.
+        self._snapshot_publisher: Callable[[], Awaitable[None]] | None = None
         self._locks: dict[str, asyncio.Lock] = {g.name: asyncio.Lock() for g in config.groups}
         # Per-group task: keyed by group.name, holds the long-lived loop. We
         # key per-group (rather than a flat list) so apply_config can diff and
@@ -263,8 +309,23 @@ class Runner:
         # (e.g. /-/reload + SIGHUP arriving together) serialise cleanly.
         self._reload_lock = asyncio.Lock()
 
+    def set_snapshot_publisher(self, publisher: Callable[[], Awaitable[None]] | None) -> None:
+        """Install (or clear) the post-run snapshot publishing hook.
+
+        HA leaders use this to push the rendered /metrics payload into the
+        shared cache after each successful group run. Idempotent; called
+        once at boot from :func:`main.run`.
+        """
+        self._snapshot_publisher = publisher
+
     async def start(self) -> None:
         """Run each group once immediately, then on the configured interval."""
+        # Guard against double-start: HA mode's leader-acquired callback
+        # invokes ``start`` every time the lease flips back to us. Without
+        # this we'd spawn duplicate group tasks each acquisition.
+        if self._tasks:
+            return
+        self._stopped.clear()
         interval = self._config.server.refresh_interval.total_seconds()
         for group in self._config.groups:
             self._spawn_group_loop(group, interval)
@@ -333,6 +394,7 @@ class Runner:
             )
             self._locks = {g.name: asyncio.Lock() for g in new_config.groups}
             self._exporter.retain_groups(set(new_by_name))
+            self._exporter.retain_discovery_groups(set(new_by_name))
 
             interval = new_config.server.refresh_interval.total_seconds()
             for group in new_config.groups:
@@ -439,8 +501,13 @@ class Runner:
             log.info("group_run_start")
 
             ctx = _RunContext(global_remaining=self._global_budgets.get(group.name, 0))
-            for query in group.queries:
-                await self._run_query(query, group, ctx, log)
+            with self._tracer.span(
+                "promforecast.group_run",
+                group=group.name,
+                query_count=len(group.queries),
+            ):
+                for query in group.queries:
+                    await self._run_query(query, group, ctx, log)
 
             duration = time.monotonic() - started
             # Counter semantics: merge this run's slow_fits with the previous
@@ -515,6 +582,18 @@ class Runner:
                 regressor_failures=len(ctx.regressor_failures),
             )
 
+            # Publish the rendered snapshot to the shared HA cache if a
+            # publisher is wired. We do this *after* updating the local
+            # exporter so the rendered payload reflects the run we just
+            # finished. Errors are swallowed by the publisher (the
+            # snapshot cache logs internally) — a Redis blip mustn't
+            # crash the run.
+            if self._snapshot_publisher is not None:
+                try:
+                    await self._snapshot_publisher()
+                except Exception:
+                    log.exception("snapshot_publish_failed")
+
             # Push to optional remote_write sink *after* the snapshot is
             # exposed via /metrics so a sink failure never delays the
             # standard exposition. Sink errors are bounded into the
@@ -551,19 +630,35 @@ class Runner:
         log: structlog.stdlib.BoundLogger,
     ) -> None:
         qlog = log.bind(query=query.id)
-        try:
-            frames = await self._fetch(query)
-        except TimeoutError:
-            qlog.error(
-                "query_timed_out",
-                timeout_s=self._config.safety.query_timeout.total_seconds(),
+        with self._tracer.span("promforecast.query", group=group.name, query=query.id):
+            await self._do_run_query(query, group, ctx, qlog)
+
+    async def _do_run_query(
+        self,
+        query: QueryConfig,
+        group: GroupConfig,
+        ctx: _RunContext,
+        qlog: structlog.stdlib.BoundLogger,
+    ) -> None:
+        frames = await self._discover_and_fetch(query, group, ctx, qlog)
+        if frames is None:
+            return
+
+        # Canary sampling runs *before* the overflow caps so the operator's
+        # opt-in population shrink happens first, and the per-query/global
+        # caps then bound the sampled population. The inverse order — caps
+        # first, then sample — would defeat the point of canary mode for a
+        # group whose total cardinality is already below caps but whose
+        # fit cost is the actual concern.
+        frames, canary_dropped = _apply_canary(frames, group.canary)
+        if canary_dropped:
+            ctx.dropped["canary"] = ctx.dropped.get("canary", 0) + canary_dropped
+            qlog.info(
+                "canary_sampled",
+                weight=group.canary.weight,
+                sampled=len(frames),
+                dropped=canary_dropped,
             )
-            ctx.failures["query_timeout"] = ctx.failures.get("query_timeout", 0) + 1
-            return
-        except Exception:
-            qlog.exception("query_failed")
-            ctx.failures["query_error"] = ctx.failures.get("query_error", 0) + 1
-            return
 
         safety = self._config.safety
         global_cap_enabled = safety.max_total_series > 0
@@ -697,15 +792,125 @@ class Runner:
         _merge_fit_into_ctx(ctx, fit_result, query.id)
         return False
 
-    async def _fetch(self, query: QueryConfig) -> list[SeriesFrame]:
+    async def _discover_and_fetch(
+        self,
+        query: QueryConfig,
+        group: GroupConfig,
+        ctx: _RunContext,
+        qlog: structlog.stdlib.BoundLogger,
+    ) -> list[SeriesFrame] | None:
+        """Expand any template variables and fetch every rendered query.
+
+        Returns the combined ``SeriesFrame`` list across all expansions on
+        success, or ``None`` when the caller should abandon the query (no
+        variables resolved, discovery itself blew up). All discovery and
+        fetch failures are recorded on ``ctx`` / the exporter so callers
+        don't need to know the details.
+        """
+        try:
+            expansion = await self._expand_query(query)
+        except Exception:
+            qlog.exception("discovery_failed")
+            ctx.failures["discovery_error"] = ctx.failures.get("discovery_error", 0) + 1
+            self._exporter.record_discovery(group=group.name, query=query.id, expansions=0)
+            return None
+
+        discovery_failure_counts: dict[tuple[str, str], int] = {}
+        for failure in expansion.failures:
+            key = (failure.variable, failure.reason)
+            discovery_failure_counts[key] = discovery_failure_counts.get(key, 0) + 1
+        self._exporter.record_discovery(
+            group=group.name,
+            query=query.id,
+            expansions=len(expansion.rendered),
+            failures=discovery_failure_counts,
+        )
+        if expansion.dropped:
+            ctx.dropped["discovery_cap"] = ctx.dropped.get("discovery_cap", 0) + expansion.dropped
+        if not expansion.rendered:
+            if expansion.failures:
+                qlog.warning(
+                    "discovery_no_values",
+                    failures=[
+                        {"variable": f.variable, "reason": f.reason} for f in expansion.failures
+                    ],
+                )
+                ctx.failures["discovery_empty"] = ctx.failures.get("discovery_empty", 0) + 1
+            else:
+                qlog.info("discovery_no_values")
+            return None
+
+        # Fan out the expanded fetches concurrently. Wall time becomes
+        # ``max(per-fetch)`` instead of ``sum(per-fetch)`` — at the typical
+        # 100ms per-fetch latency this is the difference between a 10s and
+        # a 200ms refresh for a 100-series template. ``PromSource`` already
+        # caps total concurrency via its internal semaphore, so this fan-out
+        # cannot accidentally hammer the TSDB.
+        outcomes = await asyncio.gather(
+            *(
+                self._fetch_promql(query, rendered_promql)
+                for rendered_promql, _ in expansion.rendered
+            ),
+            return_exceptions=True,
+        )
+        frames: list[SeriesFrame] = []
+        for (rendered_promql, _values), outcome in zip(expansion.rendered, outcomes, strict=True):
+            if isinstance(outcome, TimeoutError):
+                qlog.error(
+                    "query_timed_out",
+                    promql=rendered_promql,
+                    timeout_s=self._config.safety.query_timeout.total_seconds(),
+                )
+                ctx.failures["query_timeout"] = ctx.failures.get("query_timeout", 0) + 1
+                continue
+            if isinstance(outcome, BaseException):
+                qlog.warning(
+                    "query_failed",
+                    promql=rendered_promql,
+                    error=str(outcome),
+                )
+                ctx.failures["query_error"] = ctx.failures.get("query_error", 0) + 1
+                continue
+            frames.extend(outcome)
+        return frames
+
+    async def _fetch_promql(self, query: QueryConfig, promql: str) -> list[SeriesFrame]:
+        """Run a single PromQL string against the configured datasource.
+
+        Split out from the original ``_fetch(query)`` so the discovery
+        expansion path can issue one fetch per rendered query while still
+        going through the same retry / timeout / cache wiring. The original
+        :meth:`_fetch` is kept as a thin compatibility wrapper for callers
+        that don't care about the rendered string (and for tests).
+        """
         d = self._config.defaults
         s = self._config.safety
         end = datetime.now(tz=UTC)
         start = end - d.lookback
         step_seconds = max(1, int(effective_step(query, d).total_seconds()))
         return await asyncio.wait_for(
-            self._source.query_range(query.promql, start, end, step_seconds),
+            self._source.query_range(promql, start, end, step_seconds),
             timeout=s.query_timeout.total_seconds(),
+        )
+
+    async def _fetch(self, query: QueryConfig) -> list[SeriesFrame]:
+        return await self._fetch_promql(query, query.promql)
+
+    async def _expand_query(self, query: QueryConfig) -> discovery_mod.ExpansionResult:
+        """Resolve discovery variables (or pass through when no template)."""
+        if not query.discover:
+            return discovery_mod.ExpansionResult(rendered=[(query.promql, {})], failures=[])
+        d = self._config.defaults
+        s = self._config.safety
+        step_seconds = max(1, int(effective_step(query, d).total_seconds()))
+        return await discovery_mod.expand_query(
+            query=query,
+            source=self._source,
+            lookback=d.lookback,
+            step_seconds=step_seconds,
+            query_timeout_seconds=s.query_timeout.total_seconds(),
+            max_series_per_query=s.max_series_per_query,
+            overflow_strategy=s.series_overflow,
         )
 
     async def _fit_series(
@@ -731,7 +936,7 @@ class Runner:
         # both the pandas freq string and how many forecast steps live inside
         # the configured horizon, season_length controls model seasonality.
         eff_step = effective_step(query, d)
-        eff_season_length = effective_season_length(query, d, step=eff_step)
+        eff_season_length = self._resolve_season_length(query, group_name, frame, eff_step)
         freq = _pandas_freq(eff_step)
         horizon = max(1, int(d.horizon.total_seconds() // eff_step.total_seconds()))
         levels = list(d.confidence_levels)
@@ -1111,6 +1316,57 @@ class Runner:
         result.ensemble = list(factory.ensemble_weight_points(weights))
         return out
 
+    def _resolve_season_length(
+        self,
+        query: QueryConfig,
+        group_name: str,
+        frame: SeriesFrame,
+        eff_step: timedelta,
+    ) -> int:
+        """Pick a season_length for this series, running auto-detection if asked.
+
+        For non-``auto`` queries the static config-side resolver is the only
+        source of truth. For ``"auto"`` we run :func:`seasonality.detect_season_length`
+        on the series values; the static step-derived heuristic is used as
+        the fallback when ACF can't find a confident peak.
+
+        Observability:
+
+        * The per-(group, query, source) counter
+          ``forecast_season_length_detections_total`` is bumped on every
+          detection — bounded cardinality, suitable for dashboards/alerts.
+        * Anomalous outcomes (``fallback``, ``too_short``) are logged at
+          INFO; healthy outcomes (``detected``, ``snapped``) at DEBUG so
+          a high-cardinality group doesn't flood the log pipeline at
+          INFO every refresh.
+        """
+        if query.season_length != "auto":
+            return effective_season_length(query, self._config.defaults, step=eff_step)
+        fallback = effective_season_length(query, self._config.defaults, step=eff_step)
+        outcome = seasonality_mod.detect_season_length(
+            values=frame.values,
+            step=eff_step,
+            fallback=fallback,
+        )
+        self._exporter.increment_season_length_detection(
+            group=group_name, query=query.id, source=outcome.source
+        )
+        log_event = "season_length_auto_resolved"
+        log_payload = {
+            "query": query.id,
+            "period": outcome.period,
+            "source": outcome.source,
+            "correlation": (
+                None if not math.isfinite(outcome.correlation) else round(outcome.correlation, 3)
+            ),
+            "fallback": fallback,
+        }
+        if outcome.source in {"fallback", "too_short"}:
+            logger.info(log_event, **log_payload)
+        else:
+            logger.debug(log_event, **log_payload)
+        return outcome.period
+
     def _record_slow_fit_if_needed(
         self,
         *,
@@ -1186,19 +1442,31 @@ class Runner:
 
         async def _one(spec: ModelSpec) -> tuple[pd.DataFrame, pd.DataFrame] | None:
             model = model_registry.build(spec.name, season_length=season_length, params=spec.params)
-            return await asyncio.wait_for(
-                loop.run_in_executor(
-                    self._executor,
-                    _run_backtest,
-                    model,
-                    df,
-                    eval_steps,
-                    freq,
-                    levels,
-                    regressors,
-                ),
-                timeout=timeout,
-            )
+            # Mirror the production-fit span shape so an OTel trace shows
+            # backtest fits alongside forecast fits — same `model` /
+            # `season_length` / `freq` attributes, plus a `kind` tag so a
+            # query can be filtered to "backtest" or "forecast" cleanly.
+            with self._tracer.span(
+                "promforecast.fit",
+                model=spec.name,
+                kind="backtest",
+                horizon=eval_steps,
+                freq=freq,
+                season_length=season_length,
+            ):
+                return await asyncio.wait_for(
+                    loop.run_in_executor(
+                        self._executor,
+                        _run_backtest,
+                        model,
+                        df,
+                        eval_steps,
+                        freq,
+                        levels,
+                        regressors,
+                    ),
+                    timeout=timeout,
+                )
 
         outcomes = await asyncio.gather(*(_one(spec) for spec in models), return_exceptions=True)
         results: dict[str, BacktestOutcome] = {}
@@ -1259,27 +1527,34 @@ class Runner:
     ) -> pd.DataFrame:
         loop = asyncio.get_running_loop()
         model = model_registry.build(spec.name, season_length=season_length, params=spec.params)
-        return await asyncio.wait_for(
-            loop.run_in_executor(
-                self._executor,
-                _run_fit,
-                model,
-                df,
-                horizon,
-                freq,
-                levels,
-                regressors,
-            ),
-            timeout=self._config.safety.fit_timeout.total_seconds(),
-        )
+        with self._tracer.span(
+            "promforecast.fit",
+            model=spec.name,
+            kind="forecast",
+            horizon=horizon,
+            freq=freq,
+            season_length=season_length,
+        ):
+            return await asyncio.wait_for(
+                loop.run_in_executor(
+                    self._executor,
+                    _run_fit,
+                    model,
+                    df,
+                    horizon,
+                    freq,
+                    levels,
+                    regressors,
+                ),
+                timeout=self._config.safety.fit_timeout.total_seconds(),
+            )
 
-    async def stop(self) -> None:
-        """Shut down the scheduler and cancel in-flight runs.
+    async def pause(self) -> None:
+        """Stop scheduling, leave the executor / source / sink alive.
 
-        Unlike a config reload, process shutdown does not give in-flight
-        runs a grace period: SIGTERM gets ten seconds in Kubernetes by
-        default, and we'd rather drop a half-finished snapshot than
-        delay the termination.
+        HA mode uses this when leadership is lost: we want to halt new fits
+        immediately but keep the process available to take leadership back
+        without rebuilding the heavy state.
         """
         self._stopped.set()
         tasks = list(self._tasks.values())
@@ -1290,6 +1565,16 @@ class Runner:
         for task in tasks:
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await task
+
+    async def stop(self) -> None:
+        """Shut down the scheduler and cancel in-flight runs.
+
+        Unlike a config reload, process shutdown does not give in-flight
+        runs a grace period: SIGTERM gets ten seconds in Kubernetes by
+        default, and we'd rather drop a half-finished snapshot than
+        delay the termination.
+        """
+        await self.pause()
         self._executor.shutdown(wait=False, cancel_futures=True)
         await self._source.aclose()
         if self._sink is not None:

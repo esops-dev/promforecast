@@ -1,6 +1,6 @@
 # Forecast Kubernetes resource usage from kube-state-metrics and kubelet.
 
-apiVersion: promforecast.io/v1alpha1
+apiVersion: promforecast.io/v1
 
 datasource:
   url: http://victoriametrics:8428/

@@ -9,10 +9,17 @@ The docs follow the [Diataxis](https://diataxis.fr/) framework:
 
 ## Index
 
-- [Config schema](config-schema.md) — `apiVersion` and the v1.0 stability commitment
+- [Config schema](config-schema.md) — `apiVersion`, stability guarantees, and the `v1alpha1` → `v1` migration
 - [Models](models.md) — built-in forecasters, auto-select, accuracy metrics
 - [CLI](cli.md) — `promforecast run` and `promforecast validate`
+- [High availability](ha.md) — Lease-based leader election, Redis snapshot cache
+- [Query cache](cache.md) — in-memory LRU + optional Redis dedup for overlapping PromQL
+- [Series discovery](discovery.md) — template-driven auto-fan-out over label values
 - [Development](development.md) — local toolchain, CI overview, adding models
 
-The configuration reference, metrics catalogue, HA guide, and compatibility
+For a copy-and-edit reference deployment (multi-group config, HA values,
+ArgoCD/Flux manifests, architecture diagram), see
+[`examples/production/`](../examples/production/).
+
+The configuration reference, metrics catalogue, and compatibility
 matrix are tracked against later milestones — see `ROADMAP.md`.

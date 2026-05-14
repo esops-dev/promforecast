@@ -24,11 +24,12 @@ highAvailability:
 # Forecaster YAML config. Either inline below, or set existingConfigMap.
 existingConfigMap: ""
 config:
-  # Schema version. The forecaster routes on this string and warns when it
-  # is missing. Keep in lockstep with the version pinned for the v1.0
-  # cut-over; new alpha/beta revisions ship a side-by-side validator and
-  # leave this default in place until the bump is intentional.
-  apiVersion: promforecast.io/v1alpha1
+  # Schema version. The forecaster routes on this string and warns when
+  # it is missing. ``promforecast.io/v1`` is the stable schema;
+  # ``promforecast.io/v1alpha1`` still loads (with a DeprecationWarning)
+  # for configs predating the stable cut-over. See docs/config-schema.md
+  # for the deprecation policy.
+  apiVersion: promforecast.io/v1
 
   datasource:
     url: http://victoria-metrics-single-server:8428/
@@ -119,6 +120,67 @@ config:
       max_connections: 4
       max_keepalive_connections: 2
 
+  # High-availability runtime configuration. The chart's top-level
+  # `highAvailability` block controls Kubernetes-side wiring (RBAC, env
+  # vars from the downward API). The block below is the forecaster's
+  # runtime view of the same settings — both must agree to take effect.
+  # `helm install` populates the forecaster fields from the chart fields
+  # automatically, so operators usually only edit the top-level chart
+  # values. Override the inner block when you need to point the elector
+  # at a different Lease name (e.g. multi-tenant clusters).
+  highAvailability:
+    enabled: false
+    lease_name: promforecast-leader
+    # Namespace + identity default to the values projected via the
+    # downward API (PROMFORECAST_NAMESPACE / PROMFORECAST_POD_NAME).
+    namespace: ""
+    identity: ""
+    lease_duration_seconds: 30
+    renew_deadline_seconds: 20
+    retry_period_seconds: 4
+    redis:
+      address: ""
+      password: ""
+      snapshot_ttl: 5m
+
+  # Optional OpenTelemetry tracing. Disabled by default; flip
+  # `telemetry.enabled` and set an `otlp.endpoint` to ship traces of the
+  # query → fit → export pipeline to an OTel Collector. The Docker image
+  # bakes the OTel SDK in by default — no rebuild needed when enabling.
+  # When disabled the SDK is *not* imported, so this section is genuinely
+  # zero-overhead in single-replica low-traffic deployments.
+  telemetry:
+    enabled: false
+    service_name: promforecast
+    sample_ratio: 1.0
+    otlp:
+      endpoint: ""        # e.g. otel-collector.monitoring.svc:4317
+      insecure: true
+      headers: {}
+      timeout: 10s
+
+  # PromQL query-result cache. Off by default; enable when two or more
+  # groups query the same TSDB endpoint with overlapping PromQL prefixes
+  # so the duplicate fetches collapse into one. The TTL controls how
+  # stale a cached result can be — keep it well below refresh_interval
+  # so each refresh tick still gets fresh data, but high enough that
+  # cross-group overlap actually hits.
+  query_cache:
+    enabled: false
+    # `auto` resolves to `redis` when highAvailability.enabled is true,
+    # `memory` otherwise. Force one or the other when the auto rule
+    # doesn't match your topology.
+    backend: auto
+    ttl: 5m
+    # In-memory LRU size cap (entries, not bytes). Ignored when the
+    # backend resolves to redis.
+    max_entries: 1024
+    # Optional standalone Redis (when not reusing the HA Redis). Leave
+    # empty when highAvailability.redis.address is set — the HA client
+    # is reused automatically.
+    redis_address: ""
+    redis_password: ""
+
   groups: []
 
 service:
@@ -169,6 +231,12 @@ rbac:
 networkPolicy:
   enabled: false
   egress: []
+  # When highAvailability is on the chart adds Redis + kube-apiserver
+  # egress rules automatically. Override these only if your Redis runs
+  # on a non-default port or your API server is exposed on something
+  # other than 443/6443.
+  redisPort: 6379
+  kubeApiPort: 443
 
 nodeSelector: {}
 tolerations: []

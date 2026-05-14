@@ -1,0 +1,54 @@
+# Flux HelmRelease for the promforecast forecaster chart. References the
+# HelmRepository in helmrepository.yaml; pulls values verbatim from the
+# inlined `values.yaml` next door (split across a ConfigMap and the inline
+# valuesFrom for clarity).
+#
+# Two patterns shown:
+#
+# 1. ``values:`` block — short overrides committed directly.
+# 2. ``valuesFrom:`` referencing a sibling ConfigMap — useful when the
+#    config is too large for direct inlining or when separate review gates
+#    chart upgrades from config edits.
+
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: promforecast
+  namespace: observability
+spec:
+  interval: 10m
+  chart:
+    spec:
+      chart: promforecast
+      version: "0.1.0"
+      sourceRef:
+        kind: HelmRepository
+        name: promforecast
+        namespace: flux-system
+      # Re-run reconciliation when a fresh patch release lands. The chart
+      # SemVers independently from the appVersion.
+      interval: 30m
+  install:
+    remediation:
+      retries: 3
+    createNamespace: false
+  upgrade:
+    remediation:
+      remediateLastFailure: true
+      retries: 3
+    cleanupOnFail: true
+  # The forecaster config is large — keep it in a sibling ConfigMap so a
+  # config edit doesn't show as a churn in the HelmRelease diff.
+  valuesFrom:
+    - kind: ConfigMap
+      name: promforecast-values
+      valuesKey: values.yaml
+  # Anything you want to override on top of the values ConfigMap, inlined
+  # for visibility (image tag pins, namespace-specific Redis hostname).
+  values:
+    image:
+      tag: ""
+    highAvailability:
+      enabled: true
+      redis:
+        address: redis-master.observability.svc:6379

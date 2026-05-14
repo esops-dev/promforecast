@@ -3,6 +3,8 @@
 #   Prometheus       :9090
 #   node-exporter    :9100
 #   forecaster       :9091  (/metrics, /healthz, /-/reload)
+#   Redis            :6379  (query-cache backend; HA isn't wired in compose
+#                            since leader election needs a kube API server)
 #   Grafana          :3000  (admin / admin)
 
 name: promforecast-dev
@@ -44,6 +46,24 @@ services:
       - "9100:9100"
     restart: unless-stopped
 
+  redis:
+    # Lets the dev forecaster exercise the Redis-backed query cache path
+    # against a real backend instead of in-memory only. HA mode (leader
+    # election) needs a Kubernetes API server, which docker-compose does
+    # not provide — so the snapshot cache stays unused here. The query
+    # cache validates fine in single-replica mode.
+    image: redis:7-alpine
+    container_name: pf-redis
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
   prometheus:
     image: prom/prometheus:v3.11.3
     container_name: pf-prometheus
@@ -77,6 +97,8 @@ services:
       - ./docker/dev-config.yaml:/etc/promforecast/config.yaml:ro
     depends_on:
       victoriametrics:
+        condition: service_healthy
+      redis:
         condition: service_healthy
     restart: unless-stopped
 

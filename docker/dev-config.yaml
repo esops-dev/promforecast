@@ -3,11 +3,22 @@
 # Backtesting and the deviation/quality emitters are on so the bundled
 # Grafana dashboards have data to show. Not intended for any non-dev use.
 
-apiVersion: promforecast.io/v1alpha1
+apiVersion: promforecast.io/v1
 
 datasource:
   url: http://victoriametrics:8428/
   timeout: 30s
+
+# Exercise the Redis-backed query cache in dev. The two configured queries
+# don't actually overlap, so cache *hits* won't happen on the same fit, but
+# this still validates the full set/get round-trip on every refresh tick.
+# A repeated /-/reload (no config change) confirms the second call serves
+# from the cache: ``forecast_query_cache_events_total{kind="hit"}`` ticks up.
+query_cache:
+  enabled: true
+  backend: redis
+  ttl: 30s
+  redis_address: redis:6379
 
 server:
   listen: ":9091"

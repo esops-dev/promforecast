@@ -19,7 +19,7 @@ In a Helm-deployed forecaster, add the package to your container image (rebuild 
 The package registers a `Prophet` model under the `promforecast.models` entry-point group. The forecaster discovers it automatically at startup — no glue code, no config flags.
 
 ```yaml
-apiVersion: promforecast.io/v1alpha1
+apiVersion: promforecast.io/v1
 defaults:
   models:
     - SeasonalNaive

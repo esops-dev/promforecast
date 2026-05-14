@@ -82,7 +82,7 @@ sys.exit(f'alert drift: chart {sorted(ch-ex) or \"-\"}, example {sorted(ex-ch) o
 # ---------- Local dev ----------
 
 .PHONY: dev-up
-dev-up: ## Start VictoriaMetrics + node-exporter + Prometheus + forecaster locally.
+dev-up: ## Start VictoriaMetrics + node-exporter + Prometheus + Redis + forecaster locally.
 	docker compose -f docker-compose.dev.yml up -d --build
 
 .PHONY: dev-down
@@ -99,6 +99,13 @@ fams=sorted({l.split()[2] for l in b.splitlines() if l.startswith('# TYPE foreca
 need={'forecast_accuracy_mape','forecast_quality_score','forecast_deviation_ratio','forecast_deviation_outside_band'}; \
 missing=need-set(fams); \
 exit(f'!! missing: {sorted(missing)} -- the forecaster has not produced its first fit yet, wait one refresh_interval and retry') if missing else print('>> all expected metric families present')"
+	@echo ">> query cache is wired to Redis"
+	@python3 -c "import urllib.request as u; \
+b=u.urlopen('http://localhost:9091/metrics').read().decode(); \
+lines=[l for l in b.splitlines() if l.startswith('forecast_query_cache_events_total')]; \
+miss=next((float(l.split()[-1]) for l in lines if 'kind=\"miss\"' in l), 0.0); \
+print(f'  miss={miss}'); \
+exit('!! forecast_query_cache_events_total{kind=\"miss\"} is zero -- the cache is not on the fetch path') if miss == 0 else print('>> cache is active (misses observed)')"
 	@echo ">> Prometheus has scraped the forecaster"
 	@python3 -c "import urllib.request as u, json; \
 r=json.loads(u.urlopen('http://localhost:9090/api/v1/query?query=forecast_accuracy_mape').read())['data']['result']; \

@@ -1,0 +1,96 @@
+promforecast — production reference architecture
+==================================================
+
+                                ┌─────────────────────────────┐
+                                │  Workload pods              │
+                                │  (apps, kube-state-metrics, │
+                                │   node-exporter, …)         │
+                                └──────────────┬──────────────┘
+                                               │ scrape
+                                               ▼
+                              ┌──────────────────────────────┐
+                              │  Prometheus (prod)           │  ← NEVER queried
+                              │  short-retention, untouched  │    by promforecast
+                              └──────────────┬───────────────┘
+                                             │ remote_write
+                                             ▼
+                              ┌──────────────────────────────┐
+                              │  VictoriaMetrics             │
+                              │  long-term TSDB              │◀──── reads ──┐
+                              │  -futureRetention=2d         │              │
+                              └──────────────┬───────────────┘              │
+                                             │  scrape /metrics             │
+                                             │     +                        │
+                                             │  remote_write back the       │ PromQL
+                                             │  forecast curve              │
+                                             ▼                              │
+        ┌──────────────────────────────────────────────────────────────────┴───────┐
+        │   promforecast Deployment (replicas: 2, RollingUpdate)                   │
+        │                                                                          │
+        │   ┌──────────────────┐         ┌──────────────────┐                       │
+        │   │  pod #1  LEADER  │ ◀────▶ │  pod #2  FOLLOWER │                       │
+        │   │                  │  Lease  │                  │                       │
+        │   │  scheduler       │         │  scheduler idle  │                       │
+        │   │  fits models     │         │                  │                       │
+        │   │  writes snapshot │         │  reads snapshot  │                       │
+        │   │  /metrics        │         │  /metrics        │                       │
+        │   └────────┬─────────┘         └────────┬─────────┘                       │
+        │            │                            │                                 │
+        │            ▼  snapshot                  ▲  snapshot                       │
+        │     ┌────────────────────────────────────────────┐                       │
+        │     │  Redis  (HA snapshot cache, query cache)   │                       │
+        │     └────────────────────────────────────────────┘                       │
+        │                                                                          │
+        │   Kubernetes API: coordination.k8s.io/v1 Lease   (leader election)       │
+        └──────────────────────────────────────────────────────────────────────────┘
+                                             │
+                              scraped by     │     read by
+                                             ▼
+                              ┌──────────────────────────────┐
+                              │  Prometheus / VM             │
+                              └──────────────┬───────────────┘
+                                             │
+                                             ▼
+                              ┌──────────────────────────────┐
+                              │  Grafana                     │
+                              │  forecast / accuracy /       │
+                              │  deviation / quality boards  │
+                              └──────────────────────────────┘
+
+Data flow per refresh tick (default 1h):
+  1. Leader's APScheduler triggers each group.
+  2. PromQL queries fan out to VictoriaMetrics; results stream through the
+     query cache (Redis).
+  3. statsforecast fits run in a worker pool; backtests produce MAPE/MASE.
+  4. Output snapshot rendered to Prometheus exposition format and written
+     into Redis so followers can serve /metrics without re-fitting.
+  5. The full forecast curve is pushed back to VictoriaMetrics via the
+     remote_write sink with future timestamps; Grafana sees a single
+     continuous line spanning past actuals and future predictions.
+
+Failure modes:
+  * Leader dies          → follower wins the lease within
+                           lease_duration_seconds (30s by default), starts
+                           scheduling. /metrics keeps serving the last
+                           snapshot from Redis throughout.
+  * Redis dies           → follower /metrics goes stale until the next
+                           leader run; leader continues fitting. The query
+                           cache degrades into "miss" mode (no fatal).
+  * VictoriaMetrics dies → fits skip with forecast_failures_total++;
+                           /metrics keeps last successful snapshot.
+  * Bad config           → reload validates, fails the swap, keeps the
+                           previous config running. /healthz reports the
+                           reload failure.
+
+Production guard rails wired by this reference:
+  * safety.max_total_series=20000 with drop_lowest_priority overflow.
+  * Per-group priority: business_kpis(1) > node_capacity(5) > kube_resources(10).
+  * Lease renew_deadline=20s < lease_duration=30s (prevents split-brain).
+  * Redis snapshot_ttl=10m, refresh_interval=1h. The TTL is shorter than the
+    refresh interval on purpose: each leader run rewrites the snapshot, so
+    a healthy leader always keeps it fresh. If the leader stops writing
+    (crash, network split) the snapshot expires after snapshot_ttl and
+    followers fall back to their own local /metrics render — which holds
+    no fitted data, so scrapes return an empty (but successful) response
+    rather than stale forecasts dressed up as current.
+  * NetworkPolicy locks egress to TSDB + Redis + kube-apiserver.

@@ -44,7 +44,7 @@ def _write(tmp_path: Path, body: str) -> Path:
 
 
 _BASE_CONFIG = """
-apiVersion: promforecast.io/v1alpha1
+apiVersion: promforecast.io/v1
 datasource:
   url: http://vm:8428/
 server:
@@ -170,7 +170,7 @@ def test_config_endpoint_off_by_default(tmp_path: Path) -> None:
 
 def test_config_endpoint_returns_sanitised_payload(tmp_path: Path) -> None:
     body = """
-apiVersion: promforecast.io/v1alpha1
+apiVersion: promforecast.io/v1
 datasource:
   url: http://vm:8428/
 server:
@@ -206,14 +206,14 @@ groups:
     # The dump must use the *alias* spelling (``apiVersion``) so the JSON
     # keys match the YAML the operator wrote — otherwise diffing /config
     # against the source-controlled config requires a key-rename pass.
-    assert payload["config"]["apiVersion"] == "promforecast.io/v1alpha1"
+    assert payload["config"]["apiVersion"] == "promforecast.io/v1"
     assert "api_version" not in payload["config"]
 
 
 def test_config_endpoint_redacts_remote_write_headers(tmp_path: Path) -> None:
     """Auth-bearing headers must not appear verbatim in the /config payload."""
     body = """
-apiVersion: promforecast.io/v1alpha1
+apiVersion: promforecast.io/v1
 datasource:
   url: http://vm:8428/
 server:

@@ -71,7 +71,7 @@ def _write(tmp_path: Path, body: str) -> Path:
 
 
 _BASE_CONFIG = """
-apiVersion: promforecast.io/v1alpha1
+apiVersion: promforecast.io/v1
 datasource:
   url: http://vm:8428/
 server:

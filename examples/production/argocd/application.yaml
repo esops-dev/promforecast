@@ -1,0 +1,68 @@
+# ArgoCD Application for the promforecast forecaster chart.
+#
+# This manifest pulls the chart from the project's GitHub Pages repo and
+# overrides values from `examples/production/forecaster/values.yaml` (also
+# committed to the same Git repo this Application syncs from). The split
+# lets you bump the chart version in one place and the config in another
+# without re-templating.
+#
+# Prerequisites:
+#   * ArgoCD installed in `argocd` namespace.
+#   * AppProject grants the source repo + the destination cluster.
+#   * Secrets the chart references (Redis password, TSDB auth) already
+#     exist in `observability`.
+
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: promforecast
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: observability
+  # Use the project's published Helm repo. Pin a specific chart version in
+  # production; ``targetRevision: '*'`` only makes sense if you trust
+  # downstream renovate/dependabot to propose bumps for you.
+  sources:
+    - repoURL: https://esops-dev.github.io/promforecast
+      chart: promforecast
+      targetRevision: 0.1.0
+      helm:
+        # Pull values out of the same Git repo this Application is
+        # committed to so chart and values version-step together.
+        valueFiles:
+          - $values/examples/production/forecaster/values.yaml
+    - repoURL: https://github.com/your-org/your-gitops-repo.git
+      targetRevision: HEAD
+      ref: values
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: observability
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+      allowEmpty: false
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true
+      # Honor the chart-managed Deployment update strategy. Without this,
+      # ArgoCD can force a replace and bypass the RollingUpdate hand-off
+      # the chart configures when HA is on.
+      - RespectIgnoreDifferences=true
+    retry:
+      limit: 5
+      backoff:
+        duration: 30s
+        factor: 2
+        maxDuration: 5m
+  # The Deployment's `replicas` is owned by the chart, not ArgoCD — if you
+  # run an HPA later, add the same path here so HPA updates don't show as
+  # drift.
+  ignoreDifferences:
+    - group: apps
+      kind: Deployment
+      jsonPointers:
+        - /spec/replicas
+  revisionHistoryLimit: 10
