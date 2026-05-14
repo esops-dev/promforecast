@@ -17,8 +17,13 @@ RUN apt-get update \
 COPY pyproject.toml ./
 COPY src ./src
 
+# Bake the HA + OTel extras into the image so flipping
+# ``highAvailability.enabled: true`` or ``telemetry.enabled: true``
+# doesn't require a custom build. The combined size is small (~8 MiB for
+# HA, ~10 MiB for the OTel exporter chain) — well below the base image
+# noise floor.
 RUN pip install --upgrade pip build \
- && pip wheel --wheel-dir /wheels .
+ && pip wheel --wheel-dir /wheels ".[ha,otel]"
 
 # ---------- Runtime ----------
 FROM python:3.13-slim AS runtime

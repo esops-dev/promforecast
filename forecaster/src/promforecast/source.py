@@ -12,7 +12,7 @@ import math
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import httpx
 import structlog
@@ -23,6 +23,9 @@ from tenacity import (
     stop_after_attempt,
     wait_exponential,
 )
+
+if TYPE_CHECKING:
+    from .cache import QueryCache
 
 logger = structlog.get_logger(__name__)
 
@@ -66,6 +69,7 @@ class PromSource:
         max_concurrency: int = 8,
         max_keepalive_connections: int | None = None,
         on_retry: Callable[[str], None] | None = None,
+        cache: QueryCache | None = None,
     ) -> None:
         self._url = url.rstrip("/")
         self._timeout_seconds = timeout_seconds
@@ -83,6 +87,7 @@ class PromSource:
         self._client = httpx.AsyncClient(timeout=timeout_seconds, limits=self.limits)
         self._semaphore = asyncio.Semaphore(max_concurrency)
         self._on_retry = on_retry
+        self._cache = cache
 
     async def aclose(self) -> None:
         await self._client.aclose()
@@ -94,7 +99,21 @@ class PromSource:
         end: datetime,
         step_seconds: int,
     ) -> list[SeriesFrame]:
-        """Run a PromQL range query and return one frame per series."""
+        """Run a PromQL range query and return one frame per series.
+
+        When a cache is attached, the lookup key is computed from the
+        normalised PromQL, the lookback window (``end - start`` in seconds),
+        and the step. Two queries that differ only in absolute timestamps
+        (different refresh ticks) share the same key — the entry's TTL
+        controls staleness.
+        """
+        cache_key: str | None = None
+        if self._cache is not None:
+            lookback_seconds = max(1, int((end - start).total_seconds()))
+            cache_key = self._cache.cache_key(promql, lookback_seconds, step_seconds)
+            cached = await self._cache.get(cache_key)
+            if cached is not None:
+                return cached
         params = {
             "query": promql,
             "start": f"{start.timestamp():.3f}",
@@ -104,7 +123,10 @@ class PromSource:
         endpoint = f"{self._url}/api/v1/query_range"
         async with self._semaphore:
             payload = await self._request(endpoint, params)
-        return _parse_matrix(payload)
+        frames = _parse_matrix(payload)
+        if self._cache is not None and cache_key is not None:
+            await self._cache.set(cache_key, frames)
+        return frames
 
     async def _request(self, endpoint: str, params: dict[str, str]) -> dict[str, Any]:
         async for attempt in AsyncRetrying(

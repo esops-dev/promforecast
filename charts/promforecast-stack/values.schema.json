@@ -1,7 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft-07/schema#",
-  "title": "promforecast-stack Helm values",
-  "description": "Umbrella chart bundling VictoriaMetrics + promforecast. Subchart values are pass-throughs and validated by their own charts.",
+  "$id": "https://promforecast.io/schemas/stack-values.v1.schema.json",
+  "title": "promforecast-stack Helm values (v1)",
+  "description": "Umbrella chart bundling VictoriaMetrics + promforecast. Subchart values are pass-throughs and validated by their own charts. Versioned in lockstep with the forecaster's pydantic models.",
   "type": "object",
   "additionalProperties": true,
   "properties": {

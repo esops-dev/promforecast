@@ -6,5 +6,26 @@ metadata:
   labels: {{- include "promforecast.labels" . | nindent 4 }}
 data:
   config.yaml: |
-    {{- toYaml .Values.config | nindent 4 }}
+    {{- /*
+        We merge the chart-level highAvailability flag into the forecaster's
+        runtime config so operators only need to flip ONE switch
+        (highAvailability.enabled) and the forecaster's pydantic schema
+        sees the same intent. The inner `config.highAvailability` block in
+        values.yaml lets advanced users override individual fields
+        (lease name, lease durations) without rewriting the chart-level
+        wiring; here we only set `enabled` and propagate the Redis
+        address when the operator has not already set them.
+    */}}
+    {{- $cfg := .Values.config | deepCopy }}
+    {{- $ha := default dict (get $cfg "highAvailability") }}
+    {{- if .Values.highAvailability.enabled }}
+    {{- $_ := set $ha "enabled" true }}
+    {{- $redis := default dict (get $ha "redis") }}
+    {{- if and (.Values.highAvailability.redis.address) (not (get $redis "address")) }}
+    {{- $_ := set $redis "address" .Values.highAvailability.redis.address }}
+    {{- end }}
+    {{- $_ := set $ha "redis" $redis }}
+    {{- end }}
+    {{- $_ := set $cfg "highAvailability" $ha }}
+    {{- toYaml $cfg | nindent 4 }}
 {{- end }}

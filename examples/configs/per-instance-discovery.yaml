@@ -1,0 +1,35 @@
+# Dynamic series discovery — fan-out over `instance` automatically.
+#
+# Forecasts a per-instance CPU busy% metric without hand-writing one entry
+# per node. The discovery probe (`up{job="node-exporter"}`) is cheap; the
+# primary query is templated with the discovered values on every refresh.
+# Useful for environments where node membership changes faster than the
+# YAML config does (auto-scaled instance groups, spot-pool churn).
+
+apiVersion: promforecast.io/v1
+
+datasource:
+  url: http://victoriametrics:8428/
+  timeout: 30s
+
+server:
+  refresh_interval: 1h
+
+defaults:
+  lookback: 14d
+  step: 5m
+  horizon: 24h
+  models: [AutoARIMA, SeasonalNaive]
+  season_length: 288
+
+groups:
+  - name: per_instance_cpu
+    priority: 5
+    queries:
+      - id: node_cpu_busy_pct
+        promql: |
+          100 - avg(rate(node_cpu_seconds_total{instance="$instance",mode="idle"}[2m])) * 100
+        discover:
+          - name: instance
+            label: instance
+            promql: 'up{job="node-exporter"}'

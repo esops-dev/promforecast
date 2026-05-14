@@ -27,7 +27,7 @@ def test_load_minimal(tmp_path: Path) -> None:
     path = _write(
         tmp_path,
         """
-apiVersion: promforecast.io/v1alpha1
+apiVersion: promforecast.io/v1
 datasource:
   url: http://vm:8428/
 groups:
@@ -48,7 +48,7 @@ def test_load_parses_prometheus_durations(tmp_path: Path) -> None:
     path = _write(
         tmp_path,
         """
-apiVersion: promforecast.io/v1alpha1
+apiVersion: promforecast.io/v1
 datasource:
   url: http://vm:8428/
   timeout: 45s
@@ -77,7 +77,7 @@ def test_load_rejects_colon_in_id(tmp_path: Path) -> None:
     path = _write(
         tmp_path,
         """
-apiVersion: promforecast.io/v1alpha1
+apiVersion: promforecast.io/v1
 datasource:
   url: http://vm:8428/
 groups:
@@ -95,7 +95,7 @@ def test_load_rejects_unknown_field(tmp_path: Path) -> None:
     path = _write(
         tmp_path,
         """
-apiVersion: promforecast.io/v1alpha1
+apiVersion: promforecast.io/v1
 datasource:
   url: http://vm:8428/
 groups:
@@ -114,7 +114,7 @@ def test_load_accepts_nested_accuracy_and_emission_blocks(tmp_path: Path) -> Non
     path = _write(
         tmp_path,
         """
-apiVersion: promforecast.io/v1alpha1
+apiVersion: promforecast.io/v1
 datasource:
   url: http://vm:8428/
 defaults:
@@ -148,7 +148,7 @@ def test_load_accepts_models_as_strings_or_dicts(tmp_path: Path) -> None:
     path = _write(
         tmp_path,
         """
-apiVersion: promforecast.io/v1alpha1
+apiVersion: promforecast.io/v1
 datasource:
   url: http://vm:8428/
 defaults:
@@ -177,7 +177,7 @@ def test_load_rejects_unknown_field_inside_model_spec(tmp_path: Path) -> None:
     path = _write(
         tmp_path,
         """
-apiVersion: promforecast.io/v1alpha1
+apiVersion: promforecast.io/v1
 datasource:
   url: http://vm:8428/
 defaults:
@@ -199,7 +199,7 @@ def test_load_rejects_calendar_regressor_with_unknown_id(tmp_path: Path) -> None
     path = _write(
         tmp_path,
         """
-apiVersion: promforecast.io/v1alpha1
+apiVersion: promforecast.io/v1
 datasource:
   url: http://vm:8428/
 groups:
@@ -220,7 +220,7 @@ def test_load_rejects_calendar_regressor_with_promql(tmp_path: Path) -> None:
     path = _write(
         tmp_path,
         """
-apiVersion: promforecast.io/v1alpha1
+apiVersion: promforecast.io/v1
 datasource:
   url: http://vm:8428/
 groups:
@@ -242,7 +242,7 @@ def test_load_rejects_custom_regressor_without_promql(tmp_path: Path) -> None:
     path = _write(
         tmp_path,
         """
-apiVersion: promforecast.io/v1alpha1
+apiVersion: promforecast.io/v1
 datasource:
   url: http://vm:8428/
 groups:
@@ -263,7 +263,7 @@ def test_load_rejects_remote_write_enabled_without_url(tmp_path: Path) -> None:
     path = _write(
         tmp_path,
         """
-apiVersion: promforecast.io/v1alpha1
+apiVersion: promforecast.io/v1
 datasource:
   url: http://vm:8428/
 sink:
@@ -284,7 +284,7 @@ def test_load_accepts_remote_write_with_headers(tmp_path: Path) -> None:
     path = _write(
         tmp_path,
         """
-apiVersion: promforecast.io/v1alpha1
+apiVersion: promforecast.io/v1
 datasource:
   url: http://vm:8428/
 sink:
@@ -313,7 +313,7 @@ def test_load_rejects_remote_write_chunk_size_below_one(tmp_path: Path) -> None:
     path = _write(
         tmp_path,
         """
-apiVersion: promforecast.io/v1alpha1
+apiVersion: promforecast.io/v1
 datasource:
   url: http://vm:8428/
 sink:
@@ -343,7 +343,7 @@ def test_load_rejects_datasource_keepalive_above_concurrent(tmp_path: Path) -> N
     path = _write(
         tmp_path,
         """
-apiVersion: promforecast.io/v1alpha1
+apiVersion: promforecast.io/v1
 datasource:
   url: http://vm:8428/
   max_concurrent_requests: 4
@@ -364,7 +364,7 @@ def test_load_rejects_remote_write_keepalive_above_connections(tmp_path: Path) -
     path = _write(
         tmp_path,
         """
-apiVersion: promforecast.io/v1alpha1
+apiVersion: promforecast.io/v1
 datasource:
   url: http://vm:8428/
 sink:
@@ -390,7 +390,7 @@ def test_load_accepts_declared_api_version(tmp_path: Path) -> None:
     path = _write(
         tmp_path,
         """
-apiVersion: promforecast.io/v1alpha1
+apiVersion: promforecast.io/v1
 datasource:
   url: http://vm:8428/
 groups:
@@ -450,6 +450,33 @@ groups:
         config_module.load(path)
 
 
+def test_load_accepts_deprecated_v1alpha1_with_warning(tmp_path: Path) -> None:
+    """``v1alpha1`` is kept as a backward-compatible alias of v1 so configs
+    committed during the alpha window keep loading on a stable-schema
+    forecaster — but the loader emits a DeprecationWarning so operators
+    retag at their next opportunity. The schemas are byte-identical:
+    nothing else needs to change."""
+    path = _write(
+        tmp_path,
+        """
+apiVersion: promforecast.io/v1alpha1
+datasource:
+  url: http://vm:8428/
+groups:
+  - name: g
+    queries:
+      - id: m
+        promql: up
+""",
+    )
+    with pytest.warns(DeprecationWarning, match="v1alpha1.*deprecated"):
+        cfg = config_module.load(path)
+    # Loader preserves the declared version verbatim so /config still
+    # reflects what the operator wrote — they're the ones who decide when
+    # to retag.
+    assert cfg.api_version == "promforecast.io/v1alpha1"
+
+
 def test_load_rejects_top_level_non_mapping(tmp_path: Path) -> None:
     """Non-mapping YAML (a list at top level, an empty file, a scalar)
     should fail with a clear error rather than crashing inside pydantic."""
@@ -465,7 +492,7 @@ def test_load_rejects_legacy_flat_accuracy_fields(tmp_path: Path) -> None:
     path = _write(
         tmp_path,
         """
-apiVersion: promforecast.io/v1alpha1
+apiVersion: promforecast.io/v1
 datasource:
   url: http://vm:8428/
 defaults:

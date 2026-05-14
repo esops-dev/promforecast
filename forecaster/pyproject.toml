@@ -34,6 +34,10 @@ ha = [
     "kubernetes>=31.0",
     "redis>=5.1",
 ]
+otel = [
+    "opentelemetry-sdk>=1.27",
+    "opentelemetry-exporter-otlp-proto-grpc>=1.27",
+]
 dev = [
     "pytest>=8.3",
     "pytest-asyncio>=0.24",
@@ -100,6 +104,29 @@ no_implicit_reexport = true
 
 [[tool.mypy.overrides]]
 module = ["statsforecast.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+# The official ``kubernetes`` Python client doesn't ship type stubs; the
+# usual community ``types-kubernetes`` is incomplete and lags releases.
+# Only the leader-election module reaches into the package, and it does
+# so through a small typed wrapper, so ignoring the missing stubs is
+# safer than chasing partial third-party stubs.
+module = ["kubernetes", "kubernetes.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+# Same story for ``redis`` — only the async API is touched, and only
+# inside thin wrappers that re-export a typed surface.
+module = ["redis", "redis.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+# OpenTelemetry SDK is an optional extra (``promforecast[otel]``). When
+# tracing is disabled we never import the package, so stubs don't help.
+# When tracing is enabled the imports live behind a thin facade in
+# ``promforecast.telemetry`` that re-exposes the bits we use.
+module = ["opentelemetry", "opentelemetry.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

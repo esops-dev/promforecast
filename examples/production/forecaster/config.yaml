@@ -1,0 +1,205 @@
+# Production reference config.
+#
+# Combines the three "shipped with the project" group templates into a
+# single multi-group config that's been tuned for a real fleet (~150 nodes,
+# ~1k services, ~3k namespaces). The cardinality estimate is roughly
+# 18k output series after fan-out; that lands well under the global
+# ``safety.max_total_series`` cap below.
+#
+# How this config is structured:
+#
+# * ``defaults`` carries the cluster-wide knobs. Per-group overrides only
+#   appear where a group actually differs (the business KPIs group runs an
+#   ensemble; node-capacity uses ``auto_select: true`` with a hard fallback).
+# * Three groups share the same lookback window (14d) so the long-term TSDB
+#   serves all of them from a single hot range cache.
+# * ``priority`` is used by ``safety.series_overflow=drop_lowest_priority``
+#   so when the global cap is hit we drop the discovery group first and keep
+#   the business KPIs flowing.
+#
+# Plug your TSDB URL, scrape relabels, and label matchers (job names,
+# namespaces) into the relevant queries before applying.
+
+apiVersion: promforecast.io/v1
+
+datasource:
+  # Point at the long-term TSDB, NOT production Prometheus. The forecaster
+  # never reads from live Prometheus by design.
+  url: http://victoria-metrics-single-server.observability.svc:8428/
+  timeout: 30s
+  auth:
+    type: none
+  # Cap concurrent fetches so a multi-group refresh tick can't accidentally
+  # open hundreds of TCP connections to the TSDB. 16 is a comfortable
+  # ceiling for a 2-replica HA forecaster against a single-node VM; tune up
+  # if profiling shows query queueing.
+  max_concurrent_requests: 16
+  max_keepalive_connections: 16
+
+server:
+  listen: ":9091"
+  refresh_interval: 1h
+  reload:
+    enabled: true
+    watch_configmap: true
+  # Useful in production for confirming "what is this pod actually running?"
+  # without a kubectl exec. Auth is the same as /metrics — keep the port
+  # off-cluster.
+  expose_config_endpoint: true
+
+safety:
+  # Global guard rails. ``max_series_per_query`` is per individual PromQL;
+  # ``max_total_series`` is the hard cap across every group. The drop
+  # policy uses ``priority`` to pick a victim — see the per-group ``priority``
+  # below.
+  max_series_per_query: 1500
+  max_total_series: 20000
+  series_overflow: drop_lowest_priority
+  fit_timeout: 90s
+  query_timeout: 30s
+
+defaults:
+  lookback: 14d
+  step: 5m
+  horizon: 24h
+  # Three-model bake-off. ``auto_select: true`` picks the lowest-MAPE
+  # winner per series; flip to ``ensemble`` cluster-wide if no single model
+  # dominates your workload (roughly doubles fit CPU — measure first).
+  models: [AutoARIMA, AutoETS, SeasonalNaive]
+  season_length: 288               # 5min step → daily seasonality
+  confidence_levels: [80, 95]
+  min_points: 200
+  accuracy:
+    evaluate: true
+    horizons: [1h, 6h, 24h]
+    auto_select: true
+    fallback_model: SeasonalNaive
+    fallback_mape_threshold: 50
+  emission:
+    deviation: true
+    quality: true
+    contribution: true
+
+# Push the full forecast curve back into VictoriaMetrics with future
+# timestamps. Required for historical forecast graphs and recording rules
+# on past predictions. Make sure VM is started with ``-futureRetention=2d``
+# or higher (the umbrella chart sets this by default).
+sink:
+  remote_write:
+    enabled: true
+    url: http://victoria-metrics-single-server.observability.svc:8428/api/v1/import/prometheus
+    timeout: 30s
+    chunk_size: 10000
+    max_connections: 8
+    max_keepalive_connections: 4
+    headers: {}
+
+# Multi-replica HA via Kubernetes Lease + Redis snapshot cache.
+# The chart sets ``namespace`` and ``identity`` via the downward API so the
+# fields below stay empty.
+highAvailability:
+  enabled: true
+  lease_name: promforecast-leader
+  lease_duration_seconds: 30
+  renew_deadline_seconds: 20
+  retry_period_seconds: 4
+  redis:
+    address: redis-master.observability.svc:6379
+    snapshot_ttl: 10m
+
+# Share TSDB fetches across overlapping queries. Two of the three groups
+# below pull from kube-state-metrics; the cache collapses the duplicate
+# range queries into a single fetch per refresh tick.
+query_cache:
+  enabled: true
+  backend: auto                    # → redis when HA is on
+  ttl: 5m
+  max_entries: 4096
+
+# Optional OpenTelemetry tracing. Off by default — flip ``enabled: true``
+# and point at an in-cluster OTel Collector to ship spans of every
+# query → fit → export step.
+telemetry:
+  enabled: false
+  service_name: promforecast
+  sample_ratio: 1.0
+  otlp:
+    endpoint: ""                   # e.g. otel-collector.observability.svc:4317
+    insecure: true
+
+groups:
+  # ---------------------------------------------------------------
+  # Business KPIs — highest priority. Drop these last under overflow
+  # because they typically gate on-call alerts.
+  # ---------------------------------------------------------------
+  - name: business_kpis
+    priority: 1
+    queries:
+      - id: http_requests_per_second
+        promql: |
+          sum by (service) (rate(http_requests_total[5m]))
+        regressors:
+          - id: hour_of_day
+            type: calendar
+          - id: is_weekend
+            type: calendar
+
+      - id: http_5xx_per_second
+        promql: |
+          sum by (service) (rate(http_requests_total{status=~"5.."}[5m]))
+
+      - id: http_request_p95_seconds
+        promql: |
+          histogram_quantile(0.95,
+            sum by (service, le) (rate(http_request_duration_seconds_bucket[5m]))
+          )
+
+      # Hourly business KPI. Step + season_length overrides keep the
+      # seasonality aligned to the natural cadence without forking defaults.
+      - id: daily_active_users_hourly
+        promql: |
+          sum(daily_active_users)
+        step: 1h
+        season_length: 24
+        regressors:
+          - id: hour_of_day
+            type: calendar
+          - id: day_of_week
+            type: calendar
+
+  # ---------------------------------------------------------------
+  # Node capacity — high priority. Drives capacity-planning alerts.
+  # ---------------------------------------------------------------
+  - name: node_capacity
+    priority: 5
+    queries:
+      - id: node_cpu_busy_pct
+        promql: |
+          100 - (avg by (instance) (rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100)
+
+      - id: node_filesystem_avail_bytes
+        promql: |
+          node_filesystem_avail_bytes{fstype!~"tmpfs|overlay|squashfs"}
+
+      - id: node_memory_used_bytes
+        promql: |
+          node_memory_MemTotal_bytes - node_memory_MemAvailable_bytes
+
+  # ---------------------------------------------------------------
+  # Kubernetes resource usage — lower priority. Tolerates drops under
+  # extreme cardinality bursts.
+  # ---------------------------------------------------------------
+  - name: kube_resources
+    priority: 10
+    queries:
+      - id: pod_cpu_usage_cores
+        promql: |
+          sum by (namespace) (rate(container_cpu_usage_seconds_total{container!="",pod!=""}[5m]))
+
+      - id: pod_memory_working_set_bytes
+        promql: |
+          sum by (namespace) (container_memory_working_set_bytes{container!="",pod!=""})
+
+      - id: persistentvolumeclaim_used_bytes
+        promql: |
+          sum by (namespace, persistentvolumeclaim) (kubelet_volume_stats_used_bytes)

@@ -231,7 +231,36 @@ jobs:
           "$DRIFT_PYTHON" -m pip install --quiet pyyaml pydantic structlog
           "$DRIFT_PYTHON" - <<'PY'
           import pathlib, subprocess, sys, yaml
-          # Render the chart with the example node-capacity groups so we
+          sys.path.insert(0, "forecaster/src")
+          import promforecast.config as cfg_module
+
+          # Each bundled example must parse against the pydantic schema on
+          # its own. Catches typos and forbidden-extras at PR time instead
+          # of when an operator copies an example into their cluster.
+          example_paths = sorted(pathlib.Path("examples").rglob("*.yaml"))
+          example_paths += [pathlib.Path("docker/dev-config.yaml")]
+          failed = []
+          for path in example_paths:
+              # Skip non-forecaster YAML (alert manifests, Kubernetes
+              # objects). The cheapest reliable filter is the presence of a
+              # top-level ``datasource`` mapping, which only forecaster
+              # configs carry.
+              doc = yaml.safe_load(path.read_text()) or {}
+              if not isinstance(doc, dict) or "datasource" not in doc:
+                  continue
+              try:
+                  cfg_module.load(path)
+                  print(f"OK: {path}")
+              except Exception as exc:
+                  failed.append((path, exc))
+          if failed:
+              print("\nExample configs failed schema validation:")
+              for path, exc in failed:
+                  print(f"  {path}: {exc}")
+              sys.exit(1)
+
+          # The chart's default values.yaml must also chart-render into a
+          # config that validates. Run with the node-capacity groups so we
           # exercise more than the default ``groups: []``.
           example = yaml.safe_load(pathlib.Path("examples/configs/node-capacity.yaml").read_text())
           values_override = pathlib.Path("/tmp/chart-values.yaml")
@@ -247,13 +276,51 @@ jobs:
           )
           tmp = pathlib.Path("/tmp/chart-config.yaml")
           tmp.write_text(cm["data"]["config.yaml"])
-          sys.path.insert(0, "forecaster/src")
-          import promforecast.config as cfg_module
           try:
               cfg_module.load(tmp)
               print("OK: chart-rendered config validates against the forecaster's pydantic schema")
           except Exception as exc:
               print(f"chart values.yaml does not validate against the forecaster schema:\n  {exc}")
+              sys.exit(1)
+
+          # The production reference Helm values must also chart-render
+          # into a valid forecaster config. Without this guard, a copy-edit
+          # to the reference (which new adopters lean on as a starting
+          # point) could ship a broken config that only fails at first
+          # boot inside a cluster.
+          rendered = subprocess.check_output(
+              ["helm", "template", "charts/promforecast",
+               "-f", "examples/production/forecaster/values.yaml"],
+              text=True,
+          )
+          docs = list(yaml.safe_load_all(rendered))
+          cm = next(
+              d for d in docs
+              if d and d.get("kind") == "ConfigMap" and "config.yaml" in d.get("data", {})
+          )
+          tmp = pathlib.Path("/tmp/prod-chart-config.yaml")
+          tmp.write_text(cm["data"]["config.yaml"])
+          try:
+              cfg_module.load(tmp)
+              print("OK: production values.yaml chart-renders to a valid forecaster config")
+          except Exception as exc:
+              print(f"production values.yaml does not validate after chart rendering:\n  {exc}")
+              sys.exit(1)
+
+          # The Flux ConfigMap embeds the chart values as a YAML string.
+          # Pull the forecaster config back out and validate it so the
+          # three production sources can't silently drift apart.
+          flux_cm = yaml.safe_load(
+              pathlib.Path("examples/production/flux/values-configmap.yaml").read_text()
+          )
+          flux_values = yaml.safe_load(flux_cm["data"]["values.yaml"])
+          tmp = pathlib.Path("/tmp/flux-forecaster-config.yaml")
+          tmp.write_text(yaml.safe_dump(flux_values["config"]))
+          try:
+              cfg_module.load(tmp)
+              print("OK: Flux values ConfigMap carries a valid forecaster config")
+          except Exception as exc:
+              print(f"Flux values-configmap.yaml carries an invalid forecaster config:\n  {exc}")
               sys.exit(1)
           PY
 

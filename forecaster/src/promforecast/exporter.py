@@ -134,7 +134,7 @@ class GroupSnapshot:
     run_duration_seconds: float = 0.0
     series_count: int = 0
     # series_dropped reasons (bounded set):
-    #   per_query_cap, total_cap, min_points
+    #   per_query_cap, total_cap, min_points, discovery_cap, canary
     series_dropped: dict[str, int] = field(default_factory=dict)
     # failures reasons (bounded set):
     #   query_error, fit_error, invalid_metric_name, group_error,
@@ -186,6 +186,26 @@ class Exporter:
         # across groups so this isn't labelled by group; per-group query
         # latency is already observable via ``forecast_run_duration_seconds``.
         self._source_retries: dict[str, int] = {}
+        # Leader election state. ``_leader_identity`` is the local replica
+        # name (the value the ``instance`` label takes); ``_is_leader`` is
+        # the gauge value (1 = elected, 0 = follower / disabled).
+        self._leader_identity: str = ""
+        self._is_leader: bool = False
+        self._leader_transitions: int = 0
+        # Query cache counters (hits / misses / errors). Always emitted so
+        # dashboards can chart a zero series before the first query runs.
+        self._query_cache_events: dict[str, int] = {}
+        # Per-(group, query, variable, reason) discovery failure counter.
+        self._discovery_failures: dict[tuple[str, str, str, str], int] = {}
+        # Per-(group, query) expansion count (gauge): how many concrete
+        # PromQL fetches the most recent run derived from this template.
+        self._discovery_expansions: dict[tuple[str, str], int] = {}
+        # Per-(group, query, source) season_length auto-detection counter.
+        # ``source`` is bounded to {detected, snapped, fallback, too_short}
+        # so cardinality is small and predictable. Useful for alerting on
+        # "the detector is always falling back on this query" without
+        # scraping per-series logs.
+        self._season_length_detections: dict[tuple[str, str, str], int] = {}
         self._registry = CollectorRegistry()
         self._registry.register(_SnapshotCollector(self))
 
@@ -270,6 +290,76 @@ class Exporter:
         with self._lock:
             self._source_retries[reason] = self._source_retries.get(reason, 0) + 1
 
+    def set_leader_state(self, *, identity: str, is_leader: bool) -> None:
+        """Record this replica's election state.
+
+        Surfaces as ``forecast_leader_elected{instance="<identity>"}``
+        (1 = leader, 0 = follower). The identity is set even when no
+        election is configured (single-replica deployments) so a
+        join-on-instance dashboard works uniformly.
+        """
+        with self._lock:
+            if identity != self._leader_identity:
+                self._leader_identity = identity
+            if is_leader != self._is_leader:
+                self._leader_transitions += 1
+                self._is_leader = is_leader
+
+    def increment_query_cache_event(self, kind: str) -> None:
+        """Bump a query-cache counter for ``kind`` (hit | miss | error)."""
+        with self._lock:
+            self._query_cache_events[kind] = self._query_cache_events.get(kind, 0) + 1
+
+    def record_discovery(
+        self,
+        *,
+        group: str,
+        query: str,
+        expansions: int,
+        failures: dict[tuple[str, str], int] | None = None,
+    ) -> None:
+        """Record the result of a discovery / template expansion pass.
+
+        ``expansions`` is a gauge (the count from the most recent run).
+        ``failures`` increments the per-(variable, reason) counter so a
+        flaky discovery query is visible without log scraping.
+        """
+        with self._lock:
+            self._discovery_expansions[(group, query)] = expansions
+            if failures:
+                for (variable, reason), count in failures.items():
+                    key = (group, query, variable, reason)
+                    self._discovery_failures[key] = self._discovery_failures.get(key, 0) + count
+
+    def retain_discovery_groups(self, names: set[str]) -> None:
+        """Drop discovery records for groups not in ``names``.
+
+        Called after a config reload removes groups; without this their
+        expansion gauges would linger on /metrics forever.
+        """
+        with self._lock:
+            self._discovery_expansions = {
+                k: v for k, v in self._discovery_expansions.items() if k[0] in names
+            }
+            self._discovery_failures = {
+                k: v for k, v in self._discovery_failures.items() if k[0] in names
+            }
+            self._season_length_detections = {
+                k: v for k, v in self._season_length_detections.items() if k[0] in names
+            }
+
+    def increment_season_length_detection(self, group: str, query: str, source: str) -> None:
+        """Bump the auto-seasonality detection counter for one outcome.
+
+        ``source`` is one of ``detected``, ``snapped``, ``fallback``,
+        ``too_short`` — the bounded set produced by
+        :func:`promforecast.seasonality.detect_season_length`. Any other
+        token would inflate cardinality; callers must use the bounded set.
+        """
+        with self._lock:
+            key = (group, query, source)
+            self._season_length_detections[key] = self._season_length_detections.get(key, 0) + 1
+
     def render(self) -> bytes:
         """Render the current snapshot in Prometheus exposition format."""
         return generate_latest(self._registry)
@@ -308,6 +398,24 @@ class Exporter:
         with self._lock:
             return dict(self._source_retries)
 
+    def _leader_state(self) -> tuple[str, bool, int]:
+        with self._lock:
+            return self._leader_identity, self._is_leader, self._leader_transitions
+
+    def _query_cache_state(self) -> dict[str, int]:
+        with self._lock:
+            return dict(self._query_cache_events)
+
+    def _discovery_state(
+        self,
+    ) -> tuple[dict[tuple[str, str], int], dict[tuple[str, str, str, str], int]]:
+        with self._lock:
+            return dict(self._discovery_expansions), dict(self._discovery_failures)
+
+    def _season_length_state(self) -> dict[tuple[str, str, str], int]:
+        with self._lock:
+            return dict(self._season_length_detections)
+
 
 class _SnapshotCollector:
     """prometheus_client Collector that streams metrics from an Exporter snapshot."""
@@ -322,6 +430,10 @@ class _SnapshotCollector:
         remote_write_retries = self._exporter._remote_write_retries_state()
         source_retries = self._exporter._source_retries_state()
         config_hash = self._exporter._config_hash_state()
+        leader_state = self._exporter._leader_state()
+        cache_state = self._exporter._query_cache_state()
+        discovery_state = self._exporter._discovery_state()
+        season_length_state = self._exporter._season_length_state()
         yield from _forecast_families(groups)
         yield from _accuracy_families(groups)
         yield from _deviation_families(groups)
@@ -334,6 +446,10 @@ class _SnapshotCollector:
         yield from _remote_write_families(remote_write_state)
         yield from _remote_write_retries_families(remote_write_retries)
         yield from _source_retries_families(source_retries)
+        yield from _leader_families(leader_state)
+        yield from _query_cache_families(cache_state)
+        yield from _discovery_families(discovery_state)
+        yield from _season_length_families(season_length_state)
 
 
 def _emit_gauge_family(
@@ -544,7 +660,8 @@ def _operational_families(
     # CounterMetricFamily appends _total to the name, so we pass the bare stem.
     dropped = CounterMetricFamily(
         "forecast_series_dropped",
-        "Series dropped before forecasting, by reason (per_query_cap | total_cap | min_points).",
+        "Series dropped before forecasting, by reason "
+        "(per_query_cap | total_cap | min_points | discovery_cap | canary).",
         labels=["group", "reason"],
     )
     failures = CounterMetricFamily(
@@ -715,4 +832,115 @@ def _source_retries_families(
     )
     for reason, count in state.items():
         counter.add_metric([reason], float(count))
+    yield counter
+
+
+def _leader_families(
+    state: tuple[str, bool, int],
+) -> Iterator[GaugeMetricFamily | CounterMetricFamily]:
+    """Render leader-election state.
+
+    ``forecast_leader_elected{instance="..."}`` is 1 for the elected
+    leader, 0 otherwise. ``forecast_leader_transitions_total`` counts how
+    many times this replica's local state flipped — alerts on rapid
+    transitions catch lease thrash.
+
+    Both are emitted only after :meth:`Exporter.set_leader_state` has been
+    called at least once. Without the gate, single-replica deployments
+    (where leader election is disabled) would emit a meaningless
+    ``instance=""`` series.
+    """
+    identity, is_leader, transitions = state
+    if not identity:
+        return
+    gauge = GaugeMetricFamily(
+        "forecast_leader_elected",
+        "1 if this replica is the elected leader, 0 if it is a follower or election is disabled.",
+        labels=["instance"],
+    )
+    gauge.add_metric([identity], 1.0 if is_leader else 0.0)
+    yield gauge
+    counter = CounterMetricFamily(
+        "forecast_leader_transitions",
+        "Number of times this replica's leadership state changed since boot.",
+        labels=["instance"],
+    )
+    counter.add_metric([identity], float(transitions))
+    yield counter
+
+
+def _query_cache_families(
+    state: dict[str, int],
+) -> Iterator[CounterMetricFamily]:
+    """Render the ``forecast_query_cache_events_total`` counter.
+
+    Tracks hits, misses, and errors. Always emitted (with zero values when
+    nothing has happened) so dashboards can chart a flat-zero baseline
+    before the cache sees its first query.
+    """
+    counter = CounterMetricFamily(
+        "forecast_query_cache_events",
+        "PromQL query-cache events, by kind (hit | miss | error).",
+        labels=["kind"],
+    )
+    for kind in ("hit", "miss", "error"):
+        counter.add_metric([kind], float(state.get(kind, 0)))
+    yield counter
+
+
+def _discovery_families(
+    state: tuple[dict[tuple[str, str], int], dict[tuple[str, str, str, str], int]],
+) -> Iterator[GaugeMetricFamily | CounterMetricFamily]:
+    """Render dynamic-discovery expansion telemetry.
+
+    ``forecast_discovery_expansions{group, query}`` is a gauge with the
+    most recent expansion count; ``forecast_discovery_failures_total``
+    counts per-variable resolution failures. Emitted only when at least
+    one templated query has been seen this run.
+    """
+    expansions, failures = state
+    if expansions:
+        gauge = GaugeMetricFamily(
+            "forecast_discovery_expansions",
+            "Number of concrete queries the discovery template fanned out to "
+            "in the most recent run.",
+            labels=["group", "query"],
+        )
+        for (group, query), count in expansions.items():
+            gauge.add_metric([group, query], float(count))
+        yield gauge
+    if failures:
+        counter = CounterMetricFamily(
+            "forecast_discovery_failures",
+            "Discovery variable resolution failures, by reason "
+            "(query_error | query_timeout | empty_result | unknown_label | no_source).",
+            labels=["group", "query", "variable", "reason"],
+        )
+        for (group, query, variable, reason), count in failures.items():
+            counter.add_metric([group, query, variable, reason], float(count))
+        yield counter
+
+
+def _season_length_families(
+    state: dict[tuple[str, str, str], int],
+) -> Iterator[CounterMetricFamily]:
+    """Render ``forecast_season_length_detections_total{group, query, source}``.
+
+    Bumped once per series-detection. The ``source`` label is bounded to
+    ``{detected, snapped, fallback, too_short}`` so cardinality is small
+    even with hundreds of queries — far smaller than per-series logging
+    at INFO. Emitted only when at least one detection has happened this
+    process lifetime so /metrics stays quiet for deployments that don't
+    use ``season_length: auto``.
+    """
+    if not state:
+        return
+    counter = CounterMetricFamily(
+        "forecast_season_length_detections",
+        "Outcomes of the auto-seasonality detector, by source "
+        "(detected | snapped | fallback | too_short).",
+        labels=["group", "query", "source"],
+    )
+    for (group, query, source), count in state.items():
+        counter.add_metric([group, query, source], float(count))
     yield counter

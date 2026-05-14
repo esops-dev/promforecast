@@ -5,9 +5,10 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import os
 import signal
 import sys
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -17,8 +18,12 @@ from fastapi import FastAPI, Response
 from fastapi.responses import JSONResponse, PlainTextResponse
 
 from . import config as config_module
+from . import ha_cache as ha_cache_module
+from . import telemetry as telemetry_module
 from . import validate as validate_module
+from .cache import MemoryQueryCache, QueryCache, QueryCacheBackend, RedisQueryCache
 from .exporter import Exporter
+from .leader import KubernetesLeaseClient, LeaderElector, LeaderElectorConfig, default_identity
 from .reload import ConfigMapWatcher, ConfigReloader, ReloadError
 from .runner import Runner
 from .sink import ForecastSink, RemoteWriteSink
@@ -122,21 +127,46 @@ def run(config_path: Path, log_level: str) -> None:
     # refreshes this whenever a new config is applied; no other code path
     # writes the hash.
     exporter.set_config_hash(_compute_config_hash(config_path))
+
+    # Shared Redis client: built once, shared between the snapshot cache
+    # (HA mode) and the query cache (when backend resolves to Redis). When
+    # neither feature wants it the client stays at ``None`` so import-time
+    # cost of ``redis`` is paid only when actually needed.
+    redis_client = _build_redis_client(cfg)
+    snapshot_cache = _build_snapshot_cache(cfg, redis_client)
+    query_cache = _build_query_cache(cfg, exporter, redis_client)
+
     source = PromSource(
         url=cfg.datasource.url,
         timeout_seconds=cfg.datasource.timeout.total_seconds(),
         max_concurrency=cfg.datasource.max_concurrent_requests,
         max_keepalive_connections=cfg.datasource.max_keepalive_connections,
         on_retry=exporter.increment_source_retry,
+        cache=query_cache,
     )
     sink = _build_sink(cfg)
-    runner = Runner(config=cfg, source=source, exporter=exporter, sink=sink)
+    # Build the tracer *before* the runner so spans cover the very first
+    # group run. The disabled tracer is free, the real one carries SDK
+    # init cost only when ``telemetry.enabled`` is true.
+    tracer = telemetry_module.build_tracer(cfg.telemetry)
+    runner = Runner(config=cfg, source=source, exporter=exporter, sink=sink, tracer=tracer)
+    if snapshot_cache is not None:
+        # Wire the leader's per-group snapshot hook so a successful run
+        # publishes the rendered /metrics payload to Redis. Followers
+        # read this on every scrape (see ``/metrics`` handler below).
+        runner.set_snapshot_publisher(_make_snapshot_publisher(exporter, snapshot_cache))
     reloader = ConfigReloader(runner=runner, exporter=exporter, config_path=config_path)
     watcher = (
         ConfigMapWatcher(reloader)
         if cfg.server.reload.enabled and cfg.server.reload.watch_configmap
         else None
     )
+
+    elector = _build_elector(cfg, exporter, runner)
+    if elector is None:
+        # No HA configured — record this replica as a permanent "leader"
+        # so the metric is meaningful in single-replica deployments.
+        exporter.set_leader_state(identity=default_identity(), is_leader=True)
 
     app = _build_app(
         exporter,
@@ -145,6 +175,9 @@ def run(config_path: Path, log_level: str) -> None:
         watcher=watcher,
         reload_enabled=cfg.server.reload.enabled,
         expose_config_endpoint=cfg.server.expose_config_endpoint,
+        snapshot_cache=snapshot_cache,
+        elector=elector,
+        tracer=tracer,
     )
     host, port = _parse_listen(cfg.server.listen)
     server = uvicorn.Server(
@@ -159,15 +192,34 @@ def run(config_path: Path, log_level: str) -> None:
             log_config=None,
         )
     )
-    asyncio.run(_serve(server, reloader=reloader))
+    asyncio.run(_serve(server, reloader=reloader, redis_client=redis_client))
 
 
 @asynccontextmanager
 async def _lifespan_factory(
     runner: Runner,
     watcher: ConfigMapWatcher | None,
+    elector: LeaderElector | None,
+    tracer: telemetry_module.Tracer | None = None,
 ) -> AsyncIterator[None]:
-    await runner.start()
+    """Start lifecycle, gated on leader election when HA mode is active.
+
+    Without HA: behaves exactly as before — the runner starts immediately
+    and stops on shutdown.
+
+    With HA: the elector owns the runner. It runs in a background task and
+    calls ``runner.start()`` / ``runner.stop()`` via callbacks set during
+    construction; the lifespan only waits on the elector and the watcher.
+
+    The OTel tracer (when enabled) is shut down *last* so any spans emitted
+    by the runner's final stop sequence still have a chance to flush via
+    the BatchSpanProcessor before the gRPC channel is torn down.
+    """
+    elector_task: asyncio.Task[None] | None = None
+    if elector is None:
+        await runner.start()
+    else:
+        elector_task = asyncio.create_task(elector.run())
     if watcher is not None:
         await watcher.start()
     try:
@@ -175,7 +227,16 @@ async def _lifespan_factory(
     finally:
         if watcher is not None:
             await watcher.stop()
+        if elector is not None:
+            await elector.stop()
+            if elector_task is not None:
+                import contextlib  # noqa: PLC0415
+
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await elector_task
         await runner.stop()
+        if tracer is not None:
+            tracer.shutdown()
 
 
 def _build_app(
@@ -186,10 +247,13 @@ def _build_app(
     watcher: ConfigMapWatcher | None = None,
     reload_enabled: bool,
     expose_config_endpoint: bool = False,
+    snapshot_cache: ha_cache_module.SnapshotCache | None = None,
+    elector: LeaderElector | None = None,
+    tracer: telemetry_module.Tracer | None = None,
 ) -> FastAPI:
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
-        async with _lifespan_factory(runner, watcher):
+        async with _lifespan_factory(runner, watcher, elector, tracer=tracer):
             yield
 
     app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
@@ -200,15 +264,31 @@ def _build_app(
         # ``curl -s /healthz | jq .config_hash`` confirms the deployment is
         # running the expected revision without scraping /metrics first.
         timestamp, success, _ = exporter._reload_state()
-        return {
+        identity, is_leader, _ = exporter._leader_state()
+        body: dict[str, object] = {
             "status": "ok",
             "config_hash": exporter._config_hash_state(),
             "config_last_reload_timestamp": timestamp,
             "config_last_reload_success": success,
         }
+        if identity:
+            body["identity"] = identity
+            body["is_leader"] = is_leader
+        return body
 
     @app.get("/metrics")
     async def metrics() -> Response:
+        # HA followers serve the leader's cached snapshot. We always try
+        # the local registry first — if the cache misses (Redis blip,
+        # leader hasn't run yet) the local empty render is a better
+        # signal than a 404 / 500.
+        if snapshot_cache is not None and elector is not None and not elector.is_leader():
+            cached = await snapshot_cache.get()
+            if cached is not None:
+                return Response(
+                    content=cached,
+                    media_type="text/plain; version=0.0.4; charset=utf-8",
+                )
         return Response(
             content=exporter.render(),
             media_type="text/plain; version=0.0.4; charset=utf-8",
@@ -280,6 +360,7 @@ async def _serve(
     server: uvicorn.Server,
     *,
     reloader: ConfigReloader,
+    redis_client: object | None = None,
 ) -> None:
     loop = asyncio.get_running_loop()
 
@@ -303,7 +384,14 @@ async def _serve(
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, _shutdown)
     loop.add_signal_handler(signal.SIGHUP, _handle_sighup)
-    await server.serve()
+    try:
+        await server.serve()
+    finally:
+        # Close the shared Redis client once everything else has shut down.
+        # The snapshot and query caches both hold references to it, so we
+        # can't close earlier without breaking in-flight cache ops.
+        if redis_client is not None:
+            await ha_cache_module.close_redis_client(redis_client)
 
 
 async def _safe_reload(reloader: ConfigReloader) -> None:
@@ -352,6 +440,138 @@ def _configure_logging(level: str) -> None:
         lg = logging.getLogger(name)
         lg.handlers.clear()
         lg.propagate = True
+
+
+def _redis_needed(cfg: config_module.Config) -> bool:
+    """Does this config want a shared Redis client?"""
+    if cfg.high_availability.enabled:
+        return True
+    qc = cfg.query_cache
+    if not qc.enabled:
+        return False
+    return qc.backend == "redis"
+
+
+def _build_redis_client(cfg: config_module.Config) -> object | None:
+    """Construct the shared async Redis client, or ``None`` if not needed.
+
+    Both the HA snapshot cache and the (Redis-backed) query cache reuse
+    this client so a deployment that opts into both pays for exactly one
+    connection pool.
+    """
+    if not _redis_needed(cfg):
+        return None
+    address = cfg.high_availability.redis.address or cfg.query_cache.redis_address
+    if not address:
+        raise ValueError(
+            "redis backend requested but no address configured; "
+            "set highAvailability.redis.address or query_cache.redis_address"
+        )
+    password = cfg.high_availability.redis.password or cfg.query_cache.redis_password or None
+    return ha_cache_module.build_redis_client(address, password=password)
+
+
+def _build_snapshot_cache(
+    cfg: config_module.Config, redis_client: object | None
+) -> ha_cache_module.SnapshotCache | None:
+    """Redis-backed shared snapshot cache for HA followers, or ``None``."""
+    if not cfg.high_availability.enabled or redis_client is None:
+        return None
+    ttl_seconds = max(1, int(cfg.high_availability.redis.snapshot_ttl.total_seconds()))
+    return ha_cache_module.SnapshotCache(redis_client, ttl_seconds=ttl_seconds)
+
+
+def _build_query_cache(
+    cfg: config_module.Config,
+    exporter: Exporter,
+    redis_client: object | None,
+) -> QueryCache | None:
+    """Resolve the query-cache backend and return a wired :class:`QueryCache`.
+
+    Returns ``None`` when caching is disabled. Backend resolution:
+
+    * ``backend: auto`` — Redis if HA is enabled, otherwise in-memory LRU.
+    * ``backend: memory`` — always in-memory LRU.
+    * ``backend: redis`` — use the shared client; requires one to be
+      configured (HA enabled, or ``query_cache.redis_address`` set).
+    """
+    qc = cfg.query_cache
+    if not qc.enabled:
+        return None
+    backend: QueryCacheBackend
+    chosen = qc.backend
+    if chosen == "auto":
+        chosen = "redis" if redis_client is not None else "memory"
+    if chosen == "memory":
+        backend = MemoryQueryCache(max_entries=qc.max_entries)
+    else:
+        if redis_client is None:
+            raise ValueError(
+                "query_cache.backend=redis requires either highAvailability.enabled or "
+                "query_cache.redis_address to be set"
+            )
+        backend = RedisQueryCache(redis_client)
+    ttl_seconds = max(1, int(qc.ttl.total_seconds()))
+    return QueryCache(
+        backend,
+        ttl_seconds=ttl_seconds,
+        on_event=exporter.increment_query_cache_event,
+    )
+
+
+def _make_snapshot_publisher(
+    exporter: Exporter,
+    cache: ha_cache_module.SnapshotCache,
+) -> Callable[[], Awaitable[None]]:
+    """Build the per-run callback that publishes the rendered snapshot."""
+
+    async def _publish() -> None:
+        rendered = exporter.render()
+        await cache.set(rendered)
+
+    return _publish
+
+
+def _build_elector(
+    cfg: config_module.Config,
+    exporter: Exporter,
+    runner: Runner,
+) -> LeaderElector | None:
+    """Construct the leader elector for HA mode, or ``None`` when disabled.
+
+    Wires the on-acquired / on-lost callbacks so the runner only schedules
+    work while this replica holds the lease. Sets the exporter's leader
+    state on every transition so ``forecast_leader_elected`` is accurate.
+    """
+    ha = cfg.high_availability
+    if not ha.enabled:
+        return None
+    namespace = ha.namespace or os.environ.get("PROMFORECAST_NAMESPACE", "default")
+    identity = ha.identity or default_identity()
+    exporter.set_leader_state(identity=identity, is_leader=False)
+
+    async def _on_acquired() -> None:
+        exporter.set_leader_state(identity=identity, is_leader=True)
+        await runner.start()
+
+    async def _on_lost() -> None:
+        exporter.set_leader_state(identity=identity, is_leader=False)
+        await runner.pause()
+
+    elector_config = LeaderElectorConfig(
+        namespace=namespace,
+        lease_name=ha.lease_name,
+        identity=identity,
+        lease_duration_seconds=ha.lease_duration_seconds,
+        renew_deadline_seconds=ha.renew_deadline_seconds,
+        retry_period_seconds=ha.retry_period_seconds,
+    )
+    return LeaderElector(
+        config=elector_config,
+        client=KubernetesLeaseClient(),
+        on_started_leading=_on_acquired,
+        on_stopped_leading=_on_lost,
+    )
 
 
 def _build_sink(cfg: config_module.Config) -> ForecastSink | None:

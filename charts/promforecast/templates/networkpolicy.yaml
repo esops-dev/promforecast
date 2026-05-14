@@ -27,4 +27,26 @@ spec:
           protocol: UDP
         - port: 53
           protocol: TCP
+    {{- /*
+        HA mode talks to the Kubernetes API server (Lease coordination) and
+        to Redis (snapshot cache, optional query cache). The kube-apiserver
+        is reachable via the kubernetes.default.svc Service, which routes to
+        a host-network endpoint on the control plane — we authorise port
+        443/6443 to any pod-network destination since we can't enumerate the
+        endpoint IPs from a chart. Redis traffic is constrained to the
+        configured port (default 6379); operators with a non-default Redis
+        port can override via networkPolicy.redisPort.
+    */}}
+    {{- if .Values.highAvailability.enabled }}
+    - to:
+        - namespaceSelector: {}
+      ports:
+        - port: {{ .Values.networkPolicy.redisPort | default 6379 }}
+          protocol: TCP
+    - ports:
+        - port: {{ .Values.networkPolicy.kubeApiPort | default 443 }}
+          protocol: TCP
+        - port: 6443
+          protocol: TCP
+    {{- end }}
 {{- end }}

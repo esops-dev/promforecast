@@ -1,0 +1,258 @@
+# Production reference values for the `promforecast` chart.
+#
+# Pairs with the multi-group config in ./config.yaml. Two install patterns
+# are supported:
+#
+# 1. Inline (this file embeds the whole config under .Values.config).
+# 2. External ConfigMap (set `existingConfigMap: promforecast-config` and
+#    ship the YAML separately via your GitOps controller). Useful when the
+#    config rev-train is faster than chart bumps.
+#
+# Highlights:
+#   * High availability on, 2 replicas, Redis-backed snapshot cache.
+#   * Rolling update strategy (the chart switches automatically when
+#     highAvailability is enabled).
+#   * ServiceMonitor enabled for the Prometheus Operator scrape.
+#   * NetworkPolicy enabled with explicit egress to the TSDB + Redis + the
+#     Kubernetes API server (Lease coordination).
+#   * Resource requests/limits sized for ~20k output series.
+#
+# Bring-your-own:
+#   * Replace the datasource URL with your TSDB endpoint (or rely on the
+#     in-cluster `victoria-metrics-single-server` Service from the umbrella
+#     chart).
+#   * Set `serviceMonitor.namespace` to wherever the Prometheus Operator's
+#     `ServiceMonitor` selector looks.
+
+image:
+  repository: ghcr.io/esops-dev/promforecast
+  # Pin a specific tag in production — let renovate/dependabot propose the
+  # bumps. Empty string falls through to chart appVersion which is also
+  # acceptable for tip-of-main installs.
+  tag: ""
+  pullPolicy: IfNotPresent
+  pullSecrets: []
+
+replicaCount: 2
+strategy:
+  type: RollingUpdate
+  rollingUpdate:
+    maxSurge: 1
+    maxUnavailable: 0
+
+highAvailability:
+  enabled: true
+  redis:
+    # In-cluster Redis. The umbrella chart doesn't ship Redis; deploy
+    # `bitnami/redis` or run a managed instance. The Service hostname goes
+    # here, the password (if any) goes into an existing Secret you reference.
+    address: redis-master.observability.svc:6379
+    existingSecret: ""
+    secretKey: password
+
+# Inline forecaster config. Move this into a separate ConfigMap (and set
+# `existingConfigMap` above) when the config rev-train is faster than the
+# chart's release cadence.
+config:
+  apiVersion: promforecast.io/v1
+
+  datasource:
+    url: http://victoria-metrics-single-server.observability.svc:8428/
+    timeout: 30s
+    auth:
+      type: none
+    max_concurrent_requests: 16
+    max_keepalive_connections: 16
+
+  server:
+    listen: ":9091"
+    refresh_interval: 1h
+    reload:
+      enabled: true
+      watch_configmap: true
+    expose_config_endpoint: true
+
+  safety:
+    max_series_per_query: 1500
+    max_total_series: 20000
+    series_overflow: drop_lowest_priority
+    fit_timeout: 90s
+    query_timeout: 30s
+
+  defaults:
+    lookback: 14d
+    step: 5m
+    horizon: 24h
+    models: [AutoARIMA, AutoETS, SeasonalNaive]
+    season_length: 288
+    confidence_levels: [80, 95]
+    min_points: 200
+    accuracy:
+      evaluate: true
+      horizons: [1h, 6h, 24h]
+      auto_select: true
+      fallback_model: SeasonalNaive
+      fallback_mape_threshold: 50
+    emission:
+      deviation: true
+      quality: true
+      contribution: true
+
+  sink:
+    remote_write:
+      enabled: true
+      url: http://victoria-metrics-single-server.observability.svc:8428/api/v1/import/prometheus
+      timeout: 30s
+      chunk_size: 10000
+      max_connections: 8
+      max_keepalive_connections: 4
+      headers: {}
+
+  highAvailability:
+    enabled: true
+    lease_name: promforecast-leader
+    lease_duration_seconds: 30
+    renew_deadline_seconds: 20
+    retry_period_seconds: 4
+    redis:
+      address: redis-master.observability.svc:6379
+      snapshot_ttl: 10m
+
+  query_cache:
+    enabled: true
+    backend: auto
+    ttl: 5m
+    max_entries: 4096
+
+  telemetry:
+    enabled: false
+    service_name: promforecast
+    sample_ratio: 1.0
+    otlp:
+      endpoint: ""
+      insecure: true
+
+  groups:
+    - name: business_kpis
+      priority: 1
+      queries:
+        - id: http_requests_per_second
+          promql: |
+            sum by (service) (rate(http_requests_total[5m]))
+          regressors:
+            - id: hour_of_day
+              type: calendar
+            - id: is_weekend
+              type: calendar
+        - id: http_5xx_per_second
+          promql: |
+            sum by (service) (rate(http_requests_total{status=~"5.."}[5m]))
+        - id: http_request_p95_seconds
+          promql: |
+            histogram_quantile(0.95,
+              sum by (service, le) (rate(http_request_duration_seconds_bucket[5m]))
+            )
+
+    - name: node_capacity
+      priority: 5
+      queries:
+        - id: node_cpu_busy_pct
+          promql: |
+            100 - (avg by (instance) (rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100)
+        - id: node_filesystem_avail_bytes
+          promql: |
+            node_filesystem_avail_bytes{fstype!~"tmpfs|overlay|squashfs"}
+        - id: node_memory_used_bytes
+          promql: |
+            node_memory_MemTotal_bytes - node_memory_MemAvailable_bytes
+
+    - name: kube_resources
+      priority: 10
+      queries:
+        - id: pod_cpu_usage_cores
+          promql: |
+            sum by (namespace) (rate(container_cpu_usage_seconds_total{container!="",pod!=""}[5m]))
+        - id: pod_memory_working_set_bytes
+          promql: |
+            sum by (namespace) (container_memory_working_set_bytes{container!="",pod!=""})
+        - id: persistentvolumeclaim_used_bytes
+          promql: |
+            sum by (namespace, persistentvolumeclaim) (kubelet_volume_stats_used_bytes)
+
+service:
+  type: ClusterIP
+  port: 9091
+  annotations: {}
+
+serviceMonitor:
+  enabled: true
+  # Where the Prometheus Operator's `serviceMonitorSelector` looks. Most
+  # kube-prometheus-stack installs select across all namespaces by default.
+  namespace: ""
+  interval: 60s
+  scrapeTimeout: 30s
+  labels:
+    release: kube-prometheus-stack
+
+resources:
+  requests:
+    cpu: "1"
+    memory: 1Gi
+  limits:
+    cpu: "4"
+    memory: 4Gi
+
+serviceAccount:
+  create: true
+
+rbac:
+  # Required: HA mode uses the Kubernetes coordination.k8s.io/v1 Lease API.
+  create: true
+
+networkPolicy:
+  enabled: true
+  # The chart auto-adds Redis + kube-apiserver egress when HA is on.
+  # Explicit TSDB egress goes here.
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: observability
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: victoria-metrics-single
+      ports:
+        - port: 8428
+          protocol: TCP
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: [ALL]
+
+# Spread replicas across nodes so a single-node failure doesn't take both
+# pods. Soft constraint — the scheduler will still place both on one node
+# if no alternative exists.
+affinity:
+  podAntiAffinity:
+    preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        podAffinityTerm:
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: promforecast
+          topologyKey: kubernetes.io/hostname
+
+podAnnotations: {}
+podLabels: {}
+nodeSelector: {}
+tolerations: []

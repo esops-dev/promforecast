@@ -41,7 +41,9 @@ path. See [`docs/cli.md`](docs/cli.md) for `promforecast validate`,
 which CI users can run against a config file before merging.
 
 See [`docs/`](docs/) for configuration, model selection, and operational
-guidance.
+guidance. For a real-world deployment — multi-group config, HA values, and
+ready-to-apply ArgoCD/Flux manifests with a reference architecture diagram
+— see [`examples/production/`](examples/production/).
 
 ## Status
 

@@ -4,9 +4,23 @@ metadata:
   name: {{ include "promforecast.fullname" . }}
   labels: {{- include "promforecast.labels" . | nindent 4 }}
 spec:
+  {{- /*
+      HA mode uses RollingUpdate so a fresh leader can take over before the
+      old replica is fully torn down (the elector's best-effort release
+      shaves another few seconds off failover). Single-replica installs
+      keep Recreate to honour the stateless invariant — a brief gap during
+      pod replacement is fine because the next refit reproduces everything.
+  */}}
   replicas: {{ .Values.replicaCount }}
   strategy:
+    {{- if and .Values.highAvailability.enabled (eq (.Values.strategy.type | default "Recreate") "Recreate") }}
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+    {{- else }}
     {{- toYaml .Values.strategy | nindent 4 }}
+    {{- end }}
   selector:
     matchLabels: {{- include "promforecast.selectorLabels" . | nindent 6 }}
   template:

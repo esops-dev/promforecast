@@ -1,7 +1,7 @@
 # Forecast user-facing KPIs (request rate, error budget, latency).
 # Replace the metric names and labels with whatever your services expose.
 
-apiVersion: promforecast.io/v1alpha1
+apiVersion: promforecast.io/v1
 
 datasource:
   url: http://victoriametrics:8428/

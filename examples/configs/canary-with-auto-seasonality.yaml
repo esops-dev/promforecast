@@ -1,0 +1,48 @@
+# Canary onboarding for a new high-cardinality group, with automatic
+# seasonality detection per series.
+#
+# The pattern: keep canary on while a group is new (low fit cost, broad
+# coverage rotation each refresh tick); flip canary off once you trust the
+# fit time and accuracy. Per-query ``season_length: auto`` removes the
+# need to hand-tune seasonality when the series natural period isn't
+# obvious upfront. Optional OpenTelemetry block at the bottom is a no-op
+# until ``enabled: true`` plus an OTLP endpoint are set.
+
+apiVersion: promforecast.io/v1
+
+datasource:
+  url: http://victoriametrics:8428/
+
+defaults:
+  lookback: 14d
+  step: 5m
+  horizon: 24h
+  models: [AutoARIMA, SeasonalNaive]
+  season_length: 288    # fallback when auto-detection can't find a peak
+
+groups:
+  # High-cardinality group running in canary mode while operators
+  # validate the pipeline on a representative slice.
+  - name: per_pod_cpu
+    priority: 1
+    canary:
+      enabled: true
+      weight: 0.05      # fit ~5% of the fetched series each tick
+    queries:
+      - id: pod_cpu_busy_pct
+        promql: |
+          100 - avg by (pod, namespace) (
+            rate(container_cpu_usage_seconds_total{image!=""}[5m])
+          ) * 100
+        season_length: auto
+
+# Off by default. Flip ``enabled: true`` and point ``endpoint`` at an
+# OTel Collector to ship spans. Disabled ≡ zero overhead (the SDK is
+# not imported).
+telemetry:
+  enabled: false
+  service_name: promforecast
+  sample_ratio: 1.0
+  otlp:
+    endpoint: ""        # e.g. otel-collector.monitoring.svc:4317
+    insecure: true

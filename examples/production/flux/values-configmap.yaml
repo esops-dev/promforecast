@@ -1,0 +1,170 @@
+# ConfigMap fed into the HelmRelease via ``valuesFrom``. The single key
+# ``values.yaml`` carries the whole forecaster chart values document. Keep
+# this file in lockstep with ``examples/production/forecaster/values.yaml``
+# — easiest is to symlink or sync it via a Kustomize generator in your
+# GitOps repo.
+#
+# Why a ConfigMap and not committed directly under ``values:``?
+#
+# * Smaller HelmRelease diffs when the config changes (the chart-level
+#   knobs and the forecaster config rev-train independently).
+# * Same review path as any other ConfigMap, which usually has tighter
+#   approval rules than chart wiring.
+# * The forecaster watches its mounted ConfigMap and reloads on edit; this
+#   sibling ConfigMap follows the same operational model.
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: promforecast-values
+  namespace: observability
+data:
+  values.yaml: |
+    image:
+      repository: ghcr.io/esops-dev/promforecast
+      pullPolicy: IfNotPresent
+
+    replicaCount: 2
+    strategy:
+      type: RollingUpdate
+      rollingUpdate:
+        maxSurge: 1
+        maxUnavailable: 0
+
+    highAvailability:
+      enabled: true
+      redis:
+        address: redis-master.observability.svc:6379
+
+    config:
+      apiVersion: promforecast.io/v1
+
+      datasource:
+        url: http://victoria-metrics-single-server.observability.svc:8428/
+        timeout: 30s
+        auth:
+          type: none
+        max_concurrent_requests: 16
+        max_keepalive_connections: 16
+
+      server:
+        listen: ":9091"
+        refresh_interval: 1h
+        reload:
+          enabled: true
+          watch_configmap: true
+        expose_config_endpoint: true
+
+      safety:
+        max_series_per_query: 1500
+        max_total_series: 20000
+        series_overflow: drop_lowest_priority
+        fit_timeout: 90s
+        query_timeout: 30s
+
+      defaults:
+        lookback: 14d
+        step: 5m
+        horizon: 24h
+        models: [AutoARIMA, AutoETS, SeasonalNaive]
+        season_length: 288
+        confidence_levels: [80, 95]
+        min_points: 200
+        accuracy:
+          evaluate: true
+          horizons: [1h, 6h, 24h]
+          auto_select: true
+          fallback_model: SeasonalNaive
+          fallback_mape_threshold: 50
+        emission:
+          deviation: true
+          quality: true
+          contribution: true
+
+      sink:
+        remote_write:
+          enabled: true
+          url: http://victoria-metrics-single-server.observability.svc:8428/api/v1/import/prometheus
+          timeout: 30s
+          chunk_size: 10000
+          max_connections: 8
+          max_keepalive_connections: 4
+
+      highAvailability:
+        enabled: true
+        lease_name: promforecast-leader
+        lease_duration_seconds: 30
+        renew_deadline_seconds: 20
+        retry_period_seconds: 4
+        redis:
+          address: redis-master.observability.svc:6379
+          snapshot_ttl: 10m
+
+      query_cache:
+        enabled: true
+        backend: auto
+        ttl: 5m
+        max_entries: 4096
+
+      groups:
+        - name: business_kpis
+          priority: 1
+          queries:
+            - id: http_requests_per_second
+              promql: |
+                sum by (service) (rate(http_requests_total[5m]))
+              regressors:
+                - id: hour_of_day
+                  type: calendar
+                - id: is_weekend
+                  type: calendar
+            - id: http_5xx_per_second
+              promql: |
+                sum by (service) (rate(http_requests_total{status=~"5.."}[5m]))
+            - id: http_request_p95_seconds
+              promql: |
+                histogram_quantile(0.95,
+                  sum by (service, le) (rate(http_request_duration_seconds_bucket[5m]))
+                )
+
+        - name: node_capacity
+          priority: 5
+          queries:
+            - id: node_cpu_busy_pct
+              promql: |
+                100 - (avg by (instance) (rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100)
+            - id: node_filesystem_avail_bytes
+              promql: |
+                node_filesystem_avail_bytes{fstype!~"tmpfs|overlay|squashfs"}
+
+        - name: kube_resources
+          priority: 10
+          queries:
+            - id: pod_cpu_usage_cores
+              promql: |
+                sum by (namespace) (rate(container_cpu_usage_seconds_total{container!="",pod!=""}[5m]))
+
+    service:
+      type: ClusterIP
+      port: 9091
+
+    serviceMonitor:
+      enabled: true
+      interval: 60s
+      scrapeTimeout: 30s
+      labels:
+        release: kube-prometheus-stack
+
+    resources:
+      requests:
+        cpu: "1"
+        memory: 1Gi
+      limits:
+        cpu: "4"
+        memory: 4Gi
+
+    rbac:
+      create: true
+
+    networkPolicy:
+      enabled: true

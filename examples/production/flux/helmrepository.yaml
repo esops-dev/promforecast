@@ -1,0 +1,13 @@
+# Flux HelmRepository pointing at the promforecast Helm repo. Apply this
+# once per cluster; the HelmRelease below references it by name.
+
+apiVersion: source.toolkit.fluxcd.io/v1
+kind: HelmRepository
+metadata:
+  name: promforecast
+  namespace: flux-system
+spec:
+  # 30m is the upstream Flux default; tighten when you want faster pickup
+  # of a fresh chart release, loosen when bandwidth matters.
+  interval: 30m
+  url: https://esops-dev.github.io/promforecast
