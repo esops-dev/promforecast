@@ -1357,9 +1357,7 @@ class Runner:
         if forecast.empty:
             return
         if query.thresholds:
-            calibrated_df = _apply_offsets_to_threshold_eta_inputs(
-                forecast, offsets, levels
-            )
+            calibrated_df = _apply_offsets_to_threshold_eta_inputs(forecast, offsets, levels)
             etas = capacity_mod.compute_threshold_etas(
                 forecast=calibrated_df,
                 thresholds=query.thresholds,
@@ -1378,9 +1376,7 @@ class Runner:
                 units=growth_cfg.units,
             )
             if rates:
-                result.growth_rates.extend(
-                    factory.growth_rate_points(model_name, rates, selection)
-                )
+                result.growth_rates.extend(factory.growth_rate_points(model_name, rates, selection))
 
     async def _explicit_forecast(
         self,
@@ -1498,9 +1494,7 @@ class Runner:
             factory.forecast_curve_points(forecast, selection.model, selection=selection)
         )
         result.capacity_inputs.append(
-            _CapacityInput(
-                model_name=selection.model, forecast=forecast, selection=selection
-            )
+            _CapacityInput(model_name=selection.model, forecast=forecast, selection=selection)
         )
         return list(factory.forecast_points(forecast, selection.model, selection=selection))
 

@@ -360,9 +360,7 @@ class GrowthRateEmissionConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     enabled: bool = False
-    windows: list[Duration] = Field(
-        default_factory=lambda: [timedelta(days=1), timedelta(days=7)]
-    )
+    windows: list[Duration] = Field(default_factory=lambda: [timedelta(days=1), timedelta(days=7)])
     units: Literal["units_per_second", "percent"] = "units_per_second"
 
 
