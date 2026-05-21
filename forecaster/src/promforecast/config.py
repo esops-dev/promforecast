@@ -152,6 +152,34 @@ class SafetyConfig(BaseModel):
     query_timeout: Duration = timedelta(seconds=30)
 
 
+class ConformalConfig(BaseModel):
+    """Split-conformal band calibration.
+
+    Opt-in calibration that wraps any registered model. When enabled, the
+    forecaster reserves a calibration hold-out at the tail of the lookback
+    window, fits the model on the prefix, and uses the absolute residuals on
+    the hold-out to compute the smallest additive band correction that
+    achieves the requested empirical coverage. The correction is applied
+    symmetrically (``±offset`` to upper / lower) to each emitted forecast
+    confidence band, and the offset per (series, model, level) is exposed
+    as ``forecast_band_calibration_offset`` so operators can see how much
+    the bands moved.
+
+    The default ``holdout_fraction`` of 0.2 matches the conformal-prediction
+    literature's split-sample default and gives a meaningful sample for the
+    quantile estimate at the 95th percentile (it leaves ``0.2 * lookback``
+    points to estimate the upper tail). Smaller fractions risk a single
+    outlier dominating the quantile; larger fractions starve the in-fit
+    history.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    method: Literal["split"] = "split"
+    holdout_fraction: float = Field(default=0.2, gt=0.0, lt=1.0)
+
+
 class AccuracyConfig(BaseModel):
     """Backtesting + model-selection knobs.
 
@@ -175,6 +203,7 @@ class AccuracyConfig(BaseModel):
     auto_select: bool | Literal["ensemble"] = False
     fallback_model: str = "SeasonalNaive"
     fallback_mape_threshold: float | None = 50.0
+    conformal: ConformalConfig = ConformalConfig()
 
 
 class EmissionConfig(BaseModel):
@@ -351,12 +380,115 @@ class CanaryConfig(BaseModel):
     weight: float = Field(default=0.1, gt=0.0, le=1.0)
 
 
+class GapImputationConfig(BaseModel):
+    """How to fill gaps in the lookback series before fitting.
+
+    The default is intentionally conservative: a forward-fill for gaps up to
+    ``max_gap`` (30 minutes), and ``drop_series`` once the gap is larger so a
+    multi-hour outage doesn't smuggle fabricated values into the forecast.
+    Operators who want a different behaviour flip ``strategy`` per group; the
+    ``forecast_input_gaps_filled_total`` counter records what the runner did
+    so the choice is observable from /metrics.
+
+    ``max_gap`` is compared against the largest gap *between adjacent
+    samples* — not the cumulative number of missing points. A single
+    35-minute outage trips the fallback even if the series is otherwise
+    fully populated.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    strategy: Literal["forward_fill", "linear_interp", "nan", "drop_series"] = "forward_fill"
+    max_gap: Duration = timedelta(minutes=30)
+
+
+class OutlierConfig(BaseModel):
+    """Spike-resistant lookback preprocessing.
+
+    Off by default — silent data correction surprises operators, so the
+    feature is opt-in even though it is usually beneficial on noisy
+    production metrics. ``method`` picks the detector; ``sensitivity``
+    rolls up the per-method tuning (Hampel threshold, IQR multiplier, STL
+    residual cutoff) into three named bands so callers don't have to
+    reason about per-method magic numbers.
+
+    ``replace_with`` controls what replaces a flagged point.
+    ``median_neighbours`` is the default because it preserves the local
+    level without inheriting the spike; ``linear_interp`` works better for
+    monotone series; ``nan`` leaves it to downstream gap handling, which
+    is appropriate when the operator wants outliers visible in the
+    coverage signal.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    method: Literal["hampel", "iqr", "stl_residual"] = "hampel"
+    sensitivity: Literal["low", "medium", "high"] = "medium"
+    replace_with: Literal["median_neighbours", "linear_interp", "nan"] = "median_neighbours"
+
+
+class ChangePointConfig(BaseModel):
+    """Detect structural breaks in the lookback and adapt the fit window.
+
+    Off by default. When enabled, the detector runs once per series before
+    each fit; on a detected break the runner either truncates the lookback
+    to the post-break tail (``truncate_lookback``) or down-weights pre-break
+    samples (``reweight_recent``).
+
+    ``min_post_break_points`` guards against an aggressive detector
+    truncating a series to too few samples: if truncation would leave
+    fewer than this many points, the runner keeps the full lookback. This
+    is the most common knob to tune — set it to roughly one full seasonal
+    cycle.
+
+    **Not** the same algorithm as ``promanomaly`` even though both
+    projects expose ``bocpd``/``ruptures``. Here the detector runs
+    *input-side* (adjusts the lookback fed into the forecast model). In
+    ``promanomaly`` the same names run *output-side* and emit a change
+    point as an alert signal.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    method: Literal["bocpd", "ruptures"] = "ruptures"
+    action: Literal["truncate_lookback", "reweight_recent"] = "truncate_lookback"
+    min_post_break_points: int = Field(default=50, ge=2)
+    # Used only when ``action == "reweight_recent"``. The exponential decay
+    # applied to pre-break samples — 1.0 = no down-weighting, 0.0 = drop them
+    # entirely. The default 0.5 halves each pre-break point's weight.
+    reweight_decay: float = Field(default=0.5, ge=0.0, le=1.0)
+
+
+class PreprocessConfig(BaseModel):
+    """All pre-fit cleaning steps for a group.
+
+    Steps run in the order ``gaps -> outliers -> change_point``: gaps are
+    filled first so outlier detection sees a regularly-sampled signal, and
+    change-point detection runs last on the cleaned series so a single
+    spike doesn't masquerade as a regime shift.
+
+    All three sub-sections default to inert behaviour (``forward_fill`` with
+    a 30-minute cap, outliers off, change-point off), so adding the block
+    to a config without further edits does nothing observable. Each
+    individual feature flips on independently.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    gaps: GapImputationConfig = GapImputationConfig()
+    outliers: OutlierConfig = OutlierConfig()
+    change_point: ChangePointConfig = ChangePointConfig()
+
+
 class GroupConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     name: str
     priority: int = 1
     canary: CanaryConfig = Field(default_factory=CanaryConfig)
+    preprocess: PreprocessConfig = Field(default_factory=PreprocessConfig)
     queries: list[QueryConfig]
 
 

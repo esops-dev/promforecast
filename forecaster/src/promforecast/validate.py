@@ -56,6 +56,8 @@ class CardinalityEstimate:
     deviation_lines: int
     quality_lines: int
     contribution_lines: int
+    calibration_lines: int
+    preprocess_lines: int
     operational_lines: int
 
     @property
@@ -66,6 +68,8 @@ class CardinalityEstimate:
             + self.deviation_lines
             + self.quality_lines
             + self.contribution_lines
+            + self.calibration_lines
+            + self.preprocess_lines
             + self.operational_lines
         )
 
@@ -117,6 +121,8 @@ def run_validate(
     write(f"  deviation lines    {estimate.deviation_lines:>8}")
     write(f"  quality lines      {estimate.quality_lines:>8}")
     write(f"  contribution lines {estimate.contribution_lines:>8}")
+    write(f"  calibration lines  {estimate.calibration_lines:>8}")
+    write(f"  preprocess lines   {estimate.preprocess_lines:>8}")
     write(f"  operational lines  {estimate.operational_lines:>8}")
     write(f"  total              {estimate.total:>8}")
     if cfg.safety.max_total_series and estimate.total > cfg.safety.max_total_series:
@@ -195,6 +201,36 @@ def _estimate_cardinality(cfg: Config) -> CardinalityEstimate:
             for query in group.queries:
                 if query.regressors:
                     contribution_lines += series_cap * len(query.regressors)
+    # Conformal calibration emits ``forecast_band_calibration_offset`` per
+    # (series, model, level) on the *emitted* model set only — same shape
+    # as the deviation gauge. Off when ``accuracy.conformal.enabled`` is
+    # false.
+    calibration_lines = 0
+    if cfg.defaults.accuracy.conformal.enabled:
+        calibration_lines = queries * series_cap * emitted_models * n_levels
+    # Preprocessing emits per-(group, query) telemetry. The label sets
+    # are all bounded:
+    #   * max_gap_seconds         : 1 line per query
+    #   * effective_lookback_secs : 1 line per query
+    #   * change_point_total      : 1 line per query (when change_point.enabled)
+    #   * gaps_filled_total       : at most |strategies| = 3 per query
+    #   * outliers_replaced_total : at most |methods|    = 3 per query (when outliers.enabled)
+    # The gauge pair (max gap + effective lookback) is always charged
+    # because the runner emits them on every fit; the counters are only
+    # charged when the feature is enabled in *any* group, so a config
+    # that doesn't touch outliers/change-point doesn't inflate the
+    # estimate.
+    preprocess_lines = 2 * queries
+    any_outliers_on = any(g.preprocess.outliers.enabled for g in cfg.groups)
+    any_changepoint_on = any(g.preprocess.change_point.enabled for g in cfg.groups)
+    n_gap_strategies = 3
+    n_outlier_methods = 3
+    preprocess_lines += queries * n_gap_strategies
+    if any_outliers_on:
+        preprocess_lines += queries * n_outlier_methods
+    if any_changepoint_on:
+        preprocess_lines += queries
+
     # Operational: 7 gauges + N reasons per group; we ballpark 7 per group.
     operational_lines = 7 * len(cfg.groups)
 
@@ -208,6 +244,8 @@ def _estimate_cardinality(cfg: Config) -> CardinalityEstimate:
         deviation_lines=deviation_lines,
         quality_lines=quality_lines,
         contribution_lines=contribution_lines,
+        calibration_lines=calibration_lines,
+        preprocess_lines=preprocess_lines,
         operational_lines=operational_lines,
     )
 

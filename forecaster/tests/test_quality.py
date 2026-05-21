@@ -51,3 +51,39 @@ def test_none_inputs_zero_their_subscore() -> None:
 def test_non_finite_inputs_zero_their_subscore() -> None:
     assert compute(backtest_mape=float("nan"), band_width_relative=0.0, coverage=1.0) == 0.0
     assert compute(backtest_mape=0.0, band_width_relative=float("inf"), coverage=1.0) == 0.0
+
+
+def test_imputed_fraction_penalises_coverage() -> None:
+    # Full coverage but half imputed -> coverage sub-score halved.
+    full = compute(backtest_mape=0.0, band_width_relative=0.0, coverage=1.0)
+    half_imputed = compute(
+        backtest_mape=0.0,
+        band_width_relative=0.0,
+        coverage=1.0,
+        imputed_fraction=0.5,
+    )
+    assert math.isclose(half_imputed, full * 0.5)
+
+
+def test_fully_imputed_coverage_zeroes_score() -> None:
+    # If every "covered" point is fabricated, quality must collapse to 0.
+    score = compute(
+        backtest_mape=0.0,
+        band_width_relative=0.0,
+        coverage=1.0,
+        imputed_fraction=1.0,
+    )
+    assert score == 0.0
+
+
+def test_imputed_fraction_defaults_to_no_penalty() -> None:
+    # Callers that don't run preprocessing pass ``imputed_fraction=None`` (or
+    # leave it default) and must keep the historical behaviour.
+    legacy = compute(backtest_mape=0.0, band_width_relative=0.0, coverage=0.9)
+    explicit_none = compute(
+        backtest_mape=0.0,
+        band_width_relative=0.0,
+        coverage=0.9,
+        imputed_fraction=None,
+    )
+    assert math.isclose(legacy, explicit_none)

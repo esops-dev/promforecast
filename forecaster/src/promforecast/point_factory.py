@@ -23,6 +23,7 @@ from . import quality as quality_mod
 from .accuracy import overall_mape
 from .exporter import (
     AccuracyPoint,
+    CalibrationOffsetPoint,
     ContributionPoint,
     DeviationPoint,
     EnsembleWeightPoint,
@@ -107,6 +108,10 @@ class SeriesPointFactory:
         ``best_model`` and ``model_fallback`` are attached so dashboards can
         distinguish "this model won the horse race" from "this is the fallback
         after the winner blew its MAPE budget".
+
+        Conformal calibration's ``calibrated="true"`` label is added post-hoc
+        by ``runner._apply_calibration_offsets`` after this method returns,
+        so callers don't need to thread that flag through here.
         """
         if forecast.empty:
             return
@@ -132,6 +137,26 @@ class SeriesPointFactory:
                     labels={**common, "level": str(level)},
                     value=float(last[hi_col]),
                 )
+
+    def calibration_offset_points(
+        self,
+        model_name: str,
+        offsets: dict[int, float],
+    ) -> Iterable[CalibrationOffsetPoint]:
+        """One ``forecast_band_calibration_offset`` per (model, level).
+
+        Emitted only when split-conformal calibration ran for this series.
+        ``offsets`` is the per-level additive correction returned by
+        :mod:`promforecast.conformal`; non-finite values are skipped.
+        """
+        common = self._common_with_id()
+        for level, offset in offsets.items():
+            if not math.isfinite(offset):
+                continue
+            yield CalibrationOffsetPoint(
+                labels={**common, "model": model_name, "level": str(level)},
+                offset=float(offset),
+            )
 
     def forecast_curve_points(
         self,
@@ -298,6 +323,7 @@ class SeriesPointFactory:
         emitted_models: list[str],
         train_y: list[float],
         coverage: float,
+        imputed_fraction: float = 0.0,
     ) -> Iterable[QualityPoint]:
         """Compute a composite quality score per emitted (series, model).
 
@@ -305,7 +331,10 @@ class SeriesPointFactory:
         (2) the mean backtest band width relative to ``mean(|train_y|)``
         (paired with actuals during backtest, which is more meaningful than
         scoring the unvalidated forward bands), and (3) the lookback data
-        coverage.
+        coverage. When ``imputed_fraction > 0`` the coverage sub-score is
+        scaled by ``(1 - imputed_fraction)`` so a series whose lookback is
+        mostly synthesised by gap imputation does not silently score well
+        on the coverage dimension.
 
         Models with no backtest data — typically the auto-select fallback
         model when it isn't in the configured ``models`` list — are skipped
@@ -332,6 +361,7 @@ class SeriesPointFactory:
                 backtest_mape=mape,
                 band_width_relative=band_width_relative,
                 coverage=coverage,
+                imputed_fraction=imputed_fraction,
             )
             yield QualityPoint(
                 labels={**common, "model": model_name},

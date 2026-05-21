@@ -54,6 +54,14 @@ defaults:
     auto_select: true
     fallback_model: SeasonalNaive
     fallback_mape_threshold: 50
+    # Conformal calibration on so dev validates the new
+    # forecast_band_calibration_offset family end-to-end. The 0.3 holdout
+    # leaves ~9 calibration points at min_points=30 — small but enough
+    # to exercise the wiring.
+    conformal:
+      enabled: true
+      method: split
+      holdout_fraction: 0.3
   emission:
     deviation: true
     quality: true
@@ -61,6 +69,14 @@ defaults:
 groups:
   - name: node_capacity
     priority: 10
+    # Preprocessing: gap imputation explicitly configured (default behaviour
+    # but spelled out so the dev-stack exercises the new metric families).
+    # Outlier scrubbing + change-point detection stay off — they're opt-in
+    # in production and the dev-stack mirrors that.
+    preprocess:
+      gaps:
+        strategy: forward_fill
+        max_gap: 10m
     queries:
       - id: node_cpu_busy_pct
         promql: |

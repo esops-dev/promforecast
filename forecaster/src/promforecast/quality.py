@@ -9,7 +9,10 @@ multiplicatively, computed once per fit per series:
    a band whose width equals the typical actual value scores 0.5; an
    infinitely wide band approaches 0.
 3. ``coverage_score``: the data-coverage fraction itself, clamped to
-   ``[0, 1]``. 1.0 is full coverage of the lookback window.
+   ``[0, 1]``, scaled by ``(1 - imputed_fraction)`` so heavily-imputed
+   series carry a proportional penalty. A fully-covered lookback with no
+   imputation scores 1.0; a fully-covered lookback whose values are all
+   forward-fills scores 0.0.
 
 The product (``mape_score * band_score * coverage_score``) is used so that
 any one weak dimension drags the overall score down: wide-but-accurate, or
@@ -28,6 +31,7 @@ def compute(
     backtest_mape: float | None,
     band_width_relative: float | None,
     coverage: float | None,
+    imputed_fraction: float | None = None,
 ) -> float:
     """Return a quality score in ``[0.0, 1.0]``.
 
@@ -39,11 +43,22 @@ def compute(
             ``None`` or non-finite -> band sub-score 0.
         coverage: Fraction of expected points present during the lookback
             window, in ``[0, 1]``. ``None`` -> coverage sub-score 0.
+        imputed_fraction: Fraction of the coverage that was synthesised by
+            gap imputation (forward-fill / linear interpolation). The
+            coverage sub-score is multiplied by ``(1 - imputed_fraction)``
+            so a series whose "coverage" is entirely fabricated does not
+            quietly inherit a high quality score. ``None`` is treated as
+            ``0`` for backward compatibility with callers that don't run
+            preprocessing.
 
     Returns:
         ``mape_score * band_score * coverage_score`` clamped to ``[0, 1]``.
     """
-    return _mape_score(backtest_mape) * _band_score(band_width_relative) * _coverage_score(coverage)
+    return (
+        _mape_score(backtest_mape)
+        * _band_score(band_width_relative)
+        * _coverage_score(coverage, imputed_fraction)
+    )
 
 
 def _mape_score(mape: float | None) -> float:
@@ -60,7 +75,11 @@ def _band_score(band_width_relative: float | None) -> float:
     return 1.0 / (1.0 + band_width_relative)
 
 
-def _coverage_score(coverage: float | None) -> float:
+def _coverage_score(coverage: float | None, imputed_fraction: float | None) -> float:
     if coverage is None or not math.isfinite(coverage):
         return 0.0
-    return max(0.0, min(1.0, coverage))
+    base = max(0.0, min(1.0, coverage))
+    if imputed_fraction is None or not math.isfinite(imputed_fraction):
+        return base
+    penalty = max(0.0, min(1.0, imputed_fraction))
+    return base * (1.0 - penalty)
