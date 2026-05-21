@@ -507,3 +507,114 @@ groups:
     )
     with pytest.raises(ValidationError):
         config_module.load(path)
+
+
+def test_load_accepts_v1_1_preprocess_block(tmp_path: Path) -> None:
+    """v1.1 adds a per-group preprocess block with gaps/outliers/change_point."""
+    path = _write(
+        tmp_path,
+        """
+apiVersion: promforecast.io/v1
+datasource:
+  url: http://vm:8428/
+groups:
+  - name: g
+    preprocess:
+      gaps:
+        strategy: linear_interp
+        max_gap: 10m
+      outliers:
+        enabled: true
+        method: hampel
+        sensitivity: high
+      change_point:
+        enabled: true
+        method: ruptures
+        action: truncate_lookback
+        min_post_break_points: 100
+    queries:
+      - id: m
+        promql: up
+""",
+    )
+    cfg = config_module.load(path)
+    g = cfg.groups[0]
+    assert g.preprocess.gaps.strategy == "linear_interp"
+    assert g.preprocess.gaps.max_gap == timedelta(minutes=10)
+    assert g.preprocess.outliers.enabled is True
+    assert g.preprocess.outliers.sensitivity == "high"
+    assert g.preprocess.change_point.enabled is True
+    assert g.preprocess.change_point.min_post_break_points == 100
+
+
+def test_load_accepts_v1_1_conformal_block(tmp_path: Path) -> None:
+    """v1.1 adds accuracy.conformal under defaults."""
+    path = _write(
+        tmp_path,
+        """
+apiVersion: promforecast.io/v1
+datasource:
+  url: http://vm:8428/
+defaults:
+  accuracy:
+    conformal:
+      enabled: true
+      method: split
+      holdout_fraction: 0.25
+groups:
+  - name: g
+    queries:
+      - id: m
+        promql: up
+""",
+    )
+    cfg = config_module.load(path)
+    assert cfg.defaults.accuracy.conformal.enabled is True
+    assert cfg.defaults.accuracy.conformal.holdout_fraction == 0.25
+
+
+def test_load_rejects_invalid_conformal_holdout(tmp_path: Path) -> None:
+    """``holdout_fraction`` must be in (0, 1)."""
+    path = _write(
+        tmp_path,
+        """
+apiVersion: promforecast.io/v1
+datasource:
+  url: http://vm:8428/
+defaults:
+  accuracy:
+    conformal:
+      enabled: true
+      holdout_fraction: 1.5
+groups:
+  - name: g
+    queries:
+      - id: m
+        promql: up
+""",
+    )
+    with pytest.raises(ValidationError):
+        config_module.load(path)
+
+
+def test_load_rejects_unknown_outlier_method(tmp_path: Path) -> None:
+    """Outlier method must be one of the Literal choices."""
+    path = _write(
+        tmp_path,
+        """
+apiVersion: promforecast.io/v1
+datasource:
+  url: http://vm:8428/
+groups:
+  - name: g
+    preprocess:
+      outliers:
+        enabled: true
+        method: nonsense
+    queries:
+      - id: m
+        promql: up
+""",
+    )
+    with pytest.raises(ValidationError):
+        config_module.load(path)

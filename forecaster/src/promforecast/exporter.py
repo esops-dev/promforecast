@@ -31,6 +31,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "AccuracyPoint",
+    "CalibrationOffsetPoint",
     "ContributionPoint",
     "DeviationPoint",
     "EnsembleWeightPoint",
@@ -38,6 +39,7 @@ __all__ = [
     "ForecastPoint",
     "GroupSnapshot",
     "InvalidMetricNameError",
+    "PreprocessStats",
     "QualityPoint",
     "validate_metric_name",
 ]
@@ -119,6 +121,47 @@ class EnsembleWeightPoint:
     weight: float
 
 
+@dataclass(frozen=True)
+class CalibrationOffsetPoint:
+    """Additive band correction applied by split-conformal calibration.
+
+    Rendered as ``forecast_band_calibration_offset{id, group, model, level}``
+    (gauge, units: same as the underlying metric). An offset of 0 means the
+    parametric band already covered its nominal level on the calibration
+    hold-out; a positive offset is how much each side of the band was
+    widened. Emitted only when ``accuracy.conformal.enabled`` is true.
+    """
+
+    labels: dict[str, str]
+    offset: float
+
+
+@dataclass
+class PreprocessStats:
+    """Per-(group, query) preprocessing telemetry.
+
+    The runner accumulates one of these per query per run; the exporter
+    folds them into a small set of counters and gauges:
+
+    * ``forecast_input_gaps_filled_total{strategy}`` — per imputation
+      strategy that actually ran.
+    * ``forecast_input_max_gap_seconds`` — largest gap observed in the
+      lookback this run (0 when none).
+    * ``forecast_input_outliers_replaced_total{method}`` — points replaced
+      by the outlier scrubber.
+    * ``forecast_input_change_point_total`` — detected structural breaks.
+    * ``forecast_input_effective_lookback_seconds`` — post-truncation
+      lookback span; equals the full lookback when no change-point was
+      detected or the action was ``reweight_recent``.
+    """
+
+    gaps_filled: dict[str, int] = field(default_factory=dict)
+    max_gap_seconds: float = 0.0
+    outliers_replaced: dict[str, int] = field(default_factory=dict)
+    change_points: int = 0
+    effective_lookback_seconds: float = 0.0
+
+
 @dataclass
 class GroupSnapshot:
     """The most recent successful forecast output for one group."""
@@ -134,7 +177,8 @@ class GroupSnapshot:
     run_duration_seconds: float = 0.0
     series_count: int = 0
     # series_dropped reasons (bounded set):
-    #   per_query_cap, total_cap, min_points, discovery_cap, canary
+    #   per_query_cap, total_cap, min_points, discovery_cap, canary,
+    #   preprocess_drop
     series_dropped: dict[str, int] = field(default_factory=dict)
     # failures reasons (bounded set):
     #   query_error, fit_error, invalid_metric_name, group_error,
@@ -154,6 +198,24 @@ class GroupSnapshot:
     # ``runner.SLOW_FIT_RATIO``). Surfaced as a counter so operators can
     # alert on persistent slowness without losing transient blips.
     slow_fits: dict[tuple[str, str], int] = field(default_factory=dict)
+    # Per-(series, model, level) conformal calibration offsets from the
+    # most recent run. Gauge — only the latest run's samples belong on
+    # /metrics; series that disappear from the config disappear from the
+    # exposition until they reappear.
+    calibration_offsets: list[CalibrationOffsetPoint] = field(default_factory=list)
+    # Per-(query) preprocessing statistics for the most recent run.
+    # Counters (gaps_filled, outliers_replaced, change_points) are merged
+    # with the previous snapshot so the exposed counter never decreases;
+    # gauges (max_gap_seconds, effective_lookback_seconds) reflect only
+    # the most recent observation.
+    preprocess_stats: dict[str, PreprocessStats] = field(default_factory=dict)
+    # Cumulative per-(query, strategy) gap-fill counter. Same monotonic
+    # treatment as slow_fits: merged with previous snapshot at run end.
+    gaps_filled_cumulative: dict[tuple[str, str], int] = field(default_factory=dict)
+    # Cumulative per-(query, method) outlier-replacement counter.
+    outliers_replaced_cumulative: dict[tuple[str, str], int] = field(default_factory=dict)
+    # Cumulative per-(query) change-point detection counter.
+    change_points_cumulative: dict[str, int] = field(default_factory=dict)
 
 
 class Exporter:
@@ -440,6 +502,8 @@ class _SnapshotCollector:
         yield from _quality_families(groups)
         yield from _ensemble_families(groups)
         yield from _contribution_families(groups)
+        yield from _calibration_families(groups)
+        yield from _preprocess_families(groups)
         yield from _operational_families(groups)
         yield from _reload_families(reload_state)
         yield from _config_hash_families(config_hash)
@@ -661,7 +725,7 @@ def _operational_families(
     dropped = CounterMetricFamily(
         "forecast_series_dropped",
         "Series dropped before forecasting, by reason "
-        "(per_query_cap | total_cap | min_points | discovery_cap | canary).",
+        "(per_query_cap | total_cap | min_points | discovery_cap | canary | preprocess_drop).",
         labels=["group", "reason"],
     )
     failures = CounterMetricFamily(
@@ -944,3 +1008,131 @@ def _season_length_families(
     for (group, query, source), count in state.items():
         counter.add_metric([group, query, source], float(count))
     yield counter
+
+
+def _calibration_families(
+    groups: list[GroupSnapshot],
+) -> Iterator[GaugeMetricFamily]:
+    """Render ``forecast_band_calibration_offset`` gauges.
+
+    Emitted only when at least one series has a non-empty offset list — a
+    deployment with ``accuracy.conformal.enabled: false`` everywhere
+    produces no samples and the family is omitted entirely so /metrics
+    stays quiet.
+    """
+    points = [p for snap in groups for p in snap.calibration_offsets]
+    yield from _emit_gauge_family(
+        points,
+        "forecast_band_calibration_offset",
+        "Additive correction applied to the forecast band by split-conformal "
+        "calibration. Positive values widen each side of the parametric band; "
+        "0 means the band already empirically covered its nominal level.",
+        value_fn=lambda p: p.offset,
+        skip_fn=lambda p: not math.isfinite(p.offset),
+    )
+
+
+def _preprocess_families(
+    groups: list[GroupSnapshot],
+) -> Iterator[GaugeMetricFamily | CounterMetricFamily]:
+    """Render the v1.1 preprocessing telemetry families.
+
+    Emits five families:
+
+    * ``forecast_input_gaps_filled_total{group, query, strategy}``
+    * ``forecast_input_max_gap_seconds{group, query}``
+    * ``forecast_input_outliers_replaced_total{group, query, method}``
+    * ``forecast_input_change_point_total{group, query}``
+    * ``forecast_input_effective_lookback_seconds{group, query}``
+
+    Each is emitted only when at least one group has produced data for it
+    so /metrics doesn't carry empty families when preprocessing is off
+    everywhere.
+    """
+    yield from _gaps_filled_family(groups)
+    yield from _max_gap_family(groups)
+    yield from _outliers_family(groups)
+    yield from _change_points_family(groups)
+    yield from _effective_lookback_family(groups)
+
+
+def _gaps_filled_family(groups: list[GroupSnapshot]) -> Iterator[CounterMetricFamily]:
+    family = CounterMetricFamily(
+        "forecast_input_gaps_filled",
+        "Lookback samples imputed before fitting, by strategy "
+        "(forward_fill | linear_interp | nan).",
+        labels=["group", "query", "strategy"],
+    )
+    have = False
+    for snap in groups:
+        for (query_id, strategy), count in snap.gaps_filled_cumulative.items():
+            family.add_metric([snap.group, query_id, strategy], float(count))
+            have = True
+    if have:
+        yield family
+
+
+def _max_gap_family(groups: list[GroupSnapshot]) -> Iterator[GaugeMetricFamily]:
+    family = GaugeMetricFamily(
+        "forecast_input_max_gap_seconds",
+        "Largest gap observed in the lookback for the (group, query) tuple "
+        "in the most recent run. 0 when no gaps were detected.",
+        labels=["group", "query"],
+    )
+    have = False
+    for snap in groups:
+        for query_id, stats in snap.preprocess_stats.items():
+            family.add_metric([snap.group, query_id], float(stats.max_gap_seconds))
+            have = True
+    if have:
+        yield family
+
+
+def _outliers_family(groups: list[GroupSnapshot]) -> Iterator[CounterMetricFamily]:
+    family = CounterMetricFamily(
+        "forecast_input_outliers_replaced",
+        "Lookback samples replaced by the outlier scrubber, by detector method "
+        "(hampel | iqr | stl_residual).",
+        labels=["group", "query", "method"],
+    )
+    have = False
+    for snap in groups:
+        for (query_id, method), count in snap.outliers_replaced_cumulative.items():
+            family.add_metric([snap.group, query_id, method], float(count))
+            have = True
+    if have:
+        yield family
+
+
+def _change_points_family(groups: list[GroupSnapshot]) -> Iterator[CounterMetricFamily]:
+    family = CounterMetricFamily(
+        "forecast_input_change_point",
+        "Number of structural breaks detected in the lookback for the "
+        "(group, query) tuple. Driven by preprocess.change_point.",
+        labels=["group", "query"],
+    )
+    have = False
+    for snap in groups:
+        for query_id, count in snap.change_points_cumulative.items():
+            family.add_metric([snap.group, query_id], float(count))
+            have = True
+    if have:
+        yield family
+
+
+def _effective_lookback_family(groups: list[GroupSnapshot]) -> Iterator[GaugeMetricFamily]:
+    family = GaugeMetricFamily(
+        "forecast_input_effective_lookback_seconds",
+        "Effective post-truncation lookback window used for the most recent "
+        "fit of the (group, query) tuple. Equal to the configured lookback "
+        "when no truncation happened.",
+        labels=["group", "query"],
+    )
+    have = False
+    for snap in groups:
+        for query_id, stats in snap.preprocess_stats.items():
+            if stats.effective_lookback_seconds > 0:
+                family.add_metric([snap.group, query_id], float(stats.effective_lookback_seconds))
+                have = True
+    if have:
+        yield family

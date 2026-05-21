@@ -21,9 +21,11 @@ from typing import TYPE_CHECKING, Any, Literal
 
 import structlog
 
+from . import conformal as conformal_mod
 from . import contribution as contribution_mod
 from . import discovery as discovery_mod
 from . import models as model_registry
+from . import preprocess as preprocess_mod
 from . import regressors as regressors_mod
 from . import seasonality as seasonality_mod
 from . import telemetry as telemetry_mod
@@ -44,6 +46,7 @@ from .config import (
 )
 from .exporter import (
     AccuracyPoint,
+    CalibrationOffsetPoint,
     ContributionPoint,
     DeviationPoint,
     EnsembleWeightPoint,
@@ -51,6 +54,7 @@ from .exporter import (
     ForecastPoint,
     GroupSnapshot,
     InvalidMetricNameError,
+    PreprocessStats,
     QualityPoint,
     validate_metric_name,
 )
@@ -103,6 +107,12 @@ class _FitResult:
     # this series. Aggregated to (query_id, regressor_id, reason) on the
     # run context.
     regressor_failures: list[tuple[str, str]] = field(default_factory=list)
+    # Per-(model, level) conformal calibration offset for this series.
+    # Aggregated into ``calibration_offsets`` on the run context.
+    calibration_offsets: list[CalibrationOffsetPoint] = field(default_factory=list)
+    # Imputed-fraction reported by preprocessing; threaded into the quality
+    # score so heavily-imputed series score lower on the coverage dimension.
+    imputed_fraction: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -183,6 +193,17 @@ class _RunContext:
     # (query_id, regressor_id, reason). Merged with the previous snapshot
     # in ``run_group`` so the counter stays monotonic across runs.
     regressor_failures: dict[tuple[str, str, str], int] = field(default_factory=dict)
+    # Per-series conformal calibration offsets accumulated this run.
+    calibration_offsets: list[CalibrationOffsetPoint] = field(default_factory=list)
+    # Per-query preprocessing statistics for the most recent run.
+    preprocess_stats: dict[str, PreprocessStats] = field(default_factory=dict)
+    # Per-(query, strategy) gap-fill count for this run; merged with the
+    # previous snapshot so the counter stays monotonic.
+    gaps_filled: dict[tuple[str, str], int] = field(default_factory=dict)
+    # Per-(query, method) outlier replacement count for this run.
+    outliers_replaced: dict[tuple[str, str], int] = field(default_factory=dict)
+    # Per-query change-point detection count for this run.
+    change_points: dict[str, int] = field(default_factory=dict)
 
 
 def _compute_global_budgets(groups: list[GroupConfig], max_total_series: int) -> dict[str, int]:
@@ -544,6 +565,41 @@ class Runner:
             )
             for rkey, rcount in ctx.regressor_failures.items():
                 merged_regressor_failures[rkey] = merged_regressor_failures.get(rkey, 0) + rcount
+            # Same monotonic merge for the preprocessing counters, pruned
+            # to query IDs that still exist in the live group config.
+            merged_gaps: dict[tuple[str, str], int] = (
+                {
+                    key: count
+                    for key, count in previous_snapshot.gaps_filled_cumulative.items()
+                    if key[0] in current_query_ids
+                }
+                if previous_snapshot is not None
+                else {}
+            )
+            for gkey, gcount in ctx.gaps_filled.items():
+                merged_gaps[gkey] = merged_gaps.get(gkey, 0) + gcount
+            merged_outliers: dict[tuple[str, str], int] = (
+                {
+                    key: count
+                    for key, count in previous_snapshot.outliers_replaced_cumulative.items()
+                    if key[0] in current_query_ids
+                }
+                if previous_snapshot is not None
+                else {}
+            )
+            for okey, ocount in ctx.outliers_replaced.items():
+                merged_outliers[okey] = merged_outliers.get(okey, 0) + ocount
+            merged_changepoints: dict[str, int] = (
+                {
+                    key: count
+                    for key, count in previous_snapshot.change_points_cumulative.items()
+                    if key in current_query_ids
+                }
+                if previous_snapshot is not None
+                else {}
+            )
+            for cpkey, cpcount in ctx.change_points.items():
+                merged_changepoints[cpkey] = merged_changepoints.get(cpkey, 0) + cpcount
             self._exporter.update(
                 GroupSnapshot(
                     group=group.name,
@@ -564,6 +620,11 @@ class Runner:
                     # from the exposition until they reappear in config.
                     fit_durations=ctx.fit_durations,
                     slow_fits=merged_slow,
+                    calibration_offsets=ctx.calibration_offsets,
+                    preprocess_stats=ctx.preprocess_stats,
+                    gaps_filled_cumulative=merged_gaps,
+                    outliers_replaced_cumulative=merged_outliers,
+                    change_points_cumulative=merged_changepoints,
                 )
             )
             log.info(
@@ -707,11 +768,46 @@ class Runner:
             ctx.regressor_failures[rkey] = ctx.regressor_failures.get(rkey, 0) + 1
 
         min_points = self._config.defaults.min_points
+        eff_step = effective_step(query, self._config.defaults)
+        query_stats = ctx.preprocess_stats.setdefault(query.id, PreprocessStats())
         for frame in allowed:
-            if len(frame.values) < min_points:
+            cleaned = preprocess_mod.preprocess_series(
+                timestamps=list(frame.timestamps),
+                values=list(frame.values),
+                step=eff_step,
+                config=group.preprocess,
+            )
+            if cleaned.dropped:
+                ctx.dropped["preprocess_drop"] = ctx.dropped.get("preprocess_drop", 0) + 1
+                # Still record the largest gap so operators see what got
+                # dropped without scraping logs.
+                query_stats.max_gap_seconds = max(
+                    query_stats.max_gap_seconds, cleaned.max_gap_seconds
+                )
+                continue
+            self._merge_preprocess_stats(
+                ctx=ctx,
+                query_id=query.id,
+                cleaned=cleaned,
+                outlier_method=group.preprocess.outliers.method,
+            )
+            if len(cleaned.values) < min_points:
                 ctx.dropped["min_points"] = ctx.dropped.get("min_points", 0) + 1
                 continue
-            stop_query = await self._run_one_series(query, group, frame, ctx, qlog, prefetch)
+            preprocessed_frame = SeriesFrame(
+                labels=frame.labels,
+                timestamps=cleaned.timestamps,
+                values=cleaned.values,
+            )
+            stop_query = await self._run_one_series(
+                query,
+                group,
+                preprocessed_frame,
+                ctx,
+                qlog,
+                prefetch,
+                imputed_fraction=cleaned.imputed_fraction,
+            )
             if stop_query:
                 return
 
@@ -738,6 +834,44 @@ class Runner:
             query_timeout_seconds=self._config.safety.query_timeout.total_seconds(),
         )
 
+    def _merge_preprocess_stats(
+        self,
+        *,
+        ctx: _RunContext,
+        query_id: str,
+        cleaned: preprocess_mod.PreprocessResult,
+        outlier_method: str,
+    ) -> None:
+        """Fold one series' preprocessing stats into the run context.
+
+        Counters (gaps, outliers, change-points) accumulate across the
+        series of one query; gauges (max gap, effective lookback) keep
+        the largest / most recent value seen this run so the exposed
+        per-(group, query) sample matches what at least one series
+        actually went through. ``outlier_method`` is read off the group's
+        config so the per-method counter label matches the YAML the
+        operator wrote.
+        """
+        stats = ctx.preprocess_stats.setdefault(query_id, PreprocessStats())
+        for strategy, count in cleaned.gaps_filled.items():
+            stats.gaps_filled[strategy] = stats.gaps_filled.get(strategy, 0) + count
+            key = (query_id, strategy)
+            ctx.gaps_filled[key] = ctx.gaps_filled.get(key, 0) + count
+        stats.max_gap_seconds = max(stats.max_gap_seconds, cleaned.max_gap_seconds)
+        if cleaned.outliers_replaced:
+            stats.outliers_replaced[outlier_method] = (
+                stats.outliers_replaced.get(outlier_method, 0) + cleaned.outliers_replaced
+            )
+            okey = (query_id, outlier_method)
+            ctx.outliers_replaced[okey] = (
+                ctx.outliers_replaced.get(okey, 0) + cleaned.outliers_replaced
+            )
+        if cleaned.change_points:
+            stats.change_points += cleaned.change_points
+            ctx.change_points[query_id] = ctx.change_points.get(query_id, 0) + cleaned.change_points
+        if cleaned.effective_lookback_seconds > 0:
+            stats.effective_lookback_seconds = cleaned.effective_lookback_seconds
+
     async def _run_one_series(
         self,
         query: QueryConfig,
@@ -746,6 +880,7 @@ class Runner:
         ctx: _RunContext,
         qlog: structlog.stdlib.BoundLogger,
         prefetch: regressors_mod.PromQLPrefetch,
+        imputed_fraction: float = 0.0,
     ) -> bool:
         """Fit one series and merge its results into ``ctx``.
 
@@ -756,7 +891,9 @@ class Runner:
         loop.
         """
         try:
-            fit_result = await self._fit_series(query, frame, group.name, prefetch)
+            fit_result = await self._fit_series(
+                query, frame, group, prefetch, imputed_fraction=imputed_fraction
+            )
         except InvalidMetricNameError:
             qlog.exception("invalid_metric_name")
             ctx.failures["invalid_metric_name"] = ctx.failures.get("invalid_metric_name", 0) + 1
@@ -917,12 +1054,14 @@ class Runner:
         self,
         query: QueryConfig,
         frame: SeriesFrame,
-        group_name: str,
+        group: GroupConfig,
         prefetch: regressors_mod.PromQLPrefetch,
+        imputed_fraction: float = 0.0,
     ) -> _FitResult:
         import pandas as pd  # noqa: PLC0415
 
         d = self._config.defaults
+        group_name = group.name
         validate_metric_name(query.id)
 
         df = pd.DataFrame(
@@ -1031,6 +1170,21 @@ class Runner:
                 regressors=regressors_frame,
             )
 
+        result.imputed_fraction = imputed_fraction
+        if d.accuracy.conformal.enabled and forecast_points:
+            forecast_points = await self._apply_conformal_calibration(
+                df=df,
+                forecast_points=forecast_points,
+                model_specs=model_specs,
+                freq=freq,
+                levels=levels,
+                season_length=eff_season_length,
+                regressors=regressors_frame,
+                holdout_fraction=d.accuracy.conformal.holdout_fraction,
+                result=result,
+                factory=factory,
+            )
+
         result.points = forecast_points
 
         if needs.accuracy and backtest_results:
@@ -1055,7 +1209,13 @@ class Runner:
             )
             coverage = min(1.0, len(frame.values) / float(expected_points))
             result.quality = list(
-                factory.quality_points(backtests, emitted_models, frame.values, coverage)
+                factory.quality_points(
+                    backtests,
+                    emitted_models,
+                    frame.values,
+                    coverage,
+                    imputed_fraction=imputed_fraction,
+                )
             )
 
         if d.emission.contribution and regressors_frame is not None:
@@ -1514,6 +1674,154 @@ class Runner:
             )
         return results
 
+    async def _apply_conformal_calibration(
+        self,
+        *,
+        df: pd.DataFrame,
+        forecast_points: list[ForecastPoint],
+        model_specs: list[ModelSpec],
+        freq: str,
+        levels: list[int],
+        season_length: int,
+        regressors: pd.DataFrame | None,
+        holdout_fraction: float,
+        result: _FitResult,
+        factory: SeriesPointFactory,
+    ) -> list[ForecastPoint]:
+        """Compute and apply conformal offsets to /metrics and curve points.
+
+        Runs an extra fit on the configured holdout tail, computes per-level
+        offsets from the absolute residuals, and applies them to both the
+        snapshot ``forecast_points`` (consumed by /metrics) and to
+        ``result.curve`` (consumed by the remote_write sink) so a deployment
+        that pushes the full forecast curve to a TSDB sees the same
+        calibrated bands the scrape exposition serves.
+
+        The offsets per (series, model, level) are emitted as
+        ``forecast_band_calibration_offset`` samples on ``result.calibration_offsets``.
+        Failures inside :meth:`_compute_conformal_offsets` are isolated per
+        model — the forecast still emits, just without the band correction.
+        """
+        offsets_by_model = await self._compute_conformal_offsets(
+            df=df,
+            forecast_points=forecast_points,
+            model_specs=model_specs,
+            freq=freq,
+            levels=levels,
+            season_length=season_length,
+            regressors=regressors,
+            holdout_fraction=holdout_fraction,
+        )
+        if not offsets_by_model:
+            return forecast_points
+        adjusted_points = _apply_offsets_to_snapshot_points(forecast_points, offsets_by_model)
+        if result.curve:
+            result.curve = _apply_offsets_to_curve_points(result.curve, offsets_by_model)
+        for model_name, offsets in offsets_by_model.items():
+            result.calibration_offsets.extend(
+                factory.calibration_offset_points(model_name, offsets)
+            )
+        return adjusted_points
+
+    async def _compute_conformal_offsets(
+        self,
+        *,
+        df: pd.DataFrame,
+        forecast_points: list[ForecastPoint],
+        model_specs: list[ModelSpec],
+        freq: str,
+        levels: list[int],
+        season_length: int,
+        regressors: pd.DataFrame | None,
+        holdout_fraction: float,
+    ) -> dict[str, dict[int, float]]:
+        """For every emitted model, compute per-level conformal offsets.
+
+        The calibration fit is a single extra model fit per series per
+        emitted model, on the pre-holdout prefix; cost-wise that's the
+        same order as one extra backtest. Failures (degenerate holdout,
+        fit timeout, model error) are isolated to the affected model: the
+        forecast emission still happens, just without the calibration
+        correction.
+        """
+        # Which models actually have emitted forecast rows this run? In
+        # auto-select mode that's the winner only; in explicit mode it's
+        # every configured model; in ensemble mode it's every component
+        # plus a synthetic "ensemble" row. We skip the synthetic ensemble
+        # row because it has no underlying fit_predict to recalibrate
+        # against on the holdout.
+        emitted_models: set[str] = {
+            p.labels.get("model", "") for p in forecast_points if p.metric.endswith("_forecast")
+        }
+        emitted_models.discard("")
+        emitted_models.discard("ensemble")
+        if not emitted_models:
+            return {}
+        split = conformal_mod.holdout_split(df, holdout_fraction=holdout_fraction)
+        if split is None:
+            return {}
+        train_df, calib_df = split
+        train_regressors: pd.DataFrame | None
+        if regressors is not None and len(regressors) >= len(train_df):
+            train_regressors = regressors.iloc[: len(train_df)].reset_index(drop=True)
+        else:
+            train_regressors = None
+        calib_actuals = calib_df["y"].to_numpy(dtype=float)
+        calib_steps = len(calib_df)
+        # Two points is the bare statistical floor for a quantile estimate
+        # — anything smaller is just noise. The split itself already caps
+        # us below at 5 via ``holdout_split``'s ``min_holdout``, but this
+        # is the second-line guard for callers that bypass the split helper.
+        min_calib_for_quantile = 2
+        if calib_steps < min_calib_for_quantile:
+            return {}
+
+        spec_by_name = {spec.name: spec for spec in model_specs}
+        results: dict[str, dict[int, float]] = {}
+        for model_name in sorted(emitted_models):
+            spec = spec_by_name.get(model_name) or ModelSpec(name=model_name)
+            try:
+                calib_predictions = await self._fit_one(
+                    spec=spec,
+                    df=train_df,
+                    horizon=calib_steps,
+                    freq=freq,
+                    levels=levels,
+                    season_length=season_length,
+                    regressors=train_regressors,
+                )
+            except TimeoutError:
+                # Hit ``safety.fit_timeout`` — distinct from a generic
+                # fit error so logs split "calibration too slow" from
+                # "calibration model crashed". The forecast still emits
+                # without calibration; the missing
+                # ``forecast_band_calibration_offset`` sample is the
+                # operator-facing signal that calibration didn't run.
+                logger.warning(
+                    "conformal_calibration_timeout",
+                    model=model_name,
+                    timeout_s=self._config.safety.fit_timeout.total_seconds(),
+                )
+                continue
+            except Exception as exc:
+                # Asyncio CancelledError is intentionally *not* caught
+                # (Exception does not include it in Python 3.8+) so a
+                # shutdown / drain still tears down cleanly.
+                logger.warning(
+                    "conformal_calibration_fit_failed",
+                    model=model_name,
+                    error=str(exc),
+                )
+                continue
+            calib = conformal_mod.compute_offsets(
+                calib_actuals=calib_actuals,
+                calib_predictions=calib_predictions,
+                levels=levels,
+            )
+            if calib.offsets:
+                results[model_name] = calib.offsets
+        return results
+
     async def _fit_one(
         self,
         *,
@@ -1595,6 +1903,103 @@ def _run_fit(
     )
 
 
+# Conformal calibration is applied symmetrically to both the snapshot
+# ``ForecastPoint`` list (consumed by /metrics) and the
+# ``ForecastCurvePoint`` list (consumed by the remote_write sink). The two
+# carry the same (metric, labels, value) shape but ``ForecastCurvePoint``
+# also has a ``timestamp_ms`` field. The decision logic — "if this is a
+# lower/upper row for a calibrated (model, level), widen and label it" —
+# is shared via :func:`_calibrated_band_value`; the per-type list rebuild
+# lives in the two thin wrappers so each wrapper is straight-line code
+# without a constructor callback.
+
+
+def _calibrated_band_value(
+    metric: str,
+    labels: dict[str, str],
+    value: float,
+    offsets_by_model: dict[str, dict[int, float]],
+) -> tuple[float, bool] | None:
+    """Return ``(new_value, calibrated)`` if the point is a calibratable band, else ``None``.
+
+    ``None`` means "leave the point alone". ``(value, False)`` means the
+    offset is zero/missing for this (model, level), so the band is left as
+    the model emitted it; ``(value, True)`` means we widened and the
+    caller should add a ``calibrated="true"`` label. The yhat row (metric
+    exactly ending in ``_forecast``) is always returned as ``None`` —
+    calibration is a band adjustment, not a point-forecast adjustment.
+    """
+    model_name = labels.get("model", "")
+    offsets = offsets_by_model.get(model_name)
+    if offsets is None or metric.endswith("_forecast"):
+        return None
+    try:
+        level = int(labels.get("level", ""))
+    except ValueError:
+        return None
+    offset = offsets.get(level)
+    if offset is None or offset <= 0:
+        return None
+    if metric.endswith("_forecast_lower"):
+        return value - offset, True
+    if metric.endswith("_forecast_upper"):
+        return value + offset, True
+    return None
+
+
+def _apply_offsets_to_snapshot_points(
+    points: list[ForecastPoint],
+    offsets_by_model: dict[str, dict[int, float]],
+) -> list[ForecastPoint]:
+    """Widen ``ForecastPoint`` bands by the per-(model, level) offset.
+
+    Returns a freshly constructed list; the input list is not mutated.
+    """
+    if not offsets_by_model:
+        return points
+    out: list[ForecastPoint] = []
+    for point in points:
+        adjusted = _calibrated_band_value(point.metric, point.labels, point.value, offsets_by_model)
+        if adjusted is None:
+            out.append(point)
+            continue
+        new_value, calibrated = adjusted
+        new_labels = {**point.labels, "calibrated": "true"} if calibrated else point.labels
+        out.append(ForecastPoint(metric=point.metric, labels=new_labels, value=new_value))
+    return out
+
+
+def _apply_offsets_to_curve_points(
+    points: list[ForecastCurvePoint],
+    offsets_by_model: dict[str, dict[int, float]],
+) -> list[ForecastCurvePoint]:
+    """Widen ``ForecastCurvePoint`` bands by the per-(model, level) offset.
+
+    Returns a freshly constructed list; the input list is not mutated.
+    Carries the original ``timestamp_ms`` through unchanged — calibration
+    shifts the band level, not when the forecast is for.
+    """
+    if not offsets_by_model:
+        return points
+    out: list[ForecastCurvePoint] = []
+    for point in points:
+        adjusted = _calibrated_band_value(point.metric, point.labels, point.value, offsets_by_model)
+        if adjusted is None:
+            out.append(point)
+            continue
+        new_value, calibrated = adjusted
+        new_labels = {**point.labels, "calibrated": "true"} if calibrated else point.labels
+        out.append(
+            ForecastCurvePoint(
+                metric=point.metric,
+                labels=new_labels,
+                value=new_value,
+                timestamp_ms=point.timestamp_ms,
+            )
+        )
+    return out
+
+
 def _merge_fit_into_ctx(ctx: _RunContext, fit_result: _FitResult, query_id: str) -> None:
     """Splice a ``_FitResult`` into the per-group ``_RunContext``.
 
@@ -1608,6 +2013,7 @@ def _merge_fit_into_ctx(ctx: _RunContext, fit_result: _FitResult, query_id: str)
     ctx.ensemble_weight_points.extend(fit_result.ensemble)
     ctx.contribution_points.extend(fit_result.contribution)
     ctx.curve_points.extend(fit_result.curve)
+    ctx.calibration_offsets.extend(fit_result.calibration_offsets)
     for model_name, fit_seconds in fit_result.fit_durations.items():
         ctx.fit_durations[(query_id, model_name)] = fit_seconds
     for model_name in fit_result.slow_fits:

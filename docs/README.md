@@ -15,6 +15,9 @@ The docs follow the [Diataxis](https://diataxis.fr/) framework:
 - [High availability](ha.md) — Lease-based leader election, Redis snapshot cache
 - [Query cache](cache.md) — in-memory LRU + optional Redis dedup for overlapping PromQL
 - [Series discovery](discovery.md) — template-driven auto-fan-out over label values
+- [Preprocessing](preprocessing.md) — gap imputation and outlier scrubbing
+- [Change-points](change-points.md) — input-side break detection and lookback adaptation
+- [Conformal calibration](conformal.md) — empirical-coverage band correction
 - [Development](development.md) — local toolchain, CI overview, adding models
 
 For a copy-and-edit reference deployment (multi-group config, HA values,

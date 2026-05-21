@@ -134,13 +134,13 @@ async def test_run_group_full_snapshot_with_canned_fit(monkeypatch: pytest.Monke
     exporter = Exporter()
     runner = Runner(config=cfg, source=source, exporter=exporter)
 
-    async def _canned(self, query, frame, group_name, prefetch):  # type: ignore[no-untyped-def]
+    async def _canned(self, query, frame, group, prefetch, imputed_fraction=0.0):  # type: ignore[no-untyped-def]
         from promforecast.runner import _FitResult  # noqa: PLC0415
 
         points = [
             ForecastPoint(
                 metric="m_forecast",
-                labels={**frame.labels, "group": group_name, "model": "Fake"},
+                labels={**frame.labels, "group": group.name, "model": "Fake"},
                 value=42.0,
             )
         ]
