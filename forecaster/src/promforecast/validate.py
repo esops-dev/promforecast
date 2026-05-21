@@ -58,6 +58,8 @@ class CardinalityEstimate:
     contribution_lines: int
     calibration_lines: int
     preprocess_lines: int
+    threshold_eta_lines: int
+    growth_rate_lines: int
     operational_lines: int
 
     @property
@@ -70,6 +72,8 @@ class CardinalityEstimate:
             + self.contribution_lines
             + self.calibration_lines
             + self.preprocess_lines
+            + self.threshold_eta_lines
+            + self.growth_rate_lines
             + self.operational_lines
         )
 
@@ -123,6 +127,8 @@ def run_validate(
     write(f"  contribution lines {estimate.contribution_lines:>8}")
     write(f"  calibration lines  {estimate.calibration_lines:>8}")
     write(f"  preprocess lines   {estimate.preprocess_lines:>8}")
+    write(f"  threshold ETA      {estimate.threshold_eta_lines:>8}")
+    write(f"  growth rate lines  {estimate.growth_rate_lines:>8}")
     write(f"  operational lines  {estimate.operational_lines:>8}")
     write(f"  total              {estimate.total:>8}")
     if cfg.safety.max_total_series and estimate.total > cfg.safety.max_total_series:
@@ -144,7 +150,7 @@ def run_validate(
     return rc
 
 
-def _estimate_cardinality(cfg: Config) -> CardinalityEstimate:
+def _estimate_cardinality(cfg: Config) -> CardinalityEstimate:  # noqa: PLR0912
     """Worst-case forecast/accuracy/deviation/quality/operational line counts.
 
     Lower-bounding (e.g. accounting for ``min_points`` drops) would require
@@ -208,6 +214,29 @@ def _estimate_cardinality(cfg: Config) -> CardinalityEstimate:
     calibration_lines = 0
     if cfg.defaults.accuracy.conformal.enabled:
         calibration_lines = queries * series_cap * emitted_models * n_levels
+
+    # Time-to-threshold ETAs: per (series, model, threshold) plus a per-level
+    # band ETA for each threshold. Counted only against queries that
+    # actually configure thresholds — most don't.
+    threshold_eta_lines = 0
+    for group in cfg.groups:
+        for q in group.queries:
+            if not q.thresholds:
+                continue
+            per_threshold_emissions = 1 + n_levels  # point + per-level band
+            threshold_eta_lines += (
+                series_cap * emitted_models * len(q.thresholds) * per_threshold_emissions
+            )
+
+    # Growth-rate: per (series, model, window) gauge. Counted only against
+    # queries that opt into ``emission.growth_rate.enabled: true``.
+    growth_rate_lines = 0
+    for group in cfg.groups:
+        for q in group.queries:
+            if not q.emission.growth_rate.enabled:
+                continue
+            n_windows = max(1, len(q.emission.growth_rate.windows))
+            growth_rate_lines += series_cap * emitted_models * n_windows
     # Preprocessing emits per-(group, query) telemetry. The label sets
     # are all bounded:
     #   * max_gap_seconds         : 1 line per query
@@ -246,6 +275,8 @@ def _estimate_cardinality(cfg: Config) -> CardinalityEstimate:
         contribution_lines=contribution_lines,
         calibration_lines=calibration_lines,
         preprocess_lines=preprocess_lines,
+        threshold_eta_lines=threshold_eta_lines,
+        growth_rate_lines=growth_rate_lines,
         operational_lines=operational_lines,
     )
 

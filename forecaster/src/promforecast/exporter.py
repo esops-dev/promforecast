@@ -38,9 +38,11 @@ __all__ = [
     "Exporter",
     "ForecastPoint",
     "GroupSnapshot",
+    "GrowthRatePoint",
     "InvalidMetricNameError",
     "PreprocessStats",
     "QualityPoint",
+    "ThresholdEtaPoint",
     "validate_metric_name",
 ]
 
@@ -122,6 +124,37 @@ class EnsembleWeightPoint:
 
 
 @dataclass(frozen=True)
+class ThresholdEtaPoint:
+    """One ``<id>_forecast_time_to_threshold_seconds`` sample.
+
+    The metric name is per-id (mirrors the forecast point family) so it
+    can be discovered/aggregated alongside the underlying forecast.
+    ``seconds`` carries the ETA value; NaN is preserved through the
+    exporter and dropped at render time so dashboards/alerts don't see
+    sentinel rows.
+    """
+
+    metric: str
+    labels: dict[str, str]
+    seconds: float
+
+
+@dataclass(frozen=True)
+class GrowthRatePoint:
+    """One ``<id>_forecast_growth_rate`` sample.
+
+    The metric name is per-id (mirrors the forecast point family).
+    ``value`` is the slope in the configured units; ``labels`` carry
+    ``window`` (e.g. ``"1d"``) and ``units``
+    (``units_per_second``/``percent``).
+    """
+
+    metric: str
+    labels: dict[str, str]
+    value: float
+
+
+@dataclass(frozen=True)
 class CalibrationOffsetPoint:
     """Additive band correction applied by split-conformal calibration.
 
@@ -173,6 +206,13 @@ class GroupSnapshot:
     quality_points: list[QualityPoint] = field(default_factory=list)
     ensemble_weights: list[EnsembleWeightPoint] = field(default_factory=list)
     contribution_points: list[ContributionPoint] = field(default_factory=list)
+    # v1.2 capacity-planning families: per-(series, model, threshold[, level])
+    # ETAs and per-(series, model, window) growth-rate gauges. Both are
+    # snapshot-style — only the most recent run's samples belong on
+    # /metrics; queries that disappear from the config disappear from the
+    # exposition until they reappear.
+    threshold_etas: list[ThresholdEtaPoint] = field(default_factory=list)
+    growth_rates: list[GrowthRatePoint] = field(default_factory=list)
     last_run_timestamp: float = 0.0
     run_duration_seconds: float = 0.0
     series_count: int = 0
@@ -502,6 +542,8 @@ class _SnapshotCollector:
         yield from _quality_families(groups)
         yield from _ensemble_families(groups)
         yield from _contribution_families(groups)
+        yield from _threshold_eta_families(groups)
+        yield from _growth_rate_families(groups)
         yield from _calibration_families(groups)
         yield from _preprocess_families(groups)
         yield from _operational_families(groups)
@@ -687,6 +729,59 @@ def _contribution_families(
             metric_name,
             "Per-regressor explainability share for the forecast in [0, 1]; "
             "ratios across regressors of a series sum to 1 when finite.",
+            value_fn=lambda p: p.value,
+            skip_fn=lambda p: not math.isfinite(p.value),
+        )
+
+
+def _threshold_eta_families(
+    groups: list[GroupSnapshot],
+) -> Iterator[GaugeMetricFamily]:
+    """Render ``<id>_forecast_time_to_threshold_seconds`` gauges, one family per id.
+
+    The metric name is per-id (mirrors the forecast family) so the ETA can
+    be discovered alongside the underlying forecast in Grafana. NaN ETAs
+    (no crossing within the horizon) are dropped at render time — alerts
+    on ``time_to_threshold_seconds < 3600`` are the typical use case and
+    NaN samples would silently break them.
+    """
+    by_metric: dict[str, list[ThresholdEtaPoint]] = {}
+    for snap in groups:
+        for point in snap.threshold_etas:
+            by_metric.setdefault(point.metric, []).append(point)
+    for metric_name, points in sorted(by_metric.items()):
+        yield from _emit_gauge_family(
+            points,
+            metric_name,
+            "Seconds from the forecast's start until the first crossing of the "
+            "configured threshold; NaN crossings are not emitted.",
+            value_fn=lambda p: p.seconds,
+            skip_fn=lambda p: not math.isfinite(p.seconds),
+        )
+
+
+def _growth_rate_families(
+    groups: list[GroupSnapshot],
+) -> Iterator[GaugeMetricFamily]:
+    """Render ``<id>_forecast_growth_rate`` gauges, one family per id.
+
+    The metric name is per-id (mirrors the forecast family); the ``units``
+    label distinguishes ``units_per_second`` (the default) from
+    ``percent`` (fractional relative change). NaN growth rates (windows
+    that overflow the horizon, degenerate zero baselines for percent
+    units) are dropped at render time.
+    """
+    by_metric: dict[str, list[GrowthRatePoint]] = {}
+    for snap in groups:
+        for point in snap.growth_rates:
+            by_metric.setdefault(point.metric, []).append(point)
+    for metric_name, points in sorted(by_metric.items()):
+        yield from _emit_gauge_family(
+            points,
+            metric_name,
+            "Forecast growth rate measured as the slope of the forecast curve "
+            "over the window; units (units_per_second | percent) live on the "
+            "label of the same name.",
             value_fn=lambda p: p.value,
             skip_fn=lambda p: not math.isfinite(p.value),
         )

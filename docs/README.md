@@ -18,6 +18,7 @@ The docs follow the [Diataxis](https://diataxis.fr/) framework:
 - [Preprocessing](preprocessing.md) — gap imputation and outlier scrubbing
 - [Change-points](change-points.md) — input-side break detection and lookback adaptation
 - [Conformal calibration](conformal.md) — empirical-coverage band correction
+- [Capacity planning](capacity.md) — damped trend, time-to-threshold ETAs, growth rate
 - [Development](development.md) — local toolchain, CI overview, adding models
 
 For a copy-and-edit reference deployment (multi-group config, HA values,

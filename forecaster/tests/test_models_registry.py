@@ -14,7 +14,9 @@ import pytest
 
 from promforecast import models as model_registry
 from promforecast.models import (
+    AutoARIMADampedModel,
     AutoARIMAModel,
+    AutoETSDampedModel,
     AutoETSModel,
     ModelRegistrationError,
     MSTLModel,
@@ -27,7 +29,9 @@ from promforecast.models import (
     ("name", "expected_class"),
     [
         ("AutoARIMA", AutoARIMAModel),
+        ("AutoARIMADamped", AutoARIMADampedModel),
         ("AutoETS", AutoETSModel),
+        ("AutoETSDamped", AutoETSDampedModel),
         ("MSTL", MSTLModel),
         ("SeasonalNaive", SeasonalNaiveModel),
     ],
@@ -44,7 +48,14 @@ def test_build_unknown_model_raises() -> None:
 
 
 def test_each_model_satisfies_protocol() -> None:
-    for name in ("AutoARIMA", "AutoETS", "MSTL", "SeasonalNaive"):
+    for name in (
+        "AutoARIMA",
+        "AutoARIMADamped",
+        "AutoETS",
+        "AutoETSDamped",
+        "MSTL",
+        "SeasonalNaive",
+    ):
         model = model_registry.build(name, season_length=288)
         assert callable(model.fit_predict)
 
@@ -70,9 +81,19 @@ def test_build_stores_params_for_pass_through_at_fit_time() -> None:
 
 def test_available_lists_builtins() -> None:
     """The discovery surface returns every built-in entry point. Sorted so
-    docs and CLI output stay deterministic."""
-    names = model_registry.available()
-    assert names == ["AutoARIMA", "AutoETS", "MSTL", "SeasonalNaive"]
+    docs and CLI output stay deterministic. Filters to the in-tree built-ins
+    so a third-party plug-in installed alongside (e.g. ``promforecast-prophet``
+    in a developer venv) doesn't make the assertion environment-specific."""
+    builtin_names = {
+        "AutoARIMA",
+        "AutoARIMADamped",
+        "AutoETS",
+        "AutoETSDamped",
+        "MSTL",
+        "SeasonalNaive",
+    }
+    names = set(model_registry.available()) & builtin_names
+    assert names == builtin_names
 
 
 def test_unknown_model_error_lists_alternatives() -> None:

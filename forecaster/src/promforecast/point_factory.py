@@ -28,7 +28,9 @@ from .exporter import (
     DeviationPoint,
     EnsembleWeightPoint,
     ForecastPoint,
+    GrowthRatePoint,
     QualityPoint,
+    ThresholdEtaPoint,
 )
 from .sink import ForecastCurvePoint
 
@@ -38,8 +40,32 @@ if TYPE_CHECKING:
     import pandas as pd
 
     from .accuracy import AccuracyResult
+    from .capacity import GrowthRate, ThresholdEta
     from .contribution import ContributionResult
     from .selector import SelectionResult
+
+
+def _format_window(seconds: float) -> str:
+    """Format a window duration as a stable Prometheus-style label.
+
+    The growth-rate ``window`` label is operator-facing — it appears on
+    every panel and alert tuned against these metrics — so we render it
+    in the same compact form the config accepts (``1d``, ``6h``,
+    ``15m``, ``45s``). We snap to the largest natural unit that divides
+    the value cleanly to match what the operator wrote in YAML; mixed
+    durations (e.g. ``90m``) fall back to seconds so the label is still
+    well-defined.
+    """
+    s = round(seconds)
+    if s <= 0:
+        return "0s"
+    if s % 86_400 == 0:
+        return f"{s // 86_400}d"
+    if s % 3_600 == 0:
+        return f"{s // 3_600}h"
+    if s % 60 == 0:
+        return f"{s // 60}m"
+    return f"{s}s"
 
 
 @dataclass(frozen=True)
@@ -251,6 +277,69 @@ class SeriesPointFactory:
                 metric=metric_name,
                 labels=labels,
                 value=float(contribution.ratio),
+            )
+
+    def threshold_eta_points(
+        self,
+        model_name: str,
+        etas: list[ThresholdEta],
+        selection: SelectionResult | None,
+    ) -> Iterable[ThresholdEtaPoint]:
+        """Yield one ``<id>_forecast_time_to_threshold_seconds`` per ETA.
+
+        ``etas`` carries the per-(threshold, level) ETA computed by
+        :func:`promforecast.capacity.compute_threshold_etas`. The metric
+        name follows the forecast-point convention so dashboards can join
+        on ``id`` between the underlying forecast and its derived ETA.
+        Labels mirror the forecast point family (``model``, ``horizon``,
+        plus optional ``best_model``/``model_fallback``) and add
+        ``name`` + ``comparator`` for the threshold, and ``level`` when
+        the ETA was computed against a band.
+        """
+        if not etas:
+            return
+        common = self._build_common_labels(model_name, selection)
+        metric_name = f"{self._metric_id}_forecast_time_to_threshold_seconds"
+        for eta in etas:
+            labels = {
+                **common,
+                "name": eta.name,
+                "comparator": eta.comparator,
+            }
+            if eta.level is not None:
+                labels["level"] = str(eta.level)
+            yield ThresholdEtaPoint(
+                metric=metric_name,
+                labels=labels,
+                seconds=eta.seconds,
+            )
+
+    def growth_rate_points(
+        self,
+        model_name: str,
+        rates: list[GrowthRate],
+        selection: SelectionResult | None,
+    ) -> Iterable[GrowthRatePoint]:
+        """Yield one ``<id>_forecast_growth_rate`` per configured window.
+
+        Labels carry ``window`` (the configured duration rendered as a
+        Prometheus-style ``<n><unit>`` string so dashboards can group
+        cleanly) and ``units`` (``units_per_second`` / ``percent``).
+        """
+        if not rates:
+            return
+        common = self._build_common_labels(model_name, selection)
+        metric_name = f"{self._metric_id}_forecast_growth_rate"
+        for rate in rates:
+            labels = {
+                **common,
+                "window": _format_window(rate.window_seconds),
+                "units": rate.units,
+            }
+            yield GrowthRatePoint(
+                metric=metric_name,
+                labels=labels,
+                value=rate.rate,
             )
 
     def _build_common_labels(

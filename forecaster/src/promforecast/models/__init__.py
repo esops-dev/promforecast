@@ -29,7 +29,9 @@ from typing import Any
 import structlog
 
 from .auto_arima import AutoARIMAModel
+from .auto_arima_damped import AutoARIMADampedModel
 from .auto_ets import AutoETSModel
+from .auto_ets_damped import AutoETSDampedModel
 from .base import ForecastModel
 from .mstl import MSTLModel
 from .seasonal_naive import SeasonalNaiveModel
@@ -178,7 +180,9 @@ def build(
 
 __all__ = [
     "ENTRY_POINT_GROUP",
+    "AutoARIMADampedModel",
     "AutoARIMAModel",
+    "AutoETSDampedModel",
     "AutoETSModel",
     "ForecastModel",
     "MSTLModel",

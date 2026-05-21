@@ -123,6 +123,72 @@ def test_cardinality_estimate_matches_doc_formula() -> None:
     assert est.deviation_lines == 1 * 100 * 2 * 2 * 2
     # 1 * 100 * 2 emitted = 200.
     assert est.quality_lines == 1 * 100 * 2
+    # Without thresholds / growth-rate emission, the v1.2 families
+    # contribute zero to the estimate.
+    assert est.threshold_eta_lines == 0
+    assert est.growth_rate_lines == 0
+
+
+def test_cardinality_estimate_counts_threshold_and_growth_rate_lines() -> None:
+    """v1.2 ETA + growth-rate families must show up in the cardinality estimate."""
+    from datetime import timedelta  # noqa: PLC0415
+
+    from promforecast.config import (  # noqa: PLC0415
+        AccuracyConfig,
+        Config,
+        DatasourceConfig,
+        DefaultsConfig,
+        EmissionConfig,
+        GroupConfig,
+        GrowthRateEmissionConfig,
+        QueryConfig,
+        QueryEmissionConfig,
+        SafetyConfig,
+        ServerConfig,
+        ThresholdConfig,
+    )
+
+    cfg = Config(
+        datasource=DatasourceConfig(url="http://x"),
+        server=ServerConfig(),
+        safety=SafetyConfig(max_series_per_query=100, max_total_series=0),
+        defaults=DefaultsConfig(
+            models=["AutoARIMA"],
+            confidence_levels=[80, 95],
+            accuracy=AccuracyConfig(
+                evaluate=False,
+                auto_select=False,
+                horizons=[timedelta(hours=1)],
+            ),
+            emission=EmissionConfig(deviation=False, quality=False),
+        ),
+        groups=[
+            GroupConfig(
+                name="g",
+                queries=[
+                    QueryConfig(
+                        id="m",
+                        promql="up",
+                        thresholds=[
+                            ThresholdConfig(name="warn", value=80, comparator="gt"),
+                            ThresholdConfig(name="crit", value=95, comparator="gt"),
+                        ],
+                        emission=QueryEmissionConfig(
+                            growth_rate=GrowthRateEmissionConfig(
+                                enabled=True,
+                                windows=[timedelta(days=1), timedelta(days=7)],
+                            ),
+                        ),
+                    ),
+                ],
+            )
+        ],
+    )
+    est = _estimate_cardinality(cfg)
+    # 100 series * 1 model * 2 thresholds * (1 point + 2 levels) = 600.
+    assert est.threshold_eta_lines == 100 * 1 * 2 * (1 + 2)
+    # 100 series * 1 model * 2 windows = 200.
+    assert est.growth_rate_lines == 100 * 1 * 2
 
 
 def test_validate_dry_run_reports_failure_when_datasource_unreachable(tmp_path: Path) -> None:

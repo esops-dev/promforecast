@@ -13,12 +13,49 @@ External models can be added via the `promforecast.models` entry-point group (se
 
 ## Built-in models
 
-| Model          | Description                                                                 | Best for                                      | Avoid when                                      | Fit time                          |
-|----------------|-----------------------------------------------------------------------------|-----------------------------------------------|-------------------------------------------------|-----------------------------------|
-| **SeasonalNaive** | Repeats the value from `season_length` steps ago. No fitting, no parameters. | Sanity-check baseline or fallback             | Series with trends that cross the seasonal cycle | Negligible                       |
-| **AutoARIMA**  | Automatic ARIMA with trend, seasonality, and noise handling.               | Noisy infrastructure metrics (default choice) | Hundreds of series where speed matters          | Seconds per series (slowest)     |
-| **AutoETS**    | Exponential smoothing with automatic error/trend/seasonality selection.    | Clean, smooth seasonal metrics                | Zero-heavy series, sharp regime changes, heavy tails | Faster than AutoARIMA            |
-| **MSTL**       | Multiple Seasonal-Trend decomposition (LOESS) + trend forecaster on remainder. | Strong, regular seasonality                   | Short series (< 2 full cycles) or no seasonality | Comparable to AutoETS            |
+| Model               | Description                                                                                  | Best for                                      | Avoid when                                      | Fit time                          |
+|---------------------|----------------------------------------------------------------------------------------------|-----------------------------------------------|-------------------------------------------------|-----------------------------------|
+| **SeasonalNaive**   | Repeats the value from `season_length` steps ago. No fitting, no parameters.                 | Sanity-check baseline or fallback             | Series with trends that cross the seasonal cycle | Negligible                       |
+| **AutoARIMA**       | Automatic ARIMA with trend, seasonality, and noise handling.                                | Noisy infrastructure metrics (default choice) | Hundreds of series where speed matters          | Seconds per series (slowest)     |
+| **AutoARIMADamped** | AutoARIMA with a post-fit damped-trend bend.                                                | Capacity metrics over multi-day horizons       | Series with no trend (damping is a no-op)        | Same as AutoARIMA                |
+| **AutoETS**         | Exponential smoothing with automatic error/trend/seasonality selection.                     | Clean, smooth seasonal metrics                | Zero-heavy series, sharp regime changes, heavy tails | Faster than AutoARIMA            |
+| **AutoETSDamped**   | AutoETS with a forced damped additive trend (native ETS damping + post-fit bend).            | Capacity metrics over multi-day horizons       | Series with no trend (damping is a no-op)        | Same as AutoETS                  |
+| **MSTL**            | Multiple Seasonal-Trend decomposition (LOESS) + trend forecaster on remainder.              | Strong, regular seasonality                   | Short series (< 2 full cycles) or no seasonality | Comparable to AutoETS            |
+
+### When to choose damped
+
+**Rule of thumb:** for any forecast horizon longer than one full
+seasonal cycle, prefer the damped variant. A 14-day disk-fill forecast
+based on a daily seasonality (`season_length=288`) is exactly the case
+where linear extrapolation lies — turn on damping.
+
+`damping_parameter` (default `0.98`) controls how aggressively the
+trend is bent. `1.0` is no damping (equivalent to the undamped variant);
+smaller values bend more sharply.
+
+**Side-by-side numbers.** For a forecast that grows linearly at one
+unit per step, applying damping at the listed `phi` gives the following
+extrapolation at horizon `h` (i.e. how many "trend units" the forecast
+has accumulated by then):
+
+| `damping_parameter` | h=1   | h=10  | h=24  | h=144 (12h @ 5m) | h=288 (24h @ 5m) | Asymptote |
+|---------------------|-------|-------|-------|------------------|------------------|-----------|
+| `1.00` (undamped)   | 1.00  | 10.00 | 24.00 | 144.00           | 288.00           | ∞         |
+| `0.99`              | 0.99  | 9.47  | 21.22 | 75.71            | 93.52            | 99        |
+| `0.98`              | 0.98  | 8.96  | 18.83 | 46.33            | 48.85            | 49        |
+| `0.95`              | 0.95  | 7.62  | 13.45 | 18.99            | 19.00            | 19        |
+| `0.90`              | 0.90  | 5.86  | 8.28  | 9.00             | 9.00             | 9         |
+
+Near-term forecasts (h<10) are barely touched; long-horizon
+extrapolations bend toward the asymptote `phi / (1 - phi)`. The default
+of `0.98` keeps a 12h forecast comfortably above 75% of its undamped
+value at h=24 (~78%) but trims a 24h horizon to a fixed ~49 trend units
+— exactly what you want for multi-day disk-fill or memory-growth
+forecasts.
+
+See [`docs/capacity.md`](capacity.md) for the recommended
+`examples/configs/node-capacity.yaml` defaults and a "when to choose
+damped" decision flow.
 
 ## Multi-horizon accuracy
 
