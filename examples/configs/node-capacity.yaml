@@ -1,6 +1,11 @@
 # Forecast node CPU and filesystem usage from cluster-level node-exporter
 # metrics. Drop into the forecaster's config — adjust the datasource URL
 # and any label matchers to suit your environment.
+#
+# Defaults to damped-trend models so multi-day disk-fill forecasts stop
+# pretending growth is unbounded. The single `damping_parameter` knob
+# controls how aggressively the long-horizon trend is bent toward a
+# level; 0.98 keeps near-term forecasts faithful and trims the tail.
 
 apiVersion: promforecast.io/v1
 
@@ -18,7 +23,18 @@ defaults:
   lookback: 14d
   step: 5m
   horizon: 24h
-  models: [AutoARIMA, AutoETS, SeasonalNaive]
+  # Damped variants bend the linear extrapolation toward a level — the
+  # right default for capacity metrics that grow steadily but should not
+  # be assumed to grow forever. SeasonalNaive stays in the model set as
+  # the fallback baseline.
+  models:
+    - name: AutoETSDamped
+      params:
+        damping_parameter: 0.98
+    - name: AutoARIMADamped
+      params:
+        damping_parameter: 0.98
+    - SeasonalNaive
   season_length: 288
   confidence_levels: [80, 95]
   accuracy:
@@ -40,10 +56,36 @@ groups:
       - id: node_cpu_busy_pct
         promql: |
           100 - (avg by (instance) (rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100)
+        # Alert dashboards on "when will CPU saturate" rather than the
+        # absolute forecast value. Per-level band ETAs are emitted
+        # automatically when confidence_levels is non-empty.
+        thresholds:
+          - name: warn
+            value: 80
+            comparator: gt
+          - name: critical
+            value: 95
+            comparator: gt
 
       - id: node_filesystem_avail_bytes
         promql: |
           node_filesystem_avail_bytes{fstype!~"tmpfs|overlay|squashfs"}
+        # Disk fills when ``avail`` crosses below 5% of capacity. The
+        # forecaster doesn't have access to capacity here, so the
+        # threshold is set to an absolute value; tune per fleet, or use
+        # a recording rule to derive a percent-free metric and forecast
+        # that instead.
+        thresholds:
+          - name: critical
+            value: 5368709120   # 5 GiB
+            comparator: lt
+        emission:
+          # Surface "is the rate of free-space loss accelerating?" as a
+          # single panel without a derivative recording rule.
+          growth_rate:
+            enabled: true
+            windows: [1d, 7d]
+            units: units_per_second
 
       - id: node_memory_used_bytes
         promql: |

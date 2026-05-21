@@ -141,3 +141,74 @@ spec:
               The 24h forecast for free space on {{ $labels.instance }}
               ({{ $labels.mountpoint }}) is below zero. Provision capacity
               or clean up.
+
+        # v1.2: alert on the time-to-threshold ETA family directly.
+        # Read against the conservative band (``level="95"``) so the
+        # alert fires for "will hit threshold within N hours at 95%
+        # confidence" rather than just for the central forecast. Tune
+        # the window per metric — disk space deserves more warning than
+        # transient queue depth.
+        - alert: ForecastDiskFillImminent
+          expr: |
+            node_filesystem_avail_bytes_forecast_time_to_threshold_seconds{
+              name="critical", comparator="lt", level="95"
+            } < 6 * 60 * 60
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: "{{ $labels.instance }} disk will hit the floor within 6h (95% band)"
+            description: |
+              The conservative 95% forecast for {{ $labels.instance }}
+              {{ $labels.mountpoint }} reaches the configured
+              ``critical`` floor within 6h. Investigate growth and
+              provision capacity.
+
+        # CPU saturation ETA on the central forecast. Useful as an early
+        # heads-up well before any deviation alert would trigger.
+        - alert: ForecastCPUSaturationApproaching
+          expr: |
+            node_cpu_busy_pct_forecast_time_to_threshold_seconds{
+              name="warn", comparator="gt"
+            }
+            and on (instance) (
+              node_cpu_busy_pct_forecast_time_to_threshold_seconds{
+                name="warn", comparator="gt"
+              } < 4 * 60 * 60
+            )
+          for: 30m
+          labels:
+            severity: info
+          annotations:
+            summary: "{{ $labels.instance }} CPU forecast to cross warn threshold within 4h"
+            description: |
+              The CPU busy-percent forecast for {{ $labels.instance }} is
+              expected to cross the configured ``warn`` threshold within
+              4 hours. Right-size before SLO-impacting saturation.
+
+        # v1.2: growth-rate-change alert. Compares the 1d window slope
+        # against the 7d baseline; magnitudes are kept absolute so the
+        # alert catches sudden *deceleration* of a free-space metric
+        # (i.e. accelerating fill) symmetrically with sudden growth.
+        # ``clamp_min`` guards against divide-by-zero on cold series.
+        - alert: ForecastGrowthRateSpike
+          expr: |
+            abs(node_filesystem_avail_bytes_forecast_growth_rate{window="1d"})
+              /
+            clamp_min(
+              abs(
+                node_filesystem_avail_bytes_forecast_growth_rate{window="7d"} offset 1d
+              ),
+              1
+            )
+              > 3
+          for: 30m
+          labels:
+            severity: warning
+          annotations:
+            summary: "{{ $labels.instance }}{{ $labels.mountpoint }} growth rate has tripled vs last week"
+            description: |
+              The 1-day forecast growth rate for {{ $labels.instance }}
+              ({{ $labels.mountpoint }}) is more than 3x the 7-day
+              baseline. Investigate whether a workload change or leak is
+              driving accelerated consumption.

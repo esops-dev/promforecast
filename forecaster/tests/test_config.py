@@ -618,3 +618,117 @@ groups:
     )
     with pytest.raises(ValidationError):
         config_module.load(path)
+
+
+def test_load_accepts_v1_2_thresholds_and_growth_rate(tmp_path: Path) -> None:
+    """v1.2 adds per-query ``thresholds`` and ``emission.growth_rate``."""
+    path = _write(
+        tmp_path,
+        """
+apiVersion: promforecast.io/v1
+datasource:
+  url: http://vm:8428/
+groups:
+  - name: g
+    queries:
+      - id: disk_used_pct
+        promql: up
+        thresholds:
+          - name: warn
+            value: 80
+            comparator: gt
+          - name: critical
+            value: 95
+            comparator: gt
+        emission:
+          growth_rate:
+            enabled: true
+            windows: [1d, 7d]
+            units: percent
+""",
+    )
+    cfg = config_module.load(path)
+    query = cfg.groups[0].queries[0]
+    assert [t.name for t in query.thresholds] == ["warn", "critical"]
+    assert query.thresholds[0].comparator == "gt"
+    assert query.emission.growth_rate.enabled is True
+    assert query.emission.growth_rate.windows == [timedelta(days=1), timedelta(days=7)]
+    assert query.emission.growth_rate.units == "percent"
+
+
+def test_load_rejects_duplicate_threshold_name(tmp_path: Path) -> None:
+    """Threshold names must be unique within a query (they become label values)."""
+    path = _write(
+        tmp_path,
+        """
+apiVersion: promforecast.io/v1
+datasource:
+  url: http://vm:8428/
+groups:
+  - name: g
+    queries:
+      - id: m
+        promql: up
+        thresholds:
+          - name: warn
+            value: 80
+          - name: warn
+            value: 90
+""",
+    )
+    with pytest.raises(ValueError, match="duplicate threshold name"):
+        config_module.load(path)
+
+
+def test_load_rejects_growth_rate_enabled_without_windows(tmp_path: Path) -> None:
+    """``growth_rate.enabled: true`` with empty windows must fail at load time."""
+    path = _write(
+        tmp_path,
+        """
+apiVersion: promforecast.io/v1
+datasource:
+  url: http://vm:8428/
+groups:
+  - name: g
+    queries:
+      - id: m
+        promql: up
+        emission:
+          growth_rate:
+            enabled: true
+            windows: []
+""",
+    )
+    with pytest.raises(ValueError, match="at least one window"):
+        config_module.load(path)
+
+
+def test_load_accepts_damped_models(tmp_path: Path) -> None:
+    """The damped-trend models register and parse via the same model array."""
+    path = _write(
+        tmp_path,
+        """
+apiVersion: promforecast.io/v1
+datasource:
+  url: http://vm:8428/
+defaults:
+  models:
+    - name: AutoETSDamped
+      params:
+        damping_parameter: 0.95
+    - name: AutoARIMADamped
+      params:
+        damping_parameter: 0.98
+groups:
+  - name: g
+    queries:
+      - id: m
+        promql: up
+""",
+    )
+    cfg = config_module.load(path)
+    names = [spec.name for spec in cfg.defaults.models]
+    assert "AutoETSDamped" in names
+    assert "AutoARIMADamped" in names
+    ets = next(s for s in cfg.defaults.models if s.name == "AutoETSDamped")
+    assert ets.params == {"damping_parameter": 0.95}

@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 import structlog
 
+from . import capacity as capacity_mod
 from . import conformal as conformal_mod
 from . import contribution as contribution_mod
 from . import discovery as discovery_mod
@@ -53,9 +54,11 @@ from .exporter import (
     Exporter,
     ForecastPoint,
     GroupSnapshot,
+    GrowthRatePoint,
     InvalidMetricNameError,
     PreprocessStats,
     QualityPoint,
+    ThresholdEtaPoint,
     validate_metric_name,
 )
 from .point_factory import BacktestOutcome, BandSummary, SeriesPointFactory
@@ -68,6 +71,7 @@ if TYPE_CHECKING:
 
     from .config import Config, QueryConfig
     from .models import ForecastModel
+    from .selector import SelectionResult
 
 logger = structlog.get_logger(__name__)
 
@@ -80,6 +84,23 @@ OverflowStrategy = Literal["drop_lowest_priority", "reject", "sample"]
 # can observe a degraded model before alerts go red, short enough that
 # noise-induced 5-10% wobble doesn't trip it.
 SLOW_FIT_RATIO = 0.5
+
+
+@dataclass
+class _CapacityInput:
+    """One emitted (model, forecast frame) tuple, deferred to post-calibration.
+
+    The forecast frame is kept by reference (not copied) so capturing it
+    is essentially free. ``selection`` is the auto-select decision that
+    produced this emission, ``None`` for explicit / ensemble component
+    rows. ``apply_calibration`` is False for the synthetic ensemble row
+    because conformal calibration is not run against ensemble outputs.
+    """
+
+    model_name: str
+    forecast: Any  # pandas.DataFrame (avoid the import in non-TYPE_CHECKING land)
+    selection: Any  # SelectionResult | None
+    apply_calibration: bool = True
 
 
 @dataclass
@@ -110,6 +131,18 @@ class _FitResult:
     # Per-(model, level) conformal calibration offset for this series.
     # Aggregated into ``calibration_offsets`` on the run context.
     calibration_offsets: list[CalibrationOffsetPoint] = field(default_factory=list)
+    # v1.2 capacity-planning samples. ETAs are per-(model, threshold[, level]);
+    # growth rates are per-(model, window). Both are gauges (snapshot-style),
+    # aggregated into the run context without monotonic merging.
+    threshold_etas: list[ThresholdEtaPoint] = field(default_factory=list)
+    growth_rates: list[GrowthRatePoint] = field(default_factory=list)
+    # Per-model forecast dataframes retained until after conformal
+    # calibration so the capacity helpers can compute ETAs against the
+    # *calibrated* bands (a calibration that widens a band should pull
+    # the conservative ETA earlier or later by the same offset). Cleared
+    # at the end of ``_fit_series`` so we don't keep multi-MB dataframes
+    # alive in ``_RunContext``.
+    capacity_inputs: list[_CapacityInput] = field(default_factory=list)
     # Imputed-fraction reported by preprocessing; threaded into the quality
     # score so heavily-imputed series score lower on the coverage dimension.
     imputed_fraction: float = 0.0
@@ -195,6 +228,10 @@ class _RunContext:
     regressor_failures: dict[tuple[str, str, str], int] = field(default_factory=dict)
     # Per-series conformal calibration offsets accumulated this run.
     calibration_offsets: list[CalibrationOffsetPoint] = field(default_factory=list)
+    # v1.2 capacity-planning families (ETA + growth rate). Snapshot-style;
+    # only the current run's samples land on /metrics.
+    threshold_etas: list[ThresholdEtaPoint] = field(default_factory=list)
+    growth_rates: list[GrowthRatePoint] = field(default_factory=list)
     # Per-query preprocessing statistics for the most recent run.
     preprocess_stats: dict[str, PreprocessStats] = field(default_factory=dict)
     # Per-(query, strategy) gap-fill count for this run; merged with the
@@ -609,6 +646,8 @@ class Runner:
                     quality_points=ctx.quality_points,
                     ensemble_weights=ctx.ensemble_weight_points,
                     contribution_points=ctx.contribution_points,
+                    threshold_etas=ctx.threshold_etas,
+                    growth_rates=ctx.growth_rates,
                     last_run_timestamp=time.time(),
                     run_duration_seconds=duration,
                     series_count=ctx.series_count,
@@ -1171,8 +1210,9 @@ class Runner:
             )
 
         result.imputed_fraction = imputed_fraction
+        offsets_by_model: dict[str, dict[int, float]] = {}
         if d.accuracy.conformal.enabled and forecast_points:
-            forecast_points = await self._apply_conformal_calibration(
+            forecast_points, offsets_by_model = await self._apply_conformal_calibration(
                 df=df,
                 forecast_points=forecast_points,
                 model_specs=model_specs,
@@ -1184,6 +1224,27 @@ class Runner:
                 result=result,
                 factory=factory,
             )
+
+        # Capacity-planning emission runs *after* calibration so band
+        # ETAs reflect the calibrated bands the scrape will expose.
+        # Without this ordering, an alert on ``time_to_threshold{level=N}``
+        # would disagree with the corresponding ``yhat_upper`` /
+        # ``yhat_lower`` at the same level.
+        for ci in result.capacity_inputs:
+            offsets = offsets_by_model.get(ci.model_name) if ci.apply_calibration else None
+            self._emit_capacity_metrics(
+                query=query,
+                forecast=ci.forecast,
+                model_name=ci.model_name,
+                levels=levels,
+                factory=factory,
+                selection=ci.selection,
+                result=result,
+                offsets=offsets,
+            )
+        # Free the retained per-model dataframes — they can be MB-scale,
+        # and ``_RunContext`` retains them across the per-series loop.
+        result.capacity_inputs.clear()
 
         result.points = forecast_points
 
@@ -1265,6 +1326,62 @@ class Runner:
             result.regressor_failures.append((failure.regressor_id, failure.reason))
         return outcome.frame
 
+    @staticmethod
+    def _emit_capacity_metrics(
+        *,
+        query: QueryConfig,
+        forecast: pd.DataFrame,
+        model_name: str,
+        levels: list[int],
+        factory: SeriesPointFactory,
+        selection: SelectionResult | None,
+        result: _FitResult,
+        offsets: dict[int, float] | None = None,
+    ) -> None:
+        """Compute ETA + growth-rate samples from one model's forecast.
+
+        Called once per emitted (model, series) after conformal calibration
+        has decided how much to widen each band. ``offsets`` is the
+        per-level additive widening to apply to ``yhat_upper`` / shrink
+        from ``yhat_lower`` before computing band ETAs; ``None`` (or an
+        empty dict) means no calibration ran for this model and the bands
+        emit as the model produced them. Without this shift, an alert on
+        ``time_to_threshold{level="95"}`` would disagree with the band a
+        scrape can see at the same level — see
+        ``_apply_offsets_to_threshold_eta_inputs`` below.
+
+        Growth rate is computed from the point forecast (``yhat``) only,
+        which calibration does not touch, so ``offsets`` does not affect
+        it.
+        """
+        if forecast.empty:
+            return
+        if query.thresholds:
+            calibrated_df = _apply_offsets_to_threshold_eta_inputs(
+                forecast, offsets, levels
+            )
+            etas = capacity_mod.compute_threshold_etas(
+                forecast=calibrated_df,
+                thresholds=query.thresholds,
+                levels=levels,
+            )
+            if etas:
+                result.threshold_etas.extend(
+                    factory.threshold_eta_points(model_name, etas, selection)
+                )
+        growth_cfg = query.emission.growth_rate
+        if growth_cfg.enabled and growth_cfg.windows:
+            windows_seconds = [w.total_seconds() for w in growth_cfg.windows]
+            rates = capacity_mod.compute_growth_rates(
+                forecast=forecast,
+                windows_seconds=windows_seconds,
+                units=growth_cfg.units,
+            )
+            if rates:
+                result.growth_rates.extend(
+                    factory.growth_rate_points(model_name, rates, selection)
+                )
+
     async def _explicit_forecast(
         self,
         *,
@@ -1322,6 +1439,9 @@ class Runner:
             )
             out.extend(factory.forecast_points(forecast, model_name, selection=None))
             result.curve.extend(factory.forecast_curve_points(forecast, model_name, selection=None))
+            result.capacity_inputs.append(
+                _CapacityInput(model_name=model_name, forecast=forecast, selection=None)
+            )
         return out
 
     async def _auto_select_and_forecast(
@@ -1376,6 +1496,11 @@ class Runner:
         )
         result.curve.extend(
             factory.forecast_curve_points(forecast, selection.model, selection=selection)
+        )
+        result.capacity_inputs.append(
+            _CapacityInput(
+                model_name=selection.model, forecast=forecast, selection=selection
+            )
         )
         return list(factory.forecast_points(forecast, selection.model, selection=selection))
 
@@ -1446,6 +1571,9 @@ class Runner:
             component_forecasts[model_name] = forecast
             out.extend(factory.forecast_points(forecast, model_name, selection=None))
             result.curve.extend(factory.forecast_curve_points(forecast, model_name, selection=None))
+            result.capacity_inputs.append(
+                _CapacityInput(model_name=model_name, forecast=forecast, selection=None)
+            )
 
         if not component_forecasts:
             return out
@@ -1473,6 +1601,18 @@ class Runner:
         ensemble_df = _combine_ensemble(component_forecasts, weights, levels)
         out.extend(factory.forecast_points(ensemble_df, "ensemble", selection=None))
         result.curve.extend(factory.forecast_curve_points(ensemble_df, "ensemble", selection=None))
+        # Calibration is intentionally skipped for the synthetic ensemble
+        # row (``_compute_conformal_offsets`` filters it out), so we mark
+        # this input as not eligible for offset application — its bands
+        # are emitted as-is in both /metrics and the ETA family.
+        result.capacity_inputs.append(
+            _CapacityInput(
+                model_name="ensemble",
+                forecast=ensemble_df,
+                selection=None,
+                apply_calibration=False,
+            )
+        )
         result.ensemble = list(factory.ensemble_weight_points(weights))
         return out
 
@@ -1687,7 +1827,7 @@ class Runner:
         holdout_fraction: float,
         result: _FitResult,
         factory: SeriesPointFactory,
-    ) -> list[ForecastPoint]:
+    ) -> tuple[list[ForecastPoint], dict[str, dict[int, float]]]:
         """Compute and apply conformal offsets to /metrics and curve points.
 
         Runs an extra fit on the configured holdout tail, computes per-level
@@ -1701,6 +1841,10 @@ class Runner:
         ``forecast_band_calibration_offset`` samples on ``result.calibration_offsets``.
         Failures inside :meth:`_compute_conformal_offsets` are isolated per
         model — the forecast still emits, just without the band correction.
+
+        The offsets dict is also returned so the caller can feed it into
+        the capacity-planning emission and keep ``time_to_threshold`` band
+        ETAs aligned with the bands /metrics actually exposes.
         """
         offsets_by_model = await self._compute_conformal_offsets(
             df=df,
@@ -1713,7 +1857,7 @@ class Runner:
             holdout_fraction=holdout_fraction,
         )
         if not offsets_by_model:
-            return forecast_points
+            return forecast_points, {}
         adjusted_points = _apply_offsets_to_snapshot_points(forecast_points, offsets_by_model)
         if result.curve:
             result.curve = _apply_offsets_to_curve_points(result.curve, offsets_by_model)
@@ -1721,7 +1865,7 @@ class Runner:
             result.calibration_offsets.extend(
                 factory.calibration_offset_points(model_name, offsets)
             )
-        return adjusted_points
+        return adjusted_points, offsets_by_model
 
     async def _compute_conformal_offsets(
         self,
@@ -1947,6 +2091,42 @@ def _calibrated_band_value(
     return None
 
 
+def _apply_offsets_to_threshold_eta_inputs(
+    forecast: pd.DataFrame,
+    offsets: dict[int, float] | None,
+    levels: list[int],
+) -> pd.DataFrame:
+    """Return a copy of ``forecast`` with band columns shifted by the per-level offset.
+
+    The conformal calibration offset widens both sides of each band
+    symmetrically: ``yhat_upper_<level> += offset`` and
+    ``yhat_lower_<level> -= offset``. Re-applying that shift here so the
+    capacity ETA computation sees the same bands /metrics exposes keeps
+    ``time_to_threshold{level="95"}`` and ``yhat_upper{level="95"}``
+    self-consistent.
+
+    ``offsets=None`` or an empty dict is the common case (no calibration
+    ran for this model) and the frame is returned unmodified. Only
+    non-zero positive offsets actually mutate columns; a zero offset is
+    a no-op so we skip the copy.
+    """
+    if not offsets or forecast.empty:
+        return forecast
+    if not any(o > 0 for o in offsets.values()):
+        return forecast
+    out = forecast.copy()
+    for level, offset in offsets.items():
+        if offset <= 0 or level not in levels:
+            continue
+        lo_col = f"yhat_lower_{level}"
+        hi_col = f"yhat_upper_{level}"
+        if lo_col in out.columns:
+            out[lo_col] = out[lo_col].to_numpy(dtype=float) - offset
+        if hi_col in out.columns:
+            out[hi_col] = out[hi_col].to_numpy(dtype=float) + offset
+    return out
+
+
 def _apply_offsets_to_snapshot_points(
     points: list[ForecastPoint],
     offsets_by_model: dict[str, dict[int, float]],
@@ -2014,6 +2194,8 @@ def _merge_fit_into_ctx(ctx: _RunContext, fit_result: _FitResult, query_id: str)
     ctx.contribution_points.extend(fit_result.contribution)
     ctx.curve_points.extend(fit_result.curve)
     ctx.calibration_offsets.extend(fit_result.calibration_offsets)
+    ctx.threshold_etas.extend(fit_result.threshold_etas)
+    ctx.growth_rates.extend(fit_result.growth_rates)
     for model_name, fit_seconds in fit_result.fit_durations.items():
         ctx.fit_durations[(query_id, model_name)] = fit_seconds
     for model_name in fit_result.slow_fits:

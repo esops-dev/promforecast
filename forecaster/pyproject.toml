@@ -62,10 +62,12 @@ dev = [
 promforecast = "promforecast.main:cli"
 
 [project.entry-points."promforecast.models"]
-auto_arima     = "promforecast.models.auto_arima:AutoARIMAModel"
-auto_ets       = "promforecast.models.auto_ets:AutoETSModel"
-mstl           = "promforecast.models.mstl:MSTLModel"
-seasonal_naive = "promforecast.models.seasonal_naive:SeasonalNaiveModel"
+auto_arima         = "promforecast.models.auto_arima:AutoARIMAModel"
+auto_arima_damped  = "promforecast.models.auto_arima_damped:AutoARIMADampedModel"
+auto_ets           = "promforecast.models.auto_ets:AutoETSModel"
+auto_ets_damped    = "promforecast.models.auto_ets_damped:AutoETSDampedModel"
+mstl               = "promforecast.models.mstl:MSTLModel"
+seasonal_naive     = "promforecast.models.seasonal_naive:SeasonalNaiveModel"
 
 [project.urls]
 Homepage      = "https://github.com/esops-dev/promforecast"

@@ -319,6 +319,67 @@ class DiscoveryVariable(BaseModel):
     promql: str
 
 
+class ThresholdConfig(BaseModel):
+    """One named threshold for the time-to-threshold ETA metric.
+
+    Each threshold becomes a sample of ``<id>_forecast_time_to_threshold_seconds``
+    labelled with ``name`` (e.g. ``warn``/``critical``). ``comparator``
+    chooses whether the metric fires when the forecast first crosses
+    *above* (``gt``) or *below* (``lt``) ``value``; the ETA is the number
+    of seconds from the forecast's start until that crossing, or NaN if
+    no crossing happens within the horizon.
+
+    When confidence levels are emitted, the same family is emitted per
+    level using ``yhat_upper`` (for ``gt``) or ``yhat_lower`` (for ``lt``)
+    so capacity ETAs are conservative at the upper band — "disk fills
+    no later than 24h from now" rather than "the central forecast hits
+    full in 24h".
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    value: float
+    comparator: Literal["gt", "lt"] = "gt"
+
+
+class GrowthRateEmissionConfig(BaseModel):
+    """Per-query growth-rate emission.
+
+    When ``enabled: true`` the forecaster emits ``<id>_forecast_growth_rate``
+    once per configured ``windows`` entry. The value is the slope of the
+    forecast curve over that window expressed as either
+    ``units_per_second`` (default — directly interpretable in Grafana
+    with ``unit: short/s`` axes) or as a relative ``percent`` change
+    (``window_end / window_start - 1``).
+
+    Cardinality multiplier is ``N_series * N_windows`` per query; the
+    ``promforecast validate`` cardinality estimator counts the family.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    windows: list[Duration] = Field(
+        default_factory=lambda: [timedelta(days=1), timedelta(days=7)]
+    )
+    units: Literal["units_per_second", "percent"] = "units_per_second"
+
+
+class QueryEmissionConfig(BaseModel):
+    """Per-query emission toggles.
+
+    Today the only setting is :class:`GrowthRateEmissionConfig` (the
+    forecast growth-rate metric). Kept as its own block so future
+    per-query emission options can extend the schema without breaking
+    existing configs.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    growth_rate: GrowthRateEmissionConfig = Field(default_factory=GrowthRateEmissionConfig)
+
+
 class QueryConfig(BaseModel):
     """A single PromQL query plus optional per-query overrides.
 
@@ -337,6 +398,8 @@ class QueryConfig(BaseModel):
       ``promql`` is treated as a template; ``$var`` or ``${var}`` markers
       are substituted with the values produced by each variable's discovery
       query at runtime. See :mod:`promforecast.discovery`.
+    * ``thresholds``: named ETA thresholds (see :class:`ThresholdConfig`).
+    * ``emission``: per-query emission toggles (see :class:`QueryEmissionConfig`).
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -347,6 +410,8 @@ class QueryConfig(BaseModel):
     step: Duration | None = None
     season_length: int | Literal["auto"] | None = None
     discover: list[DiscoveryVariable] = Field(default_factory=list)
+    thresholds: list[ThresholdConfig] = Field(default_factory=list)
+    emission: QueryEmissionConfig = Field(default_factory=QueryEmissionConfig)
 
 
 class CanaryConfig(BaseModel):
@@ -837,6 +902,27 @@ def _validate_query_overrides(*, group_name: str, query: QueryConfig) -> None:
         raise ValueError(f"{label}: step must be a positive duration")
     if isinstance(query.season_length, int) and query.season_length <= 0:
         raise ValueError(f"{label}: season_length must be a positive integer")
+    threshold_names: set[str] = set()
+    for threshold in query.thresholds:
+        if not threshold.name:
+            raise ValueError(f"{label}.thresholds: name must be non-empty")
+        if threshold.name in threshold_names:
+            raise ValueError(
+                f"{label}.thresholds: duplicate threshold name {threshold.name!r}; "
+                "each threshold name must be unique within a query"
+            )
+        threshold_names.add(threshold.name)
+    growth = query.emission.growth_rate
+    if growth.enabled:
+        if not growth.windows:
+            raise ValueError(
+                f"{label}.emission.growth_rate: at least one window is required when enabled"
+            )
+        for window in growth.windows:
+            if window.total_seconds() <= 0:
+                raise ValueError(
+                    f"{label}.emission.growth_rate.windows: must be positive durations"
+                )
 
 
 def effective_step(query: QueryConfig, defaults: DefaultsConfig) -> timedelta:
