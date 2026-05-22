@@ -1,4 +1,4 @@
-"""Runner-level integration tests for the v1.2 capacity-planning families.
+"""Runner-level integration tests for the capacity-planning families.
 
 These exercise the end-to-end wiring through ``Runner.run_group`` so a
 regression in the per-fit hook, snapshot merge, or exporter rendering is
@@ -214,7 +214,7 @@ async def test_runner_eta_band_reflects_conformal_calibration(
 async def test_runner_omits_capacity_families_when_unconfigured(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """No threshold + growth-rate disabled = no v1.2 families on /metrics."""
+    """No threshold + growth-rate disabled = no capacity families on /metrics."""
     from promforecast import models as model_registry  # noqa: PLC0415
 
     monkeypatch.setattr(model_registry, "build", lambda *a, **kw: _RampForecastModel())

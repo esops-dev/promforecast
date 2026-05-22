@@ -509,8 +509,8 @@ groups:
         config_module.load(path)
 
 
-def test_load_accepts_v1_1_preprocess_block(tmp_path: Path) -> None:
-    """v1.1 adds a per-group preprocess block with gaps/outliers/change_point."""
+def test_load_accepts_preprocess_block(tmp_path: Path) -> None:
+    """Per-group preprocess block accepts gaps/outliers/change_point."""
     path = _write(
         tmp_path,
         """
@@ -547,8 +547,8 @@ groups:
     assert g.preprocess.change_point.min_post_break_points == 100
 
 
-def test_load_accepts_v1_1_conformal_block(tmp_path: Path) -> None:
-    """v1.1 adds accuracy.conformal under defaults."""
+def test_load_accepts_conformal_block(tmp_path: Path) -> None:
+    """Defaults accept an accuracy.conformal block."""
     path = _write(
         tmp_path,
         """
@@ -620,8 +620,8 @@ groups:
         config_module.load(path)
 
 
-def test_load_accepts_v1_2_thresholds_and_growth_rate(tmp_path: Path) -> None:
-    """v1.2 adds per-query ``thresholds`` and ``emission.growth_rate``."""
+def test_load_accepts_thresholds_and_growth_rate(tmp_path: Path) -> None:
+    """Per-query ``thresholds`` and ``emission.growth_rate`` load correctly."""
     path = _write(
         tmp_path,
         """

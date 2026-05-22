@@ -19,6 +19,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 from . import config as config_module
 from . import ha_cache as ha_cache_module
+from . import preview as preview_module
 from . import telemetry as telemetry_module
 from . import validate as validate_module
 from .cache import MemoryQueryCache, QueryCache, QueryCacheBackend, RedisQueryCache
@@ -175,6 +176,8 @@ def run(config_path: Path, log_level: str) -> None:
         watcher=watcher,
         reload_enabled=cfg.server.reload.enabled,
         expose_config_endpoint=cfg.server.expose_config_endpoint,
+        expose_preview_endpoint=cfg.server.expose_preview_endpoint,
+        source=source,
         snapshot_cache=snapshot_cache,
         elector=elector,
         tracer=tracer,
@@ -247,6 +250,8 @@ def _build_app(
     watcher: ConfigMapWatcher | None = None,
     reload_enabled: bool,
     expose_config_endpoint: bool = False,
+    expose_preview_endpoint: bool = False,
+    source: PromSource | None = None,
     snapshot_cache: ha_cache_module.SnapshotCache | None = None,
     elector: LeaderElector | None = None,
     tracer: telemetry_module.Tracer | None = None,
@@ -336,6 +341,55 @@ def _build_app(
                     "config": config_module.sanitised_dump(runner._config),
                 }
             )
+
+    if expose_preview_endpoint and source is None:
+        # Configured to expose the endpoint but the caller didn't wire a
+        # source (typical for unit tests or partial deployments). The
+        # endpoint can't function without one, so log a clear warning
+        # instead of silently registering nothing.
+        logger.warning(
+            "preview_endpoint_disabled_no_source",
+            reason="server.expose_preview_endpoint=true but no datasource was wired",
+        )
+    if expose_preview_endpoint and source is not None:
+        from fastapi import Request  # noqa: PLC0415
+
+        @app.post("/forecast/preview")
+        async def preview_endpoint(req: Request) -> Response:
+            """Run a single ad-hoc fit for the supplied query and return JSON.
+
+            Stateless: nothing about this request touches ``/metrics``,
+            the snapshot, or scheduled fits. Same network-level
+            access-control model as ``/-/reload``. See ``docs/preview.md``
+            for the request schema + worked examples.
+            """
+            try:
+                payload = await req.json()
+            except Exception as exc:
+                return JSONResponse(
+                    {"error": "invalid_body", "message": f"bad JSON: {exc}"},
+                    status_code=400,
+                )
+            try:
+                request = preview_module.parse_request(payload)
+            except preview_module.PreviewError as exc:
+                return JSONResponse(
+                    {"error": exc.reason, "message": str(exc)},
+                    status_code=exc.status_code,
+                )
+            try:
+                result = await preview_module.run_preview(
+                    config=runner._config,
+                    source=source,
+                    request=request,
+                    served_by=default_identity(),
+                )
+            except preview_module.PreviewError as exc:
+                return JSONResponse(
+                    {"error": exc.reason, "message": str(exc)},
+                    status_code=exc.status_code,
+                )
+            return JSONResponse(result)
 
     return app
 

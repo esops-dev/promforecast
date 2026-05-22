@@ -46,6 +46,11 @@ import structlog
 
 from .config import CALENDAR_FEATURE_TYPES, RegressorConfig
 
+# Imported lazily inside ``_apply_holidays`` so the ``holidays`` package
+# is loaded only when a config actually configures a holiday regressor.
+# Module-level import here would add a few MB of country-tables to every
+# import of ``regressors`` for the (common) case of no holiday usage.
+
 if TYPE_CHECKING:
     import pandas as pd
 
@@ -273,6 +278,13 @@ def align_for_series(
                     raise RegressorError(cal_failure.reason, cal_failure.message)
                 failures.append(cal_failure)
             continue
+        if reg.type == "holidays":
+            hol_failure = _apply_holidays(reg, out)
+            if hol_failure is not None:
+                if reg.required:
+                    raise RegressorError(hol_failure.reason, hol_failure.message)
+                failures.append(hol_failure)
+            continue
         aggregated = _resolve_aggregated(prefetch, reg.id)
         if aggregated is None:
             # Pre-fetch failed for this optional regressor — already counted
@@ -298,6 +310,175 @@ def _apply_calendar(reg: RegressorConfig, out: pd.DataFrame) -> RegressorFailure
     except ValueError as exc:
         return RegressorFailure(regressor_id=reg.id, reason="invalid_type", message=str(exc))
     return None
+
+
+def _apply_holidays(reg: RegressorConfig, out: pd.DataFrame) -> RegressorFailure | None:
+    """Materialise holiday regressor column(s) or return a failure record.
+
+    Two emission shapes are supported:
+
+    * ``expand: false`` (default) — a single binary column named ``<id>``
+      that is ``1`` on any holiday in the configured country/region
+      calendar and ``0`` otherwise.
+    * ``expand: true`` — one column per distinct holiday name seen in the
+      ``ds`` window, named ``<id>__<holiday_slug>``. Operators read each
+      coefficient independently ("Thanksgiving's effect is X, Black
+      Friday's is Y").
+
+    The ``holidays`` PyPI package is imported lazily so a deployment that
+    never configures the regressor doesn't pay the country-table import
+    cost. The package is shipped as the ``holidays`` extras dependency;
+    missing-install errors surface as a graceful per-regressor failure
+    with a message that names the extra.
+
+    The ``timezone`` field on the regressor controls calendar-date
+    resolution: ``ds`` is converted into the configured zone before
+    ``.dt.date`` so a US holiday flips at local midnight rather than
+    UTC-midnight. Without the conversion every non-UTC deployment would
+    mis-label holidays by several hours.
+    """
+    if not reg.country:
+        # Defensive: the schema validator rejects this at boot, but a
+        # hot-reload race could land us here with an empty country.
+        return RegressorFailure(
+            regressor_id=reg.id,
+            reason="invalid_type",
+            message="holiday regressor missing country",
+        )
+    try:
+        calendar = _build_holiday_calendar(reg)
+    except ImportError as exc:
+        return RegressorFailure(
+            regressor_id=reg.id,
+            reason="invalid_type",
+            message=(
+                "holidays package not installed; install the 'holidays' extra: "
+                f"pip install 'promforecast[holidays]' (underlying error: {exc})"
+            ),
+        )
+    except Exception as exc:
+        return RegressorFailure(
+            regressor_id=reg.id,
+            reason="invalid_type",
+            message=f"holidays calendar build failed: {exc}",
+        )
+
+
+    ds = out["ds"]
+    # Operators configure ``timezone`` as an IANA name; the source
+    # timestamps come from PromQL queries in UTC. ``tz_convert`` rebases
+    # without changing the underlying instant so the eventual
+    # ``.dt.date`` extraction matches the operator's local calendar.
+    if ds.dt.tz is None:
+        ds_local = ds.dt.tz_localize("UTC").dt.tz_convert(reg.timezone)
+    else:
+        ds_local = ds.dt.tz_convert(reg.timezone)
+    dates = ds_local.dt.date
+    if reg.expand:
+        # One-hot: enumerate the distinct holiday names observed in the
+        # ``ds`` window and emit one column per name. ``slug`` lower-cases
+        # and underscores so the column is a valid Python identifier and
+        # plays nicely with downstream model wrappers that introspect
+        # ``regressors_frame.columns``.
+        names = {calendar.get(d) for d in dates if calendar.get(d)}
+        names.discard(None)
+        for name in names:
+            slug = _slugify_holiday(str(name))
+            col = f"{reg.id}__{slug}"
+            out[col] = [1.0 if calendar.get(d) == name else 0.0 for d in dates]
+        if not names:
+            # No holidays in the window — emit the binary column so the
+            # frame always carries at least one explicit ``0`` regressor
+            # column rather than silently disappearing.
+            out[reg.id] = [0.0] * len(dates)
+    else:
+        out[reg.id] = [1.0 if calendar.get(d) else 0.0 for d in dates]
+    return None
+
+
+def _build_holiday_calendar(reg: RegressorConfig) -> Any:
+    """Resolve the ``holidays.country_holidays`` calendar for ``reg``.
+
+    ``regions`` is forwarded as ``subdiv`` because that is the keyword the
+    ``holidays`` API uses; multiple regions collapse into the union by
+    iterating + ``update()`` so a deployment can opt into, say,
+    ``["CA", "NY"]`` and pick up both US states' bank holidays.
+
+    Per-region calendars are memoised on ``(country, subdiv)`` — a config
+    with dozens of holiday regressors against the same country (a common
+    pattern with one regressor per query) would otherwise re-materialise
+    the (multi-megabyte) date tables on every config load.
+
+    Imports ``holidays`` lazily so the wider regressor module doesn't pay
+    the country-tables import cost when no holiday regressor is
+    configured.
+    """
+    # ``country`` is non-empty by validation contract (the caller checks),
+    # but mypy can't see across that branch — cast through ``str(...)`` so
+    # the holidays stubs accept it without a noqa.
+    country = str(reg.country)
+    if not reg.regions:
+        return _holiday_calendar_cache_get(country, None)
+    base: Any = _holiday_calendar_cache_get(country, reg.regions[0])
+    if len(reg.regions) == 1:
+        return base
+    # Union of multiple subdivisions. ``HolidayBase.update`` mutates the
+    # left operand, so we copy the cached base before merging in extras —
+    # otherwise the cached single-region calendar would acquire every
+    # other region's holidays after the first multi-region load.
+    base = base.copy()
+    for subdiv in reg.regions[1:]:
+        base.update(_holiday_calendar_cache_get(country, subdiv))
+    return base
+
+
+# Process-wide ``(country, subdiv) -> HolidayBase`` cache. The
+# ``holidays`` package returns a fresh, fully-materialised calendar on
+# every ``country_holidays(...)`` call; with one regressor per query the
+# config load alone would replay that work hundreds of times.
+_HOLIDAY_CALENDAR_CACHE: dict[tuple[str, str | None], Any] = {}
+
+
+def _holiday_calendar_cache_get(country: str, subdiv: str | None) -> Any:
+    """Return a cached holiday calendar for ``(country, subdiv)``.
+
+    Lazy-imports ``holidays`` so the wider module stays cheap. The
+    returned object is shared — callers that need to mutate the
+    calendar (e.g. unioning multiple regions) must ``.copy()`` first.
+    """
+    key = (country, subdiv)
+    cached = _HOLIDAY_CALENDAR_CACHE.get(key)
+    if cached is not None:
+        return cached
+    import holidays  # noqa: PLC0415
+
+    if subdiv is None:
+        calendar: Any = holidays.country_holidays(country)
+    else:
+        calendar = holidays.country_holidays(country, subdiv=subdiv)
+    _HOLIDAY_CALENDAR_CACHE[key] = calendar
+    return calendar
+
+
+def _slugify_holiday(name: str) -> str:
+    """Lower-case, ASCII-friendly slug suitable for a column name.
+
+    The ``holidays`` package can emit names with apostrophes, parens, or
+    multiple spaces (e.g. ``"New Year's Day"``). We collapse runs of
+    non-alphanumerics into a single underscore and lowercase so the
+    resulting column is stable across runs.
+    """
+    out_chars: list[str] = []
+    last_was_us = False
+    for ch in name.lower():
+        if ch.isalnum():
+            out_chars.append(ch)
+            last_was_us = False
+        elif not last_was_us:
+            out_chars.append("_")
+            last_was_us = True
+    slug = "".join(out_chars).strip("_")
+    return slug or "holiday"
 
 
 def _failure_from_outcome(

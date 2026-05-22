@@ -10,7 +10,7 @@ defaults:
   accuracy:
     conformal:
       enabled: true        # opt-in; off by default
-      method: split        # only method supported in v1.1
+      method: split        # only method currently shipped
       holdout_fraction: 0.2
 ```
 
@@ -47,7 +47,78 @@ Emitted bands also carry the label `calibrated="true"` on `_forecast_lower` / `_
 - **Constant or all-zero series** — residuals are zero → offset stays zero.
 - **Systematically bad model** — conformal makes the band *cover* the nominal level, but if the underlying model is biased the band can become uselessly wide. Watch large sustained `forecast_band_calibration_offset` values as the signal to fix the model instead.
 
+## Empirical coverage diagnostics
+
+Calibration moves the bands; verifying they actually achieve their
+nominal level is a separate concern. The empirical-coverage gauge
+`forecast_band_empirical_coverage` reports the fraction of recent
+actuals that fell inside the nominal band:
+
+```
+forecast_band_empirical_coverage{id, group, model, level, window}
+```
+
+Enable it per query:
+
+```yaml
+groups:
+  - name: kpis
+    queries:
+      - id: requests_per_second
+        promql: rate(http_requests_total[5m])
+        emission:
+          band_coverage:
+            enabled: true            # default
+            windows: [1d, 7d]        # default
+```
+
+Each (series, model, level) tracks a rolling ring buffer sized to
+`window / step`. The gauge reports `inside / total` — for a
+well-calibrated 95 % band you expect the gauge to hover near `0.95`.
+A reading of `0.4` on a `level="95"` panel tells you the band is
+drastically under-covering; the corresponding deviation alerts are
+firing on every cycle and an alert on
+`forecast_deviation_outside_band == 1` is effectively meaningless
+until the bands are fixed.
+
+Coverage and calibration interact:
+
+* With `conformal.enabled: false`, `forecast_band_empirical_coverage`
+  is the operator's primary signal that the bands are mis-calibrated.
+* With `conformal.enabled: true`, it's the **feedback loop** —
+  after calibration runs for a few refreshes the gauge should track
+  the nominal level. Persistent under-coverage despite a positive
+  `forecast_band_calibration_offset` points to an underlying model
+  problem (wrong family, missing seasonality) that calibration can't
+  paper over.
+
+### Example PrometheusRule
+
+```yaml
+- alert: ForecastBandUnderCovering
+  expr: |
+    forecast_band_empirical_coverage{window="7d", level="95"} < 0.85
+    and on (id, group)
+    forecast_quality_score > 0.6
+  for: 6h
+  annotations:
+    summary: "Forecast 95% band for {{ $labels.id }} covers only {{ $value | humanizePercentage }}"
+```
+
+The `and on (id, group) forecast_quality_score > 0.6` gate avoids
+alerting on series whose underlying model is already known to be bad
+— `ForecastQualityLow` is the better signal for those.
+
+### Memory cost
+
+`window / step` booleans per (series, level, window). With the
+default `1d` + `7d` and a 5m step that's `288 + 2016 ≈ 2300` bits
+per (series, level). At the canonical 5000-series cap with two
+levels and two windows that's roughly 2.8 MB of rolling state —
+comfortably bounded.
+
 ## See also
 
 - [Models](models.md) — backtest accuracy feeds the calibrator.
 - [Input preprocessing](preprocessing.md) — outlier scrubbing runs *before* calibration to keep the hold-out clean.
+- [Forecast drift telemetry](drift.md) — complements coverage by surfacing prediction-vs-prediction shifts.

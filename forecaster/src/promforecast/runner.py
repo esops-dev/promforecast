@@ -21,12 +21,16 @@ from typing import TYPE_CHECKING, Any, Literal
 
 import structlog
 
+from . import band_coverage as band_coverage_mod
 from . import capacity as capacity_mod
 from . import cold_start as cold_start_mod
 from . import conformal as conformal_mod
 from . import contribution as contribution_mod
+from . import deviation as deviation_mod
 from . import discovery as discovery_mod
+from . import drift as drift_mod
 from . import models as model_registry
+from . import point_factory as point_factory_mod
 from . import preprocess as preprocess_mod
 from . import quality as quality_mod
 from . import regressors as regressors_mod
@@ -47,14 +51,17 @@ from .config import (
     ModelSpec,
     QueryConfig,
     effective_emission_safeguards,
+    effective_refresh_interval,
     effective_season_length,
     effective_step,
 )
 from .exporter import (
     AccuracyPoint,
+    BandCoveragePoint,
     CalibrationOffsetPoint,
     ContributionPoint,
     DeviationPoint,
+    DriftPoint,
     EnsembleWeightPoint,
     Exporter,
     ForecastPoint,
@@ -136,7 +143,7 @@ class _FitResult:
     # Per-(model, level) conformal calibration offset for this series.
     # Aggregated into ``calibration_offsets`` on the run context.
     calibration_offsets: list[CalibrationOffsetPoint] = field(default_factory=list)
-    # v1.2 capacity-planning samples. ETAs are per-(model, threshold[, level]);
+    # Capacity-planning samples. ETAs are per-(model, threshold[, level]);
     # growth rates are per-(model, window). Both are gauges (snapshot-style),
     # aggregated into the run context without monotonic merging.
     threshold_etas: list[ThresholdEtaPoint] = field(default_factory=list)
@@ -151,14 +158,20 @@ class _FitResult:
     # Imputed-fraction reported by preprocessing; threaded into the quality
     # score so heavily-imputed series score lower on the coverage dimension.
     imputed_fraction: float = 0.0
-    # v1.3 count-aware safeguard counters: per-``kind`` increments folded
+    # Count-aware safeguard counters: per-``kind`` increments folded
     # into the run context's per-(query, kind) total. ``kind`` is
     # ``negative`` (a value clipped from below zero) or ``rounded`` (a
     # non-trivial fractional component that was rounded to integer).
     emission_clipped: dict[str, int] = field(default_factory=dict)
-    # v1.3 cold-start: number of usable siblings the borrow query
-    # produced for this series; ``0`` when cold-start did not run.
+    # Cold-start: number of usable siblings the borrow query produced for
+    # this series; ``0`` when cold-start did not run.
     cold_start_siblings: int = 0
+    # Forecast-drift gauges: one per (series, model). NaN when no prior
+    # fit was cached for the (group, query, series, model) tuple.
+    drift_points: list[DriftPoint] = field(default_factory=list)
+    # Drift alert: how many threshold crossings happened for this query
+    # in this run. The runner folds it into the per-(query) total.
+    drift_alerts: int = 0
 
 
 @dataclass(frozen=True)
@@ -241,7 +254,7 @@ class _RunContext:
     regressor_failures: dict[tuple[str, str, str], int] = field(default_factory=dict)
     # Per-series conformal calibration offsets accumulated this run.
     calibration_offsets: list[CalibrationOffsetPoint] = field(default_factory=list)
-    # v1.2 capacity-planning families (ETA + growth rate). Snapshot-style;
+    # Capacity-planning families (ETA + growth rate). Snapshot-style;
     # only the current run's samples land on /metrics.
     threshold_etas: list[ThresholdEtaPoint] = field(default_factory=list)
     growth_rates: list[GrowthRatePoint] = field(default_factory=list)
@@ -254,17 +267,27 @@ class _RunContext:
     outliers_replaced: dict[tuple[str, str], int] = field(default_factory=dict)
     # Per-query change-point detection count for this run.
     change_points: dict[str, int] = field(default_factory=dict)
-    # v1.3: per-(query, kind) emission clipping counter for this run.
-    # Merged with the previous snapshot in ``run_group`` so the exposed
-    # counter stays monotonic across runs.
+    # Per-(query, kind) emission clipping counter for this run. Merged
+    # with the previous snapshot in ``run_group`` so the exposed counter
+    # stays monotonic across runs.
     emission_clipped: dict[tuple[str, str], int] = field(default_factory=dict)
-    # v1.3: per-query usable-sibling count for the most recent cold-start
-    # fit. The runner prefetches the borrow query once per primary query
-    # (see ``_prefetch_cold_start_siblings``), so every cold-start fit
-    # within one run of a given query observes the same usable-sibling
-    # count — the gauge is deterministic per (group, query) regardless of
-    # which short series of the query was processed last.
+    # Per-query usable-sibling count for the most recent cold-start fit.
+    # The runner prefetches the borrow query once per primary query (see
+    # ``_prefetch_cold_start_siblings``), so every cold-start fit within
+    # one run of a given query observes the same usable-sibling count —
+    # the gauge is deterministic per (group, query) regardless of which
+    # short series of the query was processed last.
     cold_start_siblings: dict[str, int] = field(default_factory=dict)
+    # Per-(series, model) drift gauges from this run. Same shape as
+    # ``deviation_points`` — the renderer reads them directly.
+    drift_points: list[DriftPoint] = field(default_factory=list)
+    # Per-(query) drift threshold-crossing counter for this run.
+    drift_alerts: dict[str, int] = field(default_factory=dict)
+    # Per-query series count and run duration for the most recent run.
+    # Used to populate the ``query`` label on
+    # ``forecast_series_count`` and ``forecast_run_duration_seconds``.
+    series_count_per_query: dict[str, int] = field(default_factory=dict)
+    run_duration_per_query: dict[str, float] = field(default_factory=dict)
 
 
 def _compute_global_budgets(groups: list[GroupConfig], max_total_series: int) -> dict[str, int]:
@@ -362,6 +385,22 @@ class Runner:
         self._exporter = exporter
         self._executor = executor or ThreadPoolExecutor(max_workers=4)
         self._sink = sink
+        # Drift cache: persists across runs in the same process so
+        # successive fits can be compared. HA followers don't see the
+        # cache; they read the leader's rendered drift gauges via the
+        # shared snapshot.
+        self._drift_cache = drift_mod.DriftCache()
+        # Rolling band-coverage tracker: keeps a bounded ring of
+        # (actual ∈ band) booleans per (series, level, window). Lives on
+        # the Runner so the rolling state survives across runs without
+        # leaking into the exporter's lock surface.
+        self._band_coverage = band_coverage_mod.BandCoverageTracker()
+        # Concurrent-fits semaphore. Per-query refresh schedules can
+        # synchronise multiple groups onto the same tick; without a global
+        # cap a burst of cheap queries could saturate the executor pool.
+        # The semaphore is recreated whenever the config reload changes
+        # ``safety.max_concurrent_fits`` so the cap honours hot reloads.
+        self._fits_semaphore = asyncio.Semaphore(max(1, config.safety.max_concurrent_fits))
         # ``tracer`` is the optional OpenTelemetry facade. We accept None
         # here (rather than mandating one) so call sites that don't care
         # about tracing — tests, ad-hoc tools — don't have to construct a
@@ -408,15 +447,14 @@ class Runner:
         if self._tasks:
             return
         self._stopped.clear()
-        interval = self._config.server.refresh_interval.total_seconds()
         for group in self._config.groups:
-            self._spawn_group_loop(group, interval)
+            self._spawn_group_loop(group)
 
-    def _spawn_group_loop(self, group: GroupConfig, interval_seconds: float) -> None:
+    def _spawn_group_loop(self, group: GroupConfig) -> None:
         """Create the stop event + task for one group. Idempotent per name."""
         ev = asyncio.Event()
         self._stop_events[group.name] = ev
-        self._tasks[group.name] = asyncio.create_task(self._loop(group, interval_seconds, ev))
+        self._tasks[group.name] = asyncio.create_task(self._loop(group, ev))
 
     async def apply_config(self, new_config: Config) -> ReloadResult:
         """Swap in a new validated config, draining in-flight runs first.
@@ -478,9 +516,17 @@ class Runner:
             self._exporter.retain_groups(set(new_by_name))
             self._exporter.retain_discovery_groups(set(new_by_name))
 
-            interval = new_config.server.refresh_interval.total_seconds()
+            # Reload may have changed ``safety.max_concurrent_fits``; rebuild
+            # the semaphore so the new cap takes effect for upcoming fits.
+            self._fits_semaphore = asyncio.Semaphore(max(1, new_config.safety.max_concurrent_fits))
+            # Drift/band-coverage state lives keyed by ``(group, query)`` —
+            # prune entries for queries that no longer exist so a hot
+            # reload that drops a query doesn't leak its state forever.
+            live_pairs = {(g.name, q.id) for g in new_config.groups for q in g.queries}
+            self._drift_cache.prune_to(live_pairs)
+            self._band_coverage.forget(live_pairs)
             for group in new_config.groups:
-                self._spawn_group_loop(group, interval)
+                self._spawn_group_loop(group)
 
             return ReloadResult(added=added, removed=removed, changed=changed)
 
@@ -531,20 +577,58 @@ class Runner:
     async def _loop(
         self,
         group: GroupConfig,
-        interval_seconds: float,
         stop_event: asyncio.Event,
     ) -> None:
+        """Run each query of ``group`` on its own effective refresh interval.
+
+        Per-query ``refresh_interval`` overrides let a single group mix
+        metrics with different cadences. The loop tracks the
+        per-query next-run-time and on each tick runs only the queries
+        that are due. Queries with no override inherit
+        ``server.refresh_interval``; behaviour is unchanged from the
+        single-cadence world when no overrides are configured.
+        """
+        # ``-inf`` so every query is due on the first tick (the runner
+        # always fires an immediate first run, matching the old contract).
+        next_run_at: dict[str, float] = {q.id: float("-inf") for q in group.queries}
         while not stop_event.is_set() and not self._stopped.is_set():
+            now = time.monotonic()
+            due = [q for q in group.queries if next_run_at[q.id] <= now]
             try:
-                await self.run_group(group)
+                if due:
+                    await self.run_group(group, queries=due)
+                    for q in due:
+                        interval = effective_refresh_interval(
+                            q, self._config.server
+                        ).total_seconds()
+                        next_run_at[q.id] = now + max(1.0, interval)
             except asyncio.CancelledError:
-                # Hard cancellation during shutdown / drain timeout: let it
-                # propagate so ``_drain_all_groups`` and ``stop`` can finish.
                 raise
             except Exception:
                 logger.exception("group_run_failed", group=group.name)
                 self._exporter.increment_failure(group.name, reason="group_error")
-            await self._sleep_until_stopped_or(stop_event, interval_seconds)
+            sleep_seconds = self._next_query_due_in(group, next_run_at)
+            await self._sleep_until_stopped_or(stop_event, sleep_seconds)
+
+    @staticmethod
+    def _next_query_due_in(group: GroupConfig, next_run_at: dict[str, float]) -> float:
+        """Return seconds until the soonest-due query, clamped to >= 1s.
+
+        We never sleep sub-second so a misconfigured tiny refresh
+        interval can't busy-loop the event loop; the tick granularity
+        of one second is comfortably finer than any realistic
+        refit cadence.
+        """
+        now = time.monotonic()
+        # Floor at 1s so a barely-overdue query that just ran doesn't
+        # spin on an immediate wake. Ceil chosen pragmatically: the
+        # group refresh is typically minutes-to-hours.
+        wait = float("inf")
+        for query in group.queries:
+            wait = min(wait, next_run_at[query.id] - now)
+        if not group.queries or not math.isfinite(wait):
+            wait = 60.0
+        return max(1.0, wait)
 
     async def _sleep_until_stopped_or(
         self,
@@ -575,21 +659,46 @@ class Runner:
                     with contextlib.suppress(asyncio.CancelledError, Exception):
                         await waiter
 
-    async def run_group(self, group: GroupConfig) -> None:
-        """Execute a single group: query, fit, select, export."""
+    async def run_group(  # noqa: PLR0912, PLR0915
+        self,
+        group: GroupConfig,
+        *,
+        queries: list[QueryConfig] | None = None,
+    ) -> None:
+        """Execute (a subset of) a group's queries: query, fit, select, export.
+
+        ``queries=None`` runs every query in the group — the legacy
+        single-cadence behaviour. When the per-query refresh scheduler
+        passes a subset, only those queries are fitted; data for the
+        other queries is preserved from the prior snapshot so a
+        partial-run tick doesn't strip /metrics of stable rows.
+        """
+        queries_to_run = queries if queries is not None else list(group.queries)
+        run_query_ids = {q.id for q in queries_to_run}
         async with self._locks[group.name]:
             started = time.monotonic()
-            log = logger.bind(group=group.name, query_count=len(group.queries))
+            log = logger.bind(
+                group=group.name,
+                query_count=len(queries_to_run),
+                total_queries=len(group.queries),
+            )
             log.info("group_run_start")
 
             ctx = _RunContext(global_remaining=self._global_budgets.get(group.name, 0))
+            previous_snapshot = self._exporter.snapshot_for(group.name)
+            if previous_snapshot is not None and len(run_query_ids) != len(group.queries):
+                _inherit_prior_for_skipped_queries(
+                    ctx, previous_snapshot, run_query_ids=run_query_ids
+                )
             with self._tracer.span(
                 "promforecast.group_run",
                 group=group.name,
-                query_count=len(group.queries),
+                query_count=len(queries_to_run),
             ):
-                for query in group.queries:
+                for query in queries_to_run:
+                    q_started = time.monotonic()
                     await self._run_query(query, group, ctx, log)
+                    ctx.run_duration_per_query[query.id] = time.monotonic() - q_started
 
             duration = time.monotonic() - started
             # Counter semantics: merge this run's slow_fits with the previous
@@ -599,7 +708,6 @@ class Runner:
             # to (query, model) tuples whose query still exists in the
             # current group config; otherwise a hot-reload that drops a
             # query would leak its old slow_fits label set forever.
-            previous_snapshot = self._exporter.snapshot_for(group.name)
             current_query_ids = {q.id for q in group.queries}
             merged_slow: dict[tuple[str, str], int] = (
                 {
@@ -661,7 +769,7 @@ class Runner:
             )
             for cpkey, cpcount in ctx.change_points.items():
                 merged_changepoints[cpkey] = merged_changepoints.get(cpkey, 0) + cpcount
-            # Monotonic merge for the v1.3 emission-clipped counter, pruned
+            # Monotonic merge for the emission-clipped counter, pruned
             # to query IDs that still exist in the live group config so a
             # reload that drops a query doesn't leak its old label set
             # forever.
@@ -676,6 +784,26 @@ class Runner:
             )
             for ekey, ecount in ctx.emission_clipped.items():
                 merged_emission_clipped[ekey] = merged_emission_clipped.get(ekey, 0) + ecount
+            # Drift-alert counter: same monotonic-merge pattern as the
+            # other per-(query) counters above. Skipped queries inherit
+            # their prior cumulative value via this merge (rather than
+            # through ``_inherit_prior_for_skipped_queries``), so the
+            # counter is preserved without a separate inherit path.
+            merged_drift_alerts: dict[str, int] = (
+                {
+                    key: count
+                    for key, count in previous_snapshot.drift_alerts_cumulative.items()
+                    if key in current_query_ids
+                }
+                if previous_snapshot is not None
+                else {}
+            )
+            for dkey, dcount in ctx.drift_alerts.items():
+                merged_drift_alerts[dkey] = merged_drift_alerts.get(dkey, 0) + dcount
+            # Band-coverage gauges are rendered from the persistent
+            # tracker on the runner — pull a snapshot now so the next
+            # /metrics scrape sees the most recent rolling fractions.
+            band_coverage_points = self._build_band_coverage_points(group, run_query_ids)
             self._exporter.update(
                 GroupSnapshot(
                     group=group.name,
@@ -689,7 +817,9 @@ class Runner:
                     growth_rates=ctx.growth_rates,
                     last_run_timestamp=time.time(),
                     run_duration_seconds=duration,
+                    run_duration_per_query=dict(ctx.run_duration_per_query),
                     series_count=ctx.series_count,
+                    series_count_per_query=dict(ctx.series_count_per_query),
                     series_dropped=ctx.dropped,
                     failures=ctx.failures,
                     regressor_failures=merged_regressor_failures,
@@ -705,6 +835,9 @@ class Runner:
                     change_points_cumulative=merged_changepoints,
                     emission_clipped_cumulative=merged_emission_clipped,
                     cold_start_siblings=dict(ctx.cold_start_siblings),
+                    drift_points=list(ctx.drift_points),
+                    drift_alerts_cumulative=merged_drift_alerts,
+                    band_coverage_points=band_coverage_points,
                 )
             )
             log.info(
@@ -781,6 +914,12 @@ class Runner:
         ctx: _RunContext,
         qlog: structlog.stdlib.BoundLogger,
     ) -> None:
+        # Seed the per-query series count so a query that fails before the
+        # accept-loop still reports ``forecast_query_series_count=0`` on
+        # this tick. Without this seed the gauge would be silently missing
+        # for a failing query and dashboards would see a stale value
+        # inherited from a prior successful run.
+        ctx.series_count_per_query.setdefault(query.id, 0)
         frames = await self._discover_and_fetch(query, group, ctx, qlog)
         if frames is None:
             return
@@ -822,6 +961,9 @@ class Runner:
         if global_cap_enabled:
             ctx.global_remaining = max(0, ctx.global_remaining - len(allowed))
         ctx.series_count += len(allowed)
+        ctx.series_count_per_query[query.id] = ctx.series_count_per_query.get(query.id, 0) + len(
+            allowed
+        )
 
         # Prefetch every PromQL regressor *once* per primary query — not
         # per series. Without this split a query that returned 100 series
@@ -1225,8 +1367,8 @@ class Runner:
             )
         ]
 
-        # Apply count-aware emission safeguards (v1.3) to cold-start
-        # forecasts as well so a count-shaped series doesn't suddenly
+        # Apply count-aware emission safeguards to cold-start forecasts
+        # as well so a count-shaped series doesn't suddenly
         # emit negative or fractional values just because its first
         # forecast came from a borrowed shape. Snapshot pass owns the
         # counter — the curve pass mutates values only — so we don't
@@ -1557,7 +1699,7 @@ class Runner:
         # and ``_RunContext`` retains them across the per-series loop.
         result.capacity_inputs.clear()
 
-        # Count-aware emission safeguards (v1.3). Applied *after* the
+        # Count-aware emission safeguards. Applied *after* the
         # calibration widening so a band that widened into negative
         # territory still gets clipped. Run on both the snapshot and
         # the remote_write curve so scrape + push see the same numbers;
@@ -1627,7 +1769,151 @@ class Runner:
             if contributions:
                 result.contribution = list(factory.contribution_points(contributions))
 
+        # Drift telemetry. We compare the current full yhat curve to the
+        # cached previous yhat curve per (group, query, series, model).
+        # ``result.curve`` has one row per horizon step per emitted band
+        # row; ``_record_drift`` filters to the ``_forecast`` (yhat) rows.
+        if query.emission.drift.enabled and result.curve:
+            self._record_drift(
+                query=query,
+                group_name=group_name,
+                series_key=_series_key_from_labels(frame.labels),
+                curve_points=result.curve,
+                factory=factory,
+                result=result,
+            )
+
+        # Band coverage: record one (inside / outside) observation per
+        # (model, level, window) against the trailing backtest row.
+        # The buffer maxlen is sized to ``window / refresh_interval``
+        # rather than ``window / step`` because the runner records one
+        # observation per fit, not per data step — keeping the two in
+        # lockstep so a "full" buffer means "this window of refresh
+        # cadences is observed" instead of a 12x-oversized buffer that
+        # never fills.
+        if query.emission.band_coverage.enabled and backtests:
+            self._record_band_coverage(
+                query=query,
+                group_name=group_name,
+                series_key=_series_key_from_labels(frame.labels),
+                backtests=backtests,
+                emitted_models=emitted_models,
+                observation_period=effective_refresh_interval(query, self._config.server),
+            )
+
         return result
+
+    def _record_drift(
+        self,
+        *,
+        query: QueryConfig,
+        group_name: str,
+        series_key: str,
+        curve_points: list[ForecastCurvePoint],
+        factory: SeriesPointFactory,
+        result: _FitResult,
+    ) -> None:
+        """Compute drift gauges for every emitted (series, model) pair.
+
+        We isolate the per-model **full** yhat curve from
+        ``curve_points`` (each carries ``model`` on its labels, a
+        ``_forecast`` / ``_forecast_lower`` / ``_forecast_upper``
+        metric name, and a per-step ``timestamp_ms``). Only the
+        yhat-row entries (metric exactly ``<id>_forecast``) feed the
+        drift score so the bands don't pollute the comparison.
+
+        Curves are compared against the previous curve cached on
+        :attr:`_drift_cache`; the new curve overwrites the cache so
+        the next refit gets the same treatment. ``NaN`` scores
+        (no prior fit, or both curves all-NaN) skip the gauge — the
+        exporter's render path filters non-finite samples and the
+        alert counter only ticks on finite >= threshold values.
+        """
+        drift_cfg = query.emission.drift
+        yhat_metric = f"{query.id}_forecast"
+        curves_by_model: dict[str, list[float]] = {}
+        for point in curve_points:
+            # The curve carries one row per horizon step per emitted
+            # band; restrict to the exact yhat metric for this query so
+            # the bands don't pollute the comparison and a query whose
+            # id legitimately contains ``forecast`` (e.g.
+            # ``api_forecast_count``) isn't mis-matched by a substring
+            # check.
+            if point.metric != yhat_metric:
+                continue
+            model_name = point.labels.get("model", "")
+            if not model_name:
+                continue
+            curves_by_model.setdefault(model_name, []).append(point.value)
+        for model_name, curve in curves_by_model.items():
+            previous = self._drift_cache.get(
+                group=group_name,
+                query=query.id,
+                series_key=series_key,
+                model=model_name,
+            )
+            score = (
+                drift_mod.compute_drift(previous, curve, method=drift_cfg.method)
+                if previous is not None
+                else float("nan")
+            )
+            self._drift_cache.put(
+                group=group_name,
+                query=query.id,
+                series_key=series_key,
+                model=model_name,
+                curve=curve,
+            )
+            if math.isfinite(score):
+                labels = {**factory.drift_labels(model_name), "method": drift_cfg.method}
+                result.drift_points.append(DriftPoint(labels=labels, score=score))
+                if drift_cfg.alert_threshold is not None and score >= drift_cfg.alert_threshold:
+                    result.drift_alerts += 1
+
+    def _record_band_coverage(
+        self,
+        *,
+        query: QueryConfig,
+        group_name: str,
+        series_key: str,
+        backtests: dict[str, BacktestOutcome],
+        emitted_models: list[str],
+        observation_period: timedelta,
+    ) -> None:
+        """Push one (inside / outside) observation per (model, level, window).
+
+        Uses the trailing backtest row's (actual, lower, upper) tuple as
+        the most recent observation — same source the deviation metrics
+        consume. ``observation_period`` is the time between successive
+        observations the runner produces; the tracker sizes each
+        bucket's ring to ``window / observation_period`` so a "full"
+        bucket really means "this window's worth of refreshes is
+        recorded".
+        """
+        windows = query.emission.band_coverage.windows
+        for model_name in emitted_models:
+            outcome = backtests.get(model_name)
+            if outcome is None:
+                continue
+            actual = outcome.last_actual
+            if not math.isfinite(actual):
+                continue
+            for level, band in outcome.last_bands.items():
+                if not (math.isfinite(band.lower) and math.isfinite(band.upper)):
+                    continue
+                inside = deviation_mod.inside_band(actual, band.lower, band.upper)
+                for window in windows:
+                    self._band_coverage.observe(
+                        group=group_name,
+                        query=query.id,
+                        series_key=series_key,
+                        model=model_name,
+                        level=level,
+                        window_label=_format_band_window(window),
+                        window=window,
+                        step=observation_period,
+                        inside=inside,
+                    )
 
     def _align_regressors_for_series(
         self,
@@ -2113,19 +2399,20 @@ class Runner:
                 freq=freq,
                 season_length=season_length,
             ):
-                return await asyncio.wait_for(
-                    loop.run_in_executor(
-                        self._executor,
-                        _run_backtest,
-                        model,
-                        df,
-                        eval_steps,
-                        freq,
-                        levels,
-                        regressors,
-                    ),
-                    timeout=timeout,
-                )
+                async with self._fits_semaphore:
+                    return await asyncio.wait_for(
+                        loop.run_in_executor(
+                            self._executor,
+                            _run_backtest,
+                            model,
+                            df,
+                            eval_steps,
+                            freq,
+                            levels,
+                            regressors,
+                        ),
+                        timeout=timeout,
+                    )
 
         outcomes = await asyncio.gather(*(_one(spec) for spec in models), return_exceptions=True)
         results: dict[str, BacktestOutcome] = {}
@@ -2346,19 +2633,54 @@ class Runner:
             freq=freq,
             season_length=season_length,
         ):
-            return await asyncio.wait_for(
-                loop.run_in_executor(
-                    self._executor,
-                    _run_fit,
-                    model,
-                    df,
-                    horizon,
-                    freq,
-                    levels,
-                    regressors,
-                ),
-                timeout=self._config.safety.fit_timeout.total_seconds(),
+            # ``_fits_semaphore`` caps the number of concurrent fits across
+            # every group/query — important when per-query refresh
+            # schedules synchronise multiple groups onto the same tick.
+            async with self._fits_semaphore:
+                return await asyncio.wait_for(
+                    loop.run_in_executor(
+                        self._executor,
+                        _run_fit,
+                        model,
+                        df,
+                        horizon,
+                        freq,
+                        levels,
+                        regressors,
+                    ),
+                    timeout=self._config.safety.fit_timeout.total_seconds(),
+                )
+
+    def _build_band_coverage_points(
+        self,
+        group: GroupConfig,
+        run_query_ids: set[str],
+    ) -> list[BandCoveragePoint]:
+        """Snapshot the tracker into ``BandCoveragePoint``s for the exporter.
+
+        We render *every* tracked sample, regardless of which queries
+        ran this tick, so /metrics always shows the latest rolling
+        fraction for every (group, query) tuple with data. The
+        ``run_query_ids`` parameter is reserved for future filtering
+        but unused today — the tracker is bounded by the live config
+        already via :meth:`band_coverage.BandCoverageTracker.forget`.
+        """
+        del run_query_ids
+        live_query_ids = {q.id for q in group.queries}
+        out: list[BandCoveragePoint] = []
+        for sample in self._band_coverage.samples():
+            if sample.labels.get("group") != group.name:
+                continue
+            if sample.labels.get("id") not in live_query_ids:
+                continue
+            out.append(
+                BandCoveragePoint(
+                    labels=sample.labels,
+                    fraction=sample.fraction,
+                    samples=sample.samples,
+                )
             )
+        return out
 
     async def pause(self) -> None:
         """Stop scheduling, leave the executor / source / sink alive.
@@ -2539,7 +2861,7 @@ def _apply_offsets_to_curve_points(
     return out
 
 
-# Count-aware emission safeguards (v1.3).
+# Count-aware emission safeguards.
 #
 # When a query's ``emission.clip_non_negative`` is True every emitted
 # forecast / band value is clamped at zero from below; when its
@@ -2682,6 +3004,144 @@ def _merge_fit_into_ctx(ctx: _RunContext, fit_result: _FitResult, query_id: str)
         ctx.emission_clipped[ekey] = ctx.emission_clipped.get(ekey, 0) + count
     if fit_result.cold_start_siblings > 0:
         ctx.cold_start_siblings[query_id] = fit_result.cold_start_siblings
+    ctx.drift_points.extend(fit_result.drift_points)
+    if fit_result.drift_alerts:
+        ctx.drift_alerts[query_id] = ctx.drift_alerts.get(query_id, 0) + fit_result.drift_alerts
+
+
+def _inherit_prior_for_skipped_queries(  # noqa: PLR0912
+    ctx: _RunContext,
+    prior: GroupSnapshot,
+    *,
+    run_query_ids: set[str],
+) -> None:
+    """Preload ``ctx`` with prior-snapshot data for queries skipped this tick.
+
+    With per-query refresh intervals, ``run_group`` may run only a
+    subset of the group's queries on any given tick. Without this
+    preload the snapshot would lose every other query's last-known
+    forecast / accuracy / deviation rows the next time the partial
+    snapshot is published. Counter-style fields (slow_fits, gaps_filled,
+    ...) are already merged with the prior via the explicit
+    counter-merge logic in :meth:`Runner.run_group`; here we only need
+    to copy snapshot-style (gauge / list) data.
+
+    ``run_query_ids`` is the set of query IDs that *will* run this
+    tick; everything else gets its prior data inherited. ``curve_points``
+    are intentionally *not* inherited because they drive the remote_write
+    sink — pushing previously-fit curves every refresh would duplicate
+    data in the TSDB.
+    """
+    # Point lists keyed by query-id label.
+    for point in prior.accuracy_points:
+        if point.labels.get("id") not in run_query_ids:
+            ctx.accuracy_points.append(point)
+    for dpoint in prior.deviation_points:
+        if dpoint.labels.get("id") not in run_query_ids:
+            ctx.deviation_points.append(dpoint)
+    for qpoint in prior.quality_points:
+        if qpoint.labels.get("id") not in run_query_ids:
+            ctx.quality_points.append(qpoint)
+    for epoint in prior.ensemble_weights:
+        if epoint.labels.get("id") not in run_query_ids:
+            ctx.ensemble_weight_points.append(epoint)
+    for cpoint in prior.calibration_offsets:
+        if cpoint.labels.get("id") not in run_query_ids:
+            ctx.calibration_offsets.append(cpoint)
+    for drift_point in prior.drift_points:
+        if drift_point.labels.get("id") not in run_query_ids:
+            ctx.drift_points.append(drift_point)
+    # Point lists keyed by metric name (which encodes the query id).
+    for fpoint in prior.points:
+        q_id = _query_id_from_metric(fpoint.metric)
+        if q_id not in run_query_ids:
+            ctx.points.append(fpoint)
+    for contribution_point in prior.contribution_points:
+        if _query_id_from_metric(contribution_point.metric) not in run_query_ids:
+            ctx.contribution_points.append(contribution_point)
+    for tpoint in prior.threshold_etas:
+        if _query_id_from_metric(tpoint.metric) not in run_query_ids:
+            ctx.threshold_etas.append(tpoint)
+    for gpoint in prior.growth_rates:
+        if _query_id_from_metric(gpoint.metric) not in run_query_ids:
+            ctx.growth_rates.append(gpoint)
+    # Per-(query, model) and per-query dicts that aren't counters.
+    for (q_id, model_name), fit_seconds in prior.fit_durations.items():
+        if q_id not in run_query_ids:
+            ctx.fit_durations[(q_id, model_name)] = fit_seconds
+    for q_id, stats in prior.preprocess_stats.items():
+        if q_id not in run_query_ids:
+            # ``PreprocessStats`` is mutable (the runner mutates it
+            # in-place when accumulating per-query stats). Copying
+            # defensively here prevents a future writer on the new ctx
+            # from mutating the prior snapshot mid-render: a follower
+            # serving ``/metrics`` would otherwise see torn state.
+            ctx.preprocess_stats[q_id] = PreprocessStats(
+                gaps_filled=dict(stats.gaps_filled),
+                max_gap_seconds=stats.max_gap_seconds,
+                outliers_replaced=dict(stats.outliers_replaced),
+                change_points=stats.change_points,
+                effective_lookback_seconds=stats.effective_lookback_seconds,
+            )
+    for q_id, count in prior.cold_start_siblings.items():
+        if q_id not in run_query_ids:
+            ctx.cold_start_siblings[q_id] = count
+    for q_id, dur in prior.run_duration_per_query.items():
+        if q_id not in run_query_ids:
+            ctx.run_duration_per_query[q_id] = dur
+    for q_id, count in prior.series_count_per_query.items():
+        if q_id not in run_query_ids:
+            ctx.series_count_per_query[q_id] = count
+
+
+def _series_key_from_labels(labels: dict[str, str]) -> str:
+    """Stable per-series key derived from the label set.
+
+    Used to address per-series state in the drift cache and band-coverage
+    tracker. Skips ``__name__`` (Prometheus's reserved metric-name
+    pseudo-label) so two queries that return the same labelset on a
+    different metric share state appropriately — both forecast the same
+    underlying signal.
+
+    The key is ``"k1=v1,k2=v2"`` with sorted keys so equal label
+    dictionaries produce the same key regardless of iteration order.
+    """
+    items = sorted((k, v) for k, v in labels.items() if k != "__name__")
+    return ",".join(f"{k}={v}" for k, v in items)
+
+
+def _format_band_window(window: timedelta) -> str:
+    """Render a ``timedelta`` window as a Prometheus-style label."""
+    return point_factory_mod.format_window(window.total_seconds())
+
+
+# Suffixes that the runner / point_factory emits on forecast-derived
+# metrics. ``_query_id_from_metric`` matches the longest one first so an
+# id like ``api_forecast_count`` (a legal Prometheus identifier) is not
+# mis-routed by an internal ``_forecast`` substring.
+_FORECAST_METRIC_SUFFIXES: tuple[str, ...] = (
+    "_forecast_contribution_ratio",
+    "_forecast_time_to_threshold_seconds",
+    "_forecast_growth_rate",
+    "_forecast_lower",
+    "_forecast_upper",
+    "_forecast",
+)
+
+
+def _query_id_from_metric(metric_name: str) -> str:
+    """Pull the query ``id`` back out of a forecast metric name.
+
+    Matches the known emission suffix set rather than ``rfind("_forecast")``
+    so a query id that legitimately contains the word ``forecast`` (e.g.
+    ``api_forecast_count``) round-trips correctly.
+    """
+    for suffix in _FORECAST_METRIC_SUFFIXES:
+        if metric_name.endswith(suffix):
+            stem = metric_name[: -len(suffix)]
+            if stem:
+                return stem
+    return ""
 
 
 def _resolve_spec(specs: list[ModelSpec], name: str) -> ModelSpec:

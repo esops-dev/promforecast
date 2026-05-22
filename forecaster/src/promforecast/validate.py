@@ -60,13 +60,19 @@ class CardinalityEstimate:
     preprocess_lines: int
     threshold_eta_lines: int
     growth_rate_lines: int
-    # v1.3 count-aware emission counter — per (query, kind=negative|rounded)
+    # Count-aware emission counter — per (query, kind=negative|rounded)
     # when a query opts in via ``data_profile: count`` or sets the
     # explicit emission toggles.
     emission_clipped_lines: int
-    # v1.3 cold-start sibling gauge — per (query) when cold-start is
+    # Cold-start sibling gauge — per (query) when cold-start is
     # configured. Bounded; gauge counts as one line per query.
     cold_start_lines: int
+    # Drift telemetry: per-(series, model) gauge plus per-(query)
+    # alert counter for every query that opts into ``emission.drift``.
+    drift_lines: int
+    # Empirical band coverage: per-(series, model, level, window) rolling
+    # gauge for every query that opts into ``emission.band_coverage``.
+    band_coverage_lines: int
     operational_lines: int
 
     @property
@@ -83,6 +89,8 @@ class CardinalityEstimate:
             + self.growth_rate_lines
             + self.emission_clipped_lines
             + self.cold_start_lines
+            + self.drift_lines
+            + self.band_coverage_lines
             + self.operational_lines
         )
 
@@ -140,6 +148,8 @@ def run_validate(
     write(f"  growth rate lines  {estimate.growth_rate_lines:>8}")
     write(f"  emission clipped   {estimate.emission_clipped_lines:>8}")
     write(f"  cold start lines   {estimate.cold_start_lines:>8}")
+    write(f"  drift lines        {estimate.drift_lines:>8}")
+    write(f"  band coverage      {estimate.band_coverage_lines:>8}")
     write(f"  operational lines  {estimate.operational_lines:>8}")
     write(f"  total              {estimate.total:>8}")
     if cfg.safety.max_total_series and estimate.total > cfg.safety.max_total_series:
@@ -271,7 +281,7 @@ def _estimate_cardinality(cfg: Config) -> CardinalityEstimate:  # noqa: PLR0912,
     if any_changepoint_on:
         preprocess_lines += queries
 
-    # v1.3 count-aware emission clipping: a per-(query, kind=negative|rounded)
+    # Count-aware emission clipping: a per-(query, kind=negative|rounded)
     # counter, bounded to 2 lines per query. Charged only against queries
     # that explicitly opt in (``emission.clip_non_negative`` /
     # ``round_to_integer`` set, or ``data_profile: count``) because most
@@ -291,7 +301,7 @@ def _estimate_cardinality(cfg: Config) -> CardinalityEstimate:  # noqa: PLR0912,
                 # Two ``kind`` values (negative, rounded) per query.
                 emission_clipped_lines += 2
 
-    # v1.3 cold-start: ``forecast_cold_start_siblings{group, query}`` is a
+    # Cold-start: ``forecast_cold_start_siblings{group, query}`` is a
     # single gauge per query that has cold-start configured.
     cold_start_lines = 0
     for group in cfg.groups:
@@ -299,8 +309,35 @@ def _estimate_cardinality(cfg: Config) -> CardinalityEstimate:  # noqa: PLR0912,
             if q.cold_start.borrow_from is not None:
                 cold_start_lines += 1
 
+    # Drift telemetry. ``forecast_drift_score`` is per (series, model);
+    # we count it against ``series_cap`` per opted-in query. The
+    # ``forecast_drift_alerts_total`` counter is one line per opted-in
+    # query.
+    drift_lines = 0
+    for group in cfg.groups:
+        for q in group.queries:
+            if not q.emission.drift.enabled:
+                continue
+            drift_lines += series_cap * emitted_models
+            drift_lines += 1  # the per-(group, query) alert counter row
+
+    # Empirical band coverage. ``forecast_band_empirical_coverage`` is
+    # per (series, model, level, window) for opted-in queries.
+    band_coverage_lines = 0
+    for group in cfg.groups:
+        for q in group.queries:
+            if not q.emission.band_coverage.enabled:
+                continue
+            n_windows = max(1, len(q.emission.band_coverage.windows))
+            band_coverage_lines += series_cap * emitted_models * n_levels * n_windows
+
     # Operational: 7 gauges + N reasons per group; we ballpark 7 per group.
-    operational_lines = 7 * len(cfg.groups)
+    # The runner also emits per-(group, query) rows of
+    # ``forecast_query_run_duration_seconds`` and
+    # ``forecast_query_series_count`` for every query (not just queries
+    # that override ``refresh_interval``), so we add two extra lines per
+    # query unconditionally.
+    operational_lines = 7 * len(cfg.groups) + 2 * queries
 
     return CardinalityEstimate(
         series_per_query=series_cap,
@@ -318,6 +355,8 @@ def _estimate_cardinality(cfg: Config) -> CardinalityEstimate:  # noqa: PLR0912,
         growth_rate_lines=growth_rate_lines,
         emission_clipped_lines=emission_clipped_lines,
         cold_start_lines=cold_start_lines,
+        drift_lines=drift_lines,
+        band_coverage_lines=band_coverage_lines,
         operational_lines=operational_lines,
     )
 

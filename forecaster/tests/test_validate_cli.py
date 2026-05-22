@@ -123,14 +123,14 @@ def test_cardinality_estimate_matches_doc_formula() -> None:
     assert est.deviation_lines == 1 * 100 * 2 * 2 * 2
     # 1 * 100 * 2 emitted = 200.
     assert est.quality_lines == 1 * 100 * 2
-    # Without thresholds / growth-rate emission, the v1.2 families
+    # Without thresholds / growth-rate emission, the capacity families
     # contribute zero to the estimate.
     assert est.threshold_eta_lines == 0
     assert est.growth_rate_lines == 0
 
 
 def test_cardinality_estimate_counts_threshold_and_growth_rate_lines() -> None:
-    """v1.2 ETA + growth-rate families must show up in the cardinality estimate."""
+    """Capacity ETA + growth-rate families must show up in the cardinality estimate."""
     from datetime import timedelta  # noqa: PLC0415
 
     from promforecast.config import (  # noqa: PLC0415

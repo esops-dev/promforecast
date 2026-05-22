@@ -23,6 +23,11 @@ logger = structlog.get_logger(__name__)
 
 CALENDAR_FEATURE_TYPES = ("hour_of_day", "day_of_week", "is_weekend")
 
+# Bounded set of regressor "types" the schema accepts. Stays small on purpose:
+# every new type ships its own validator and runtime path, so a Literal here
+# prevents typos from silently degrading to ``custom``.
+REGRESSOR_TYPES = ("custom", "calendar", "holidays")
+
 # Versioned schema. ``apiVersion`` mirrors the Kubernetes convention so a
 # config file declares which schema it conforms to and the loader can route
 # between versions transparently. ``promforecast.io/v1`` is the stable
@@ -46,12 +51,15 @@ _PROM_DURATION_RE = re.compile(
 )
 
 
-def _parse_duration(value: object) -> object:
+def parse_duration(value: object) -> object:
     """Accept Prometheus-style durations (``5m``, ``1h``, ``14d``).
 
     Pydantic's native timedelta parser only accepts ISO-8601 ("PT5M") and
     seconds. The Prometheus ecosystem uses the compact form everywhere, so
     config files become unfriendly without this coercion.
+
+    Public helper: re-used by ``preview.py`` (for ``horizon`` / ``lookback``
+    overrides) and any future caller that wants the same syntax.
     """
     if not isinstance(value, str):
         return value
@@ -62,7 +70,7 @@ def _parse_duration(value: object) -> object:
     return timedelta(days=days, hours=hours, minutes=minutes, seconds=seconds, milliseconds=millis)
 
 
-Duration = Annotated[timedelta, BeforeValidator(_parse_duration)]
+Duration = Annotated[timedelta, BeforeValidator(parse_duration)]
 
 
 class AuthConfig(BaseModel):
@@ -130,6 +138,12 @@ class ServerConfig(BaseModel):
     # cluster but not on a public address. Operators flip this on when they
     # need to confirm what the forecaster is *actually* running.
     expose_config_endpoint: bool = False
+    # ``POST /forecast/preview`` returns a JSON forecast for ad-hoc inputs
+    # (override regressors, override horizon, override lookback) without
+    # touching the YAML config. Same network-level access-control model as
+    # ``/-/reload``: rely on NetworkPolicy and service exposure. Off by
+    # default; flip on to support what-if dashboards.
+    expose_preview_endpoint: bool = False
 
 
 class SafetyConfig(BaseModel):
@@ -150,6 +164,14 @@ class SafetyConfig(BaseModel):
     series_overflow: Literal["drop_lowest_priority", "reject", "sample"] = "drop_lowest_priority"
     fit_timeout: Duration = timedelta(seconds=60)
     query_timeout: Duration = timedelta(seconds=30)
+    # Cap on simultaneous per-query refresh jobs across the whole forecaster.
+    # Per-query refresh intervals let groups schedule jobs independently;
+    # without a global cap, a burst of cheap queries can
+    # all line up on the same tick and saturate the executor pool. The
+    # default of 8 mirrors the datasource concurrency cap so a single
+    # forecaster doesn't open more parallel fits than it has TSDB read
+    # slots.
+    max_concurrent_fits: int = Field(default=8, ge=1)
 
 
 class ConformalConfig(BaseModel):
@@ -276,13 +298,18 @@ class DefaultsConfig(BaseModel):
 class RegressorConfig(BaseModel):
     """Exogenous regressor wired into a query.
 
-    Two flavours:
+    Three flavours:
 
     * ``type: calendar`` — built-in deterministic features
       (``hour_of_day``, ``day_of_week``, ``is_weekend``). ``id`` doubles as
       the feature name and must match one of those built-ins.
     * ``type: custom`` (default) — a PromQL query whose returned series is
       aligned to the primary query's time index. ``promql`` is required.
+    * ``type: holidays`` — wraps the ``holidays`` PyPI package. ``country``
+      is required; optional ``regions`` narrows the per-region list
+      (e.g. US states); ``expand: true`` emits one regressor column per
+      holiday name (so the model can learn that Black Friday differs from
+      Thanksgiving) instead of a single ``is_holiday`` binary column.
 
     ``required`` flips the failure mode from graceful (skip the regressor,
     keep forecasting) to fatal-per-series (the whole series is skipped if
@@ -294,8 +321,22 @@ class RegressorConfig(BaseModel):
 
     id: str
     promql: str | None = None
-    type: Literal["custom", "calendar"] = "custom"
+    type: Literal["custom", "calendar", "holidays"] = "custom"
     required: bool = False
+    # Holiday-regressor parameters. Only consulted when ``type == "holidays"``.
+    # ``country`` is the ISO-3166-1 alpha-2 country code accepted by the
+    # ``holidays`` package. ``regions`` narrows to per-region calendars (e.g.
+    # US states, Canadian provinces); ``[]`` (default) means the country-wide
+    # union. ``expand`` switches between a single binary column (default,
+    # bounded cardinality) and one-hot per holiday name. ``timezone`` is the
+    # IANA name used to convert UTC query timestamps to a local calendar
+    # date before the holiday lookup; defaults to ``UTC`` which matches the
+    # original behaviour but is wrong for localised workloads (a US holiday
+    # otherwise flips at UTC-midnight rather than US-Eastern midnight).
+    country: str | None = None
+    regions: list[str] = Field(default_factory=list)
+    expand: bool = False
+    timezone: str = "UTC"
 
 
 class DiscoveryVariable(BaseModel):
@@ -364,17 +405,71 @@ class GrowthRateEmissionConfig(BaseModel):
     units: Literal["units_per_second", "percent"] = "units_per_second"
 
 
+class DriftEmissionConfig(BaseModel):
+    """Per-query forecast-drift telemetry.
+
+    When ``enabled: true`` the runner compares each new forecast vector
+    against the previous successful fit for the same series and emits a
+    drift score per (series, model). Two scoring methods are supported:
+
+    * ``method: mape`` (default) — symmetric mean absolute percentage
+      change between the two yhat curves. Cheap, dimension-free, and the
+      most operator-friendly choice for "the prediction shifted by N%".
+    * ``method: wasserstein`` — 1-D Wasserstein (earth-mover) distance
+      between the two curves treated as empirical distributions, scaled
+      by ``mean(|previous|)`` so it stays dimension-free. Useful when the
+      operator cares about distributional shape changes rather than
+      pointwise magnitude.
+
+    ``alert_threshold`` bumps the ``forecast_drift_alerts_total`` counter
+    whenever the score crosses the threshold. Counter-based rather than a
+    gauge boolean so an alert on ``increase(...) > 0`` survives transient
+    flips. ``None`` disables the alert counter even when scoring is on.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = True
+    method: Literal["mape", "wasserstein"] = "mape"
+    alert_threshold: float | None = 0.25
+
+
+class BandCoverageConfig(BaseModel):
+    """Per-query empirical band-coverage diagnostics.
+
+    When ``enabled: true`` the exporter tracks a rolling boolean
+    (actual ∈ band) per (series, level, window) and emits
+    ``forecast_band_empirical_coverage{id, group, model, level, window}``.
+    The gauge reports the fraction of recent actuals that fell inside the
+    nominal band, so an operator can detect "the 95% band is empirically
+    covering 40%" before backtest MAPE picks the regression up.
+
+    Memory cost is bounded: ``window / step`` booleans per (series, level,
+    window). With the default windows of ``1d`` + ``7d`` and a 5m step
+    that's 288 + 2016 = ~2.3 kbits per (series, level), a fraction of a
+    megabyte for the canonical 5000-series cap.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = True
+    windows: list[Duration] = Field(default_factory=lambda: [timedelta(days=1), timedelta(days=7)])
+
+
 class QueryEmissionConfig(BaseModel):
     """Per-query emission toggles.
 
-    Today three families of settings live here:
+    Today five families of settings live here:
 
-    * :class:`GrowthRateEmissionConfig` (the v1.2 forecast growth-rate
-      metric)
-    * ``clip_non_negative`` and ``round_to_integer`` (v1.3 count-aware
-      emission safeguards for non-negative / integer-valued metrics)
+    * :class:`GrowthRateEmissionConfig` — forecast growth-rate metric.
+    * ``clip_non_negative`` and ``round_to_integer`` — count-aware
+      emission safeguards for non-negative / integer-valued metrics.
+    * :class:`DriftEmissionConfig` — forecast-vs-previous-forecast
+      drift telemetry.
+    * :class:`BandCoverageConfig` — empirical band coverage rolling
+      gauges.
 
-    All three are kept on the per-query :class:`EmissionConfig` block so
+    Every family is kept on the per-query :class:`EmissionConfig` block so
     operators opt in *per metric*: a config that mixes a count-valued
     error counter with a continuous CPU-busy-percent series isn't
     forced to choose a single rounding policy for both.
@@ -382,10 +477,10 @@ class QueryEmissionConfig(BaseModel):
     ``clip_non_negative`` / ``round_to_integer`` default to ``None`` so
     the runner can distinguish "operator left it unset" from "operator
     explicitly said off". When a query carries ``data_profile: count``,
-    the runner treats unset toggles as opt-in (both default to ``True``)
-    — that's the documented v1.3 behaviour. An operator who wants the
-    count profile but explicit continuous emission still gets the
-    override by setting the toggle to ``False`` directly.
+    the runner treats unset toggles as opt-in (both default to ``True``).
+    An operator who wants the count profile but explicit continuous
+    emission still gets the override by setting the toggle to ``False``
+    directly.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -393,6 +488,8 @@ class QueryEmissionConfig(BaseModel):
     growth_rate: GrowthRateEmissionConfig = Field(default_factory=GrowthRateEmissionConfig)
     clip_non_negative: bool | None = None
     round_to_integer: bool | None = None
+    drift: DriftEmissionConfig = Field(default_factory=DriftEmissionConfig)
+    band_coverage: BandCoverageConfig = Field(default_factory=BandCoverageConfig)
 
 
 class ColdStartBorrowConfig(BaseModel):
@@ -408,8 +505,8 @@ class ColdStartBorrowConfig(BaseModel):
     average before being fed into :class:`SeasonalNaiveModel` as the
     cold-start forecast.
 
-    ``method`` is fixed at ``median_normalized`` in v1.3 — the only
-    method shipped today — but the field exists so future variants
+    ``method`` is fixed at ``median_normalized`` — the only method
+    shipped today — but the field exists so future variants
     (``mean_normalized``, ``trimmed_median``) can ship without a schema
     bump.
     """
@@ -441,7 +538,7 @@ class ColdStartConfig(BaseModel):
 
     **Explicit non-goal**: this is not full hierarchical reconciliation
     — the borrowed shape is a prior, not a constrained joint forecast.
-    True bottom-up/top-down reconciliation is a v2 model-pack concern.
+    True bottom-up/top-down reconciliation is a future model-pack concern.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -497,6 +594,12 @@ class QueryConfig(BaseModel):
     emission: QueryEmissionConfig = Field(default_factory=QueryEmissionConfig)
     data_profile: Literal["intermittent", "count", "continuous"] | None = None
     cold_start: ColdStartConfig = Field(default_factory=ColdStartConfig)
+    # Per-query refresh override. When ``None`` (default) the query
+    # inherits ``server.refresh_interval`` from its group. Setting it
+    # explicitly schedules an independent timer for this query, so a
+    # group can mix cheap-and-stable hourly metrics with expensive daily
+    # capacity refits without forking the YAML into two groups.
+    refresh_interval: Duration | None = None
 
 
 class CanaryConfig(BaseModel):
@@ -974,7 +1077,7 @@ def _check_api_version(raw: dict[str, Any], *, source: str) -> dict[str, Any]:
     return raw
 
 
-def _validate_query_overrides(*, group_name: str, query: QueryConfig) -> None:
+def _validate_query_overrides(*, group_name: str, query: QueryConfig) -> None:  # noqa: PLR0912
     """Reject obviously broken per-query ``step`` / ``season_length``.
 
     The pydantic schema accepts both fields as optional with broad types so
@@ -1009,6 +1112,24 @@ def _validate_query_overrides(*, group_name: str, query: QueryConfig) -> None:
                 raise ValueError(
                     f"{label}.emission.growth_rate.windows: must be positive durations"
                 )
+    drift = query.emission.drift
+    if drift.enabled and drift.alert_threshold is not None and drift.alert_threshold < 0:
+        raise ValueError(
+            f"{label}.emission.drift.alert_threshold must be >= 0 (or null to disable)"
+        )
+    band_cov = query.emission.band_coverage
+    if band_cov.enabled:
+        if not band_cov.windows:
+            raise ValueError(
+                f"{label}.emission.band_coverage: at least one window is required when enabled"
+            )
+        for window in band_cov.windows:
+            if window.total_seconds() <= 0:
+                raise ValueError(
+                    f"{label}.emission.band_coverage.windows: must be positive durations"
+                )
+    if query.refresh_interval is not None and query.refresh_interval.total_seconds() <= 0:
+        raise ValueError(f"{label}.refresh_interval must be a positive duration")
 
 
 def _validate_cold_start(*, label: str, query: QueryConfig) -> None:
@@ -1053,14 +1174,25 @@ def effective_step(query: QueryConfig, defaults: DefaultsConfig) -> timedelta:
     return query.step if query.step is not None else defaults.step
 
 
+def effective_refresh_interval(query: QueryConfig, server: ServerConfig) -> timedelta:
+    """Resolve the actual refresh interval for ``query``.
+
+    A query-level ``refresh_interval`` shadows the group/server-wide value
+    so an operator can mix hourly business KPIs with daily capacity refits
+    inside one group. ``None`` (the default) inherits ``server.refresh_interval``.
+    """
+    return query.refresh_interval if query.refresh_interval is not None else server.refresh_interval
+
+
 def effective_emission_safeguards(query: QueryConfig) -> tuple[bool, bool]:
     """Resolve ``(clip_non_negative, round_to_integer)`` for a query.
 
     A query with ``data_profile: count`` opts both toggles on by
     default so an operator who declared the profile gets count-safe
     emission without a second knob. An explicit boolean on either
-    toggle wins over the profile default — that's the override
-    pathway documented in v1.3.
+    toggle wins over the profile default — the explicit-override
+    pathway is what an operator should reach for when the profile's
+    default doesn't fit.
 
     Returns the resolved booleans the runner uses; the values are not
     persisted back on the query (the original config is read-only by
@@ -1151,14 +1283,83 @@ def _derive_season_length_from_step(step: timedelta) -> int:
     return 7
 
 
+def _validate_holiday_calendar(*, label: str, reg: RegressorConfig) -> None:
+    """Eagerly resolve the holiday calendar for ``reg`` to catch typos.
+
+    The ``holidays`` package raises ``NotImplementedError`` (or a subclass)
+    for unsupported countries and ``KeyError`` for unknown sub-divisions.
+    We translate both into a precise ``ValueError`` carrying the
+    offending YAML path so operators see "groups[g].queries[q].regressors[h]:
+    holiday country 'XZ' is not supported" instead of waiting for the
+    runner to bump ``forecast_regressor_failures_total{reason="invalid_type"}``
+    on every refresh.
+
+    Import is local so configs without holiday regressors never pay the
+    ``holidays`` import cost at load time. The optional ``holidays``
+    extras provides the dependency; the error message points operators
+    at the install command.
+
+    Calendar resolution is cached on ``(country, subdiv)`` so a config
+    with dozens of holiday regressors against the same country pays the
+    country-table materialisation cost exactly once per region.
+    """
+    try:
+        from . import regressors as _regressors  # noqa: PLC0415
+    except ImportError:  # pragma: no cover - the module is part of the package
+        _regressors = None  # type: ignore[assignment]
+
+    try:
+        import holidays  # noqa: PLC0415
+    except ImportError as exc:
+        raise ValueError(
+            f"{label}: holiday regressors require the optional 'holidays' extra. Install with "
+            f"`pip install 'promforecast[holidays]'` (underlying error: {exc})"
+        ) from exc
+
+    # Timezone validation: zoneinfo.ZoneInfo raises on an unknown name.
+    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError  # noqa: PLC0415
+    try:
+        ZoneInfo(reg.timezone)
+    except ZoneInfoNotFoundError as exc:
+        raise ValueError(
+            f"{label}: holiday regressor timezone is not a known IANA zone: {reg.timezone!r}"
+        ) from exc
+
+    country = str(reg.country)
+    cache_get = (
+        _regressors._holiday_calendar_cache_get if _regressors is not None else None
+    )
+    try:
+        if not reg.regions:
+            if cache_get is not None:
+                cache_get(country, None)
+            else:
+                holidays.country_holidays(country)
+        else:
+            for subdiv in reg.regions:
+                if cache_get is not None:
+                    cache_get(country, subdiv)
+                else:
+                    holidays.country_holidays(country, subdiv=subdiv)
+    except (NotImplementedError, KeyError) as exc:
+        raise ValueError(
+            f"{label}: holidays country/region not supported by the 'holidays' package: {exc}"
+        ) from exc
+
+
 def _validate_regressor(*, group_name: str, query_id: str, reg: RegressorConfig) -> None:
     """Per-regressor sanity checks.
 
-    Calendar regressors must use one of the supported feature names and
-    must not carry a ``promql:`` (it would be silently ignored). Custom
-    regressors must carry a non-empty ``promql:`` (otherwise the runner
-    has nothing to query). Both checks fail the load with a message that
-    points at the offending group/query so operators can find it quickly.
+    * Calendar regressors must use one of the supported feature names and
+      must not carry a ``promql:`` (it would be silently ignored).
+    * Custom regressors must carry a non-empty ``promql:`` (otherwise the
+      runner has nothing to query).
+    * Holiday regressors must declare a ``country`` and must not carry a
+      ``promql:``. They're deterministic per timestamp and never hit the
+      TSDB.
+
+    Each check fails the load with a message that points at the offending
+    group/query so operators can find it quickly.
     """
     label = f"groups[{group_name}].queries[{query_id}].regressors[{reg.id}]"
     if reg.type == "calendar":
@@ -1169,5 +1370,16 @@ def _validate_regressor(*, group_name: str, query_id: str, reg: RegressorConfig)
             )
         if reg.promql:
             raise ValueError(f"{label}: calendar regressors must not set promql")
+        if reg.country or reg.regions:
+            raise ValueError(f"{label}: calendar regressors must not set country/regions")
+    elif reg.type == "holidays":
+        if reg.promql:
+            raise ValueError(f"{label}: holiday regressors must not set promql")
+        if not reg.country:
+            raise ValueError(f"{label}: holiday regressors require a country code")
+        # Resolve the calendar once at boot so a typo in ``country`` /
+        # ``regions`` surfaces as a load-time error rather than as a
+        # silent per-series ``invalid_type`` failure on every refresh.
+        _validate_holiday_calendar(label=label, reg=reg)
     elif not reg.promql:
         raise ValueError(f"{label}: custom regressors require a non-empty promql")

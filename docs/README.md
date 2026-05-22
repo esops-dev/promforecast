@@ -19,6 +19,10 @@ The docs follow the [Diataxis](https://diataxis.fr/) framework:
 - [Change-points](change-points.md) — input-side break detection and lookback adaptation
 - [Conformal calibration](conformal.md) — empirical-coverage band correction
 - [Capacity planning](capacity.md) — damped trend, time-to-threshold ETAs, growth rate
+- [Forecast drift](drift.md) — prediction-vs-prediction shift telemetry
+- [Scheduling](scheduling.md) — per-query refresh intervals, max-concurrent-fits cap
+- [Forecast preview](preview.md) — opt-in ad-hoc what-if endpoint
+- [Regressors](regressors.md) — calendar, custom PromQL, and holiday regressors
 - [Development](development.md) — local toolchain, CI overview, adding models
 
 For a copy-and-edit reference deployment (multi-group config, HA values,
