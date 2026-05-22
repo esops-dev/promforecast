@@ -1,4 +1,4 @@
-"""Tests for the v1.3 intermittent-demand model wrappers.
+"""Tests for the intermittent-demand model wrappers.
 
 The actual ``fit_predict`` behaviour exercises ``statsforecast`` end to
 end; these tests pin down the wrapper-layer contracts:

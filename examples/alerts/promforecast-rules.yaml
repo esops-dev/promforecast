@@ -39,7 +39,7 @@ spec:
               Consider retraining, switching models, or extending the
               lookback window.
 
-        # v1.3: parallel rule for intermittent / count-shaped series. MAPE
+        # Parallel rule for intermittent / count-shaped series. MAPE
         # is undefined wherever the actual is zero, so the rule above
         # silently never fires for these series; MASE > 1.0 means the
         # forecast is doing worse than a seasonal naive baseline.
@@ -110,7 +110,7 @@ spec:
               likely producing meaningless output for this series; check
               data coverage and band width.
 
-        # v1.3: cold-start sibling headroom is thinning. The configured
+        # Cold-start sibling headroom is thinning. The configured
         # ``min_siblings`` is the contract; once the gauge drops below
         # the threshold the next cold-start fit will silently fall
         # through to the standard min_points drop. Catch the early
@@ -195,7 +195,7 @@ spec:
               {{ $labels.instance }} ({{ $labels.mountpoint }}) is below
               zero. Provision capacity or clean up.
 
-        # v1.2: alert on the time-to-threshold ETA family directly.
+        # Alert on the time-to-threshold ETA family directly.
         # Read against the conservative band (``level="95"``) so the
         # alert fires for "will hit threshold within N hours at 95%
         # confidence" rather than just for the central forecast. Tune
@@ -239,7 +239,7 @@ spec:
               expected to cross the configured ``warn`` threshold within
               4 hours. Right-size before SLO-impacting saturation.
 
-        # v1.2: growth-rate-change alert. Compares the 1d window slope
+        # Growth-rate-change alert. Compares the 1d window slope
         # against the 7d baseline; magnitudes are kept absolute so the
         # alert catches sudden *deceleration* of a free-space metric
         # (i.e. accelerating fill) symmetrically with sudden growth.

@@ -1,8 +1,8 @@
 """Tests for per-query ``step`` and ``season_length`` overrides.
 
 The runner has historically read ``step`` and ``season_length`` from
-``defaults`` only; the v0.3 user story adds per-query overrides so a single
-forecaster can mix metrics with very different cadences. These tests pin
+``defaults`` only; per-query overrides let a single forecaster mix
+metrics with very different cadences. These tests pin
 the schema (parsing + validation) and the runner wiring (the override
 actually flows into the query/fit calls).
 """

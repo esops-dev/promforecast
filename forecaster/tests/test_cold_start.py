@@ -1,4 +1,4 @@
-"""Tests for the v1.3 cold-start sibling-borrowing module.
+"""Tests for the cold-start sibling-borrowing module.
 
 The cold-start helpers are pure-function: most cases exercise them
 without spinning up the runner. A separate runner test plumbs cold-

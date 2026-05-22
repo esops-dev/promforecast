@@ -1,4 +1,4 @@
-"""Runner-side integration tests for v1.3 features.
+"""Runner-side integration tests for cold-start / count-aware / intermittent.
 
 Cold-start, count-aware safeguards, and the intermittent profile all
 plumb through ``Runner._do_run_query`` / ``Runner._fit_series``. We

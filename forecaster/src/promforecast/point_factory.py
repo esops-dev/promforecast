@@ -45,16 +45,16 @@ if TYPE_CHECKING:
     from .selector import SelectionResult
 
 
-def _format_window(seconds: float) -> str:
+def format_window(seconds: float) -> str:
     """Format a window duration as a stable Prometheus-style label.
 
-    The growth-rate ``window`` label is operator-facing — it appears on
-    every panel and alert tuned against these metrics — so we render it
-    in the same compact form the config accepts (``1d``, ``6h``,
-    ``15m``, ``45s``). We snap to the largest natural unit that divides
-    the value cleanly to match what the operator wrote in YAML; mixed
-    durations (e.g. ``90m``) fall back to seconds so the label is still
-    well-defined.
+    Operator-facing label rendering: any ``window`` / ``observation
+    window`` label that ends up on /metrics goes through this helper so
+    the value matches the compact form the config accepts (``1d``,
+    ``6h``, ``15m``, ``45s``). We snap to the largest natural unit that
+    divides the value cleanly to match what the operator wrote in YAML;
+    mixed durations (e.g. ``90m``) fall back to seconds so the label is
+    still well-defined.
     """
     s = round(seconds)
     if s <= 0:
@@ -138,7 +138,7 @@ class SeriesPointFactory:
         This convention matters for capacity-style alerts: an alert
         like ``node_filesystem_avail_bytes_forecast < 0`` answers
         "will the disk be empty at the configured horizon", not "will
-        it be empty at the next 5-minute step". The v1.2 ETA family
+        it be empty at the next 5-minute step". The ETA family
         (``<id>_forecast_time_to_threshold_seconds``) is the
         complementary read for "*when* does the forecast first cross
         the threshold".
@@ -176,6 +176,15 @@ class SeriesPointFactory:
                     labels={**common, "level": str(level)},
                     value=float(last[hi_col]),
                 )
+
+    def drift_labels(self, model_name: str) -> dict[str, str]:
+        """Common label set for a :class:`DriftPoint` in this series.
+
+        Drift gauges live alongside the operational families
+        (``id``-labelled, with ``model``) so dashboards can join them
+        cleanly against the forecast points without renaming.
+        """
+        return {**self._common_with_id(), "model": model_name}
 
     def calibration_offset_points(
         self,
@@ -346,7 +355,7 @@ class SeriesPointFactory:
         for rate in rates:
             labels = {
                 **common,
-                "window": _format_window(rate.window_seconds),
+                "window": format_window(rate.window_seconds),
                 "units": rate.units,
             }
             yield GrowthRatePoint(
@@ -441,7 +450,7 @@ class SeriesPointFactory:
         does not silently score well on the coverage dimension.
 
         ``score_kind`` chooses the scoring unit. The default ``"mape"``
-        preserves the v1.0 behaviour; pass ``"mase"`` when the caller's
+        is the historical default; pass ``"mase"`` when the caller's
         ``data_profile`` is ``intermittent`` so a series whose actuals
         are mostly zero (and therefore have NaN MAPE everywhere) still
         gets a meaningful quality signal.

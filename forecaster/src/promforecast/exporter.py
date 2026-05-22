@@ -31,9 +31,11 @@ if TYPE_CHECKING:
 
 __all__ = [
     "AccuracyPoint",
+    "BandCoveragePoint",
     "CalibrationOffsetPoint",
     "ContributionPoint",
     "DeviationPoint",
+    "DriftPoint",
     "EnsembleWeightPoint",
     "Exporter",
     "ForecastPoint",
@@ -155,6 +157,35 @@ class GrowthRatePoint:
 
 
 @dataclass(frozen=True)
+class DriftPoint:
+    """One ``forecast_drift_score`` sample.
+
+    Rendered as a gauge labelled with ``id``, ``group``, ``model``,
+    plus the rest of the series base labels so the value can be joined
+    against the underlying forecast in Grafana. ``method`` carries the
+    scoring method (``mape``/``wasserstein``) so dashboards can switch
+    between the two without re-keying.
+    """
+
+    labels: dict[str, str]
+    score: float
+
+
+@dataclass(frozen=True)
+class BandCoveragePoint:
+    """One ``forecast_band_empirical_coverage`` sample.
+
+    Rendered as a gauge in ``[0, 1]``. ``samples`` carries the number of
+    rolling observations the fraction was computed over so dashboards
+    can dim panels whose window hasn't filled yet (``< maxlen``).
+    """
+
+    labels: dict[str, str]
+    fraction: float
+    samples: int
+
+
+@dataclass(frozen=True)
 class CalibrationOffsetPoint:
     """Additive band correction applied by split-conformal calibration.
 
@@ -206,7 +237,7 @@ class GroupSnapshot:
     quality_points: list[QualityPoint] = field(default_factory=list)
     ensemble_weights: list[EnsembleWeightPoint] = field(default_factory=list)
     contribution_points: list[ContributionPoint] = field(default_factory=list)
-    # v1.2 capacity-planning families: per-(series, model, threshold[, level])
+    # Capacity-planning families: per-(series, model, threshold[, level])
     # ETAs and per-(series, model, window) growth-rate gauges. Both are
     # snapshot-style — only the most recent run's samples belong on
     # /metrics; queries that disappear from the config disappear from the
@@ -215,7 +246,16 @@ class GroupSnapshot:
     growth_rates: list[GrowthRatePoint] = field(default_factory=list)
     last_run_timestamp: float = 0.0
     run_duration_seconds: float = 0.0
+    # Per-query run duration in seconds for the most recent fit of each
+    # query. Drives ``forecast_run_duration_seconds{query=...}`` so an
+    # operator can see which queries dominate fit cost when per-query
+    # refresh intervals diverge.
+    run_duration_per_query: dict[str, float] = field(default_factory=dict)
     series_count: int = 0
+    # Per-query series count: same shape as ``run_duration_per_query``.
+    # Surfaces ``forecast_series_count{query=...}`` so queries running on
+    # different refresh cadences each report their own cardinality.
+    series_count_per_query: dict[str, int] = field(default_factory=dict)
     # series_dropped reasons (bounded set):
     #   per_query_cap, total_cap, min_points, discovery_cap, canary,
     #   preprocess_drop
@@ -256,7 +296,7 @@ class GroupSnapshot:
     outliers_replaced_cumulative: dict[tuple[str, str], int] = field(default_factory=dict)
     # Cumulative per-(query) change-point detection counter.
     change_points_cumulative: dict[str, int] = field(default_factory=dict)
-    # Cumulative per-(query, kind) emission clipping counter (v1.3).
+    # Cumulative per-(query, kind) emission clipping counter.
     # ``kind`` is bounded to ``negative`` (a value clipped from below zero
     # by ``emission.clip_non_negative``) and ``rounded`` (a value whose
     # fractional part was non-trivial when ``emission.round_to_integer``
@@ -269,6 +309,17 @@ class GroupSnapshot:
     # cold-start fit is borrowing from a thinner sibling set than the
     # operator configured (e.g. peer renames thinning the borrow query).
     cold_start_siblings: dict[str, int] = field(default_factory=dict)
+    # Drift telemetry — per-(series, model) gauge of how much the
+    # forecast curve moved between successive fits, plus a cumulative
+    # per-(query) alert counter that bumps when the gauge crosses the
+    # configured threshold.
+    drift_points: list[DriftPoint] = field(default_factory=list)
+    drift_alerts_cumulative: dict[str, int] = field(default_factory=dict)
+    # Empirical band coverage — per-(series, model, level, window)
+    # rolling gauge in [0, 1]. The exporter holds the rolling state in a
+    # separate ``BandCoverageTracker`` and snapshots the current
+    # fractions here at render time.
+    band_coverage_points: list[BandCoveragePoint] = field(default_factory=list)
 
 
 class Exporter:
@@ -561,6 +612,8 @@ class _SnapshotCollector:
         yield from _preprocess_families(groups)
         yield from _emission_clipped_families(groups)
         yield from _cold_start_siblings_families(groups)
+        yield from _drift_families(groups)
+        yield from _band_coverage_families(groups)
         yield from _operational_families(groups)
         yield from _reload_families(reload_state)
         yield from _config_hash_families(config_hash)
@@ -802,7 +855,7 @@ def _growth_rate_families(
         )
 
 
-def _operational_families(
+def _operational_families(  # noqa: PLR0912
     groups: list[GroupSnapshot],
 ) -> Iterator[GaugeMetricFamily | CounterMetricFamily]:
     if not groups:
@@ -813,9 +866,16 @@ def _operational_families(
         "Unix timestamp of the most recent successful run for the group.",
         labels=["group"],
     )
+    # Group-aggregate gauges. Stable schema (single ``group`` label) —
+    # dashboards relying on these built before per-query refresh intervals
+    # existed keep working unchanged. Per-query breakdowns are emitted as
+    # separate families (``forecast_query_run_duration_seconds`` and
+    # ``forecast_query_series_count``) so dashboards can opt in without
+    # being forced to change their label matchers.
     duration = GaugeMetricFamily(
         "forecast_run_duration_seconds",
-        "Wall-clock duration of the most recent run for the group.",
+        "Wall-clock duration of the most recent run for the group "
+        "(sum across all queries when per-query refresh intervals diverge).",
         labels=["group"],
     )
     series_count = GaugeMetricFamily(
@@ -823,13 +883,39 @@ def _operational_families(
         "Number of series accepted by the most recent run for the group.",
         labels=["group"],
     )
+    per_query_duration = GaugeMetricFamily(
+        "forecast_query_run_duration_seconds",
+        "Wall-clock duration of the most recent run for the "
+        "(group, query) tuple. Emitted when per-query refresh intervals "
+        "cause query-level fit costs to diverge from the group total.",
+        labels=["group", "query"],
+    )
+    per_query_series_count = GaugeMetricFamily(
+        "forecast_query_series_count",
+        "Number of series accepted by the most recent run for the "
+        "(group, query) tuple. Emitted alongside "
+        "``forecast_series_count`` to enable per-query cardinality views.",
+        labels=["group", "query"],
+    )
+    have_per_query_duration = False
+    have_per_query_series_count = False
     for snap in groups:
         last_run.add_metric([snap.group], snap.last_run_timestamp)
         duration.add_metric([snap.group], snap.run_duration_seconds)
         series_count.add_metric([snap.group], float(snap.series_count))
+        for query_id, dur in snap.run_duration_per_query.items():
+            per_query_duration.add_metric([snap.group, query_id], float(dur))
+            have_per_query_duration = True
+        for query_id, count in snap.series_count_per_query.items():
+            per_query_series_count.add_metric([snap.group, query_id], float(count))
+            have_per_query_series_count = True
     yield last_run
     yield duration
     yield series_count
+    if have_per_query_duration:
+        yield per_query_duration
+    if have_per_query_series_count:
+        yield per_query_series_count
 
     # CounterMetricFamily appends _total to the name, so we pass the bare stem.
     dropped = CounterMetricFamily(
@@ -1145,7 +1231,7 @@ def _calibration_families(
 def _preprocess_families(
     groups: list[GroupSnapshot],
 ) -> Iterator[GaugeMetricFamily | CounterMetricFamily]:
-    """Render the v1.1 preprocessing telemetry families.
+    """Render the preprocessing telemetry families.
 
     Emits five families:
 
@@ -1253,7 +1339,7 @@ def _emission_clipped_families(
 ) -> Iterator[CounterMetricFamily]:
     """Render ``forecast_emission_clipped_total{group, query, kind}``.
 
-    Bumped only when a v1.3 emission safeguard (``clip_non_negative`` or
+    Bumped only when an emission safeguard (``clip_non_negative`` or
     ``round_to_integer``) actually corrected a value:
 
     * ``kind="negative"`` increments per emission whose model output
@@ -1283,6 +1369,70 @@ def _emission_clipped_families(
             have = True
     if have:
         yield family
+
+
+def _drift_families(
+    groups: list[GroupSnapshot],
+) -> Iterator[GaugeMetricFamily | CounterMetricFamily]:
+    """Render the forecast-drift gauge and alert counter.
+
+    ``forecast_drift_score{id, group, model, ...}`` reports how much
+    the forecast curve moved between successive fits (default: MAPE
+    between the two yhat curves, configurable per query). Non-finite
+    samples are dropped at render time — they signal "no prior fit
+    available" and emitting NaN would just confuse downstream alerts.
+
+    ``forecast_drift_alerts_total{group, id}`` ticks once every time
+    the drift score crossed the configured threshold; counter so
+    ``increase(...)`` alerts survive transient flips back below the
+    threshold.
+    """
+    drift_points = [p for snap in groups for p in snap.drift_points]
+    yield from _emit_gauge_family(
+        drift_points,
+        "forecast_drift_score",
+        "Per-fit drift score: how much the forecast curve moved between "
+        "successive fits (label `method` carries the scoring algorithm).",
+        value_fn=lambda p: p.score,
+        skip_fn=lambda p: not math.isfinite(p.score),
+    )
+    have_alerts = any(snap.drift_alerts_cumulative for snap in groups)
+    if not have_alerts:
+        return
+    counter = CounterMetricFamily(
+        "forecast_drift_alerts",
+        "Number of times the forecast drift score crossed the configured "
+        "alert threshold for the (group, query) tuple.",
+        labels=["group", "id"],
+    )
+    for snap in groups:
+        for query_id, count in snap.drift_alerts_cumulative.items():
+            counter.add_metric([snap.group, query_id], float(count))
+    yield counter
+
+
+def _band_coverage_families(
+    groups: list[GroupSnapshot],
+) -> Iterator[GaugeMetricFamily]:
+    """Render ``forecast_band_empirical_coverage`` gauges.
+
+    One gauge per (series, model, level, window). The value is the
+    fraction of recent actuals that landed inside the nominal band — a
+    reading of 0.4 on a 95% band tells the operator the band is
+    drastically under-covering. Emitted only when at least one series
+    has produced a rolling sample so /metrics stays quiet for
+    deployments that don't opt into the diagnostic.
+    """
+    points = [p for snap in groups for p in snap.band_coverage_points]
+    yield from _emit_gauge_family(
+        points,
+        "forecast_band_empirical_coverage",
+        "Rolling fraction of actuals that fell inside the nominal forecast "
+        "band over the configured window. 0.0..1.0; expect ~level/100 when "
+        "the bands are well calibrated.",
+        value_fn=lambda p: p.fraction,
+        skip_fn=lambda p: not math.isfinite(p.fraction),
+    )
 
 
 def _cold_start_siblings_families(

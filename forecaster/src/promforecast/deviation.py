@@ -60,4 +60,20 @@ def compute(
         return Deviation(ratio=float("nan"), outside_band=actual != yhat)
 
     ratio = (actual - yhat) / width
-    return Deviation(ratio=ratio, outside_band=actual < lo or actual > hi)
+    return Deviation(ratio=ratio, outside_band=not inside_band(actual, lo, hi))
+
+
+def inside_band(actual: float, lower: float, upper: float) -> bool:
+    """Return ``True`` when ``actual`` lies inside ``[lower, upper]``.
+
+    Single source of truth for the inside/outside test — shared with the
+    rolling :mod:`promforecast.band_coverage` path so the two diagnostics
+    can never drift in how they classify an observation.
+
+    The caller is expected to have already filtered out non-finite
+    inputs; this helper assumes finite arguments. Bands are ordered if
+    ``lower > upper`` (a band whose lower bound is above the upper
+    bound is normalised so the comparison still makes sense).
+    """
+    lo, hi = (lower, upper) if lower <= upper else (upper, lower)
+    return lo <= actual <= hi

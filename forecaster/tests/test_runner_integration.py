@@ -94,7 +94,7 @@ async def test_run_group_records_min_points_drops() -> None:
 
     body = exporter.render().decode()
     assert 'forecast_series_dropped_total{group="g",reason="min_points"} 2.0' in body
-    assert 'forecast_series_count{group="g"} 2.0' in body
+    assert 'forecast_query_series_count{group="g",query="m"} 2.0' in body
 
 
 @pytest.mark.asyncio
@@ -152,7 +152,7 @@ async def test_run_group_full_snapshot_with_canned_fit(monkeypatch: pytest.Monke
     body = exporter.render().decode()
     assert "m_forecast{" in body
     assert 'instance="host-a"' in body
-    assert 'forecast_series_count{group="g"} 1.0' in body
+    assert 'forecast_query_series_count{group="g",query="m"} 1.0' in body
 
 
 class _FakeModel:
@@ -560,5 +560,9 @@ async def test_run_group_global_cap_truncates_across_queries() -> None:
     await runner.run_group(cfg.groups[0])
 
     body = exporter.render().decode()
+    # Per-query gauge: ``a`` collects the one allowed series, ``b`` is
+    # shut out by the total cap. Group total stays exposed under the
+    # legacy ``forecast_series_count`` family.
+    assert 'forecast_query_series_count{group="g",query="a"} 1.0' in body
     assert 'forecast_series_count{group="g"} 1.0' in body
     assert 'reason="total_cap"' in body

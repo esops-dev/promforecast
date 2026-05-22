@@ -1,4 +1,4 @@
-"""Tests for the v1.1 preprocessing pipeline."""
+"""Tests for the preprocessing pipeline."""
 
 from __future__ import annotations
 

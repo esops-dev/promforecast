@@ -259,7 +259,7 @@ async def test_apply_config_drains_in_flight_run_before_swapping(
     let_finish = asyncio.Event()
     completed = False
 
-    async def _slow_run_group(self, group):  # type: ignore[no-untyped-def]
+    async def _slow_run_group(self, group, *, queries=None):  # type: ignore[no-untyped-def]
         nonlocal completed
         in_flight.set()
         await let_finish.wait()
@@ -300,7 +300,7 @@ async def test_apply_config_hard_cancels_after_drain_grace_expires(
 
     in_flight = asyncio.Event()
 
-    async def _hanging_run_group(self, group):  # type: ignore[no-untyped-def]
+    async def _hanging_run_group(self, group, *, queries=None):  # type: ignore[no-untyped-def]
         in_flight.set()
         await asyncio.sleep(60)
 

@@ -1,4 +1,4 @@
-"""Tests for the v1.3 count-aware emission safeguards.
+"""Tests for the count-aware emission safeguards.
 
 The clipping and rounding logic lives in two pure helpers
 (``_classify_emission_correction`` and the snapshot/curve appliers).
@@ -111,7 +111,7 @@ def test_effective_emission_safeguards_explicit_override_wins() -> None:
 
     Operators occasionally want the count profile (for the auto-select
     nudge in the future) without the rounding — the override pathway
-    documented in v1.3 has to actually work.
+    has to actually work.
     """
     q = QueryConfig(
         id="m",

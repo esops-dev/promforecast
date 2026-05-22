@@ -181,7 +181,7 @@ def _fill_gaps(
             continue
         largest_gap = max(largest_gap, gap)
         if gap > max_gap_seconds and config.strategy != "drop_series":
-            # Apply the fallback (always ``drop_series`` for v1.1) so a
+            # Apply the fallback (always ``drop_series`` today) so a
             # very long gap doesn't get papered over by forward-fill.
             logger.info(
                 "preprocess_gap_drop",

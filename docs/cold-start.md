@@ -28,7 +28,7 @@ groups:
           borrow_from:
             promql: |
               rate(http_requests_total{service!="new-service",region="us-east-1"}[5m])
-            method: median_normalized   # only option in v1.3
+            method: median_normalized   # only option currently shipped
             min_siblings: 3             # default
           max_quality_score: 0.5        # caps quality score (default 0.5)
 ```

@@ -1,6 +1,6 @@
-"""Runner integration tests for the v0.4 features.
+"""Runner integration tests for the discovery / templating runner path.
 
-Covers the discovery / templating path end-to-end through the runner's
+Covers discovery / templating end-to-end through the runner's
 ``_run_query`` orchestration — without the heavy statsforecast fit. We
 use a fake source that returns canned frames per PromQL string and
 assert on the per-query failure / dropped / discovery-expansion

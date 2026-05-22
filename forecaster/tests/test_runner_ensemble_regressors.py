@@ -1,6 +1,6 @@
-"""Integration tests for v0.3 runner features.
+"""Integration tests for ensemble / regressor / remote-write runner features.
 
-Covers the runner-level wiring of the four v0.3 user stories:
+Covers the runner-level wiring of four user stories:
 
 * Ensemble auto-select mode: combined forecast plus component models, with
   inverse-MAPE weights exposed as a metric.
