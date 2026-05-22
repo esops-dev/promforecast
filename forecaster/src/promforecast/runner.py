@@ -891,9 +891,7 @@ class Runner:
             )
             if len(cleaned.values) < min_points:
                 if not cold_start_resolved:
-                    cold_start_siblings = await self._prefetch_cold_start_siblings(
-                        query, qlog
-                    )
+                    cold_start_siblings = await self._prefetch_cold_start_siblings(query, qlog)
                     cold_start_resolved = True
                 if cold_start_siblings is not None:
                     handled = await self._try_cold_start(

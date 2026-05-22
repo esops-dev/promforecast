@@ -1025,9 +1025,7 @@ def _validate_cold_start(*, label: str, query: QueryConfig) -> None:
     # Pydantic accepts the empty string as a valid ``str``; an empty
     # borrow PromQL would 4xx the TSDB silently every refresh.
     if not borrow.promql.strip():
-        raise ValueError(
-            f"{label}.cold_start.borrow_from: promql must be a non-empty PromQL query"
-        )
+        raise ValueError(f"{label}.cold_start.borrow_from: promql must be a non-empty PromQL query")
     # ``max_quality_score <= 0`` would emit cold-start quality samples at
     # zero and trip ``ForecastQualityZero`` every cycle. Operators who
     # want cold-start quality disabled should leave ``borrow_from`` out.

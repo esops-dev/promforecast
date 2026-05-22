@@ -128,75 +128,12 @@ spec:
               {{`{{ $labels.model }}`}}, level {{`{{ $labels.level }}`}}) has a
               deviation ratio with magnitude above 2 for 5m.
 
-    - name: promforecast.capacity.examples
-      interval: 5m
-      rules:
-        - alert: NodeFilesystemForecastedFull
-          expr: node_filesystem_avail_bytes_forecast < 0
-          for: 30m
-          labels:
-            severity: warning
-          annotations:
-            summary: "{{`{{ $labels.instance }}`}}:{{`{{ $labels.mountpoint }}`}} forecast to fill before horizon"
-            description: |
-              The end-of-horizon forecast for free space on
-              {{`{{ $labels.instance }}`}} ({{`{{ $labels.mountpoint }}`}}) is below
-              zero. Provision capacity or clean up.
-
-        - alert: ForecastDiskFillImminent
-          expr: |
-            node_filesystem_avail_bytes_forecast_time_to_threshold_seconds{
-              name="critical", comparator="lt", level="95"
-            } < 6 * 60 * 60
-          for: 15m
-          labels:
-            severity: warning
-          annotations:
-            summary: "{{`{{ $labels.instance }}`}} disk will hit the floor within 6h (95% band)"
-            description: |
-              The conservative 95% forecast for {{`{{ $labels.instance }}`}}
-              {{`{{ $labels.mountpoint }}`}} reaches the configured
-              ``critical`` floor within 6h.
-
-        - alert: ForecastCPUSaturationApproaching
-          expr: |
-            node_cpu_busy_pct_forecast_time_to_threshold_seconds{
-              name="warn", comparator="gt"
-            }
-            and on (instance) (
-              node_cpu_busy_pct_forecast_time_to_threshold_seconds{
-                name="warn", comparator="gt"
-              } < 4 * 60 * 60
-            )
-          for: 30m
-          labels:
-            severity: info
-          annotations:
-            summary: "{{`{{ $labels.instance }}`}} CPU forecast to cross warn threshold within 4h"
-            description: |
-              The CPU busy-percent forecast for {{`{{ $labels.instance }}`}} is
-              expected to cross the configured ``warn`` threshold within 4
-              hours.
-
-        - alert: ForecastGrowthRateSpike
-          expr: |
-            abs(node_filesystem_avail_bytes_forecast_growth_rate{window="1d"})
-              /
-            clamp_min(
-              abs(
-                node_filesystem_avail_bytes_forecast_growth_rate{window="7d"} offset 1d
-              ),
-              1
-            )
-              > 3
-          for: 30m
-          labels:
-            severity: warning
-          annotations:
-            summary: "{{`{{ $labels.instance }}`}}{{`{{ $labels.mountpoint }}`}} growth rate has tripled vs last week"
-            description: |
-              The 1-day forecast growth rate for {{`{{ $labels.instance }}`}}
-              ({{`{{ $labels.mountpoint }}`}}) is more than 3x the 7-day
-              baseline. Investigate whether a workload change or leak is
-              driving accelerated consumption.
+# Capacity-planning alerts live only in examples/alerts/promforecast-rules.yaml
+# under the ``promforecast.capacity.examples`` group. They are
+# environment-specific templates (filesystem/CPU metric names, thresholds)
+# that the chart deliberately does not bundle — the drift check in
+# .github/workflows/ci.yml excludes any group whose name ends with
+# ``.examples`` from the chart-vs-example comparison precisely so those
+# operator-tunable templates can live in one place. Add operational alerts
+# (no metric/env assumptions) to the groups above so they ship in both.
 {{- end }}

@@ -305,7 +305,7 @@ async def test_cold_start_skipped_when_required_regressor_configured() -> None:
 
     body = exporter.render().decode()
     # Cold-start did not run — no ColdStart forecast, no sibling fetch.
-    assert "model=\"ColdStart\"" not in body
+    assert 'model="ColdStart"' not in body
     assert "siblings" not in source.calls
     # The series falls through to the regular min_points drop.
     assert 'forecast_series_dropped_total{group="g",reason="min_points"} 1.0' in body
