@@ -70,9 +70,7 @@ class BandCoverageTracker:
         # derived ``maxlen`` happens to differ — two (window, step) pairs
         # can yield the same ``maxlen`` (e.g. 1d/1h and 24h/1h) which the
         # ring would otherwise treat as unchanged.
-        self._buckets: dict[
-            tuple[str, str, str, str, int, str], tuple[int, int, deque[bool]]
-        ] = {}
+        self._buckets: dict[tuple[str, str, str, str, int, str], tuple[int, int, deque[bool]]] = {}
 
     def observe(
         self,

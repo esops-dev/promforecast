@@ -363,7 +363,6 @@ def _apply_holidays(reg: RegressorConfig, out: pd.DataFrame) -> RegressorFailure
             message=f"holidays calendar build failed: {exc}",
         )
 
-
     ds = out["ds"]
     # Operators configure ``timezone`` as an IANA name; the source
     # timestamps come from PromQL queries in UTC. ``tz_convert`` rebases

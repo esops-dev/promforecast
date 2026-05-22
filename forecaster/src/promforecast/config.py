@@ -1318,6 +1318,7 @@ def _validate_holiday_calendar(*, label: str, reg: RegressorConfig) -> None:
 
     # Timezone validation: zoneinfo.ZoneInfo raises on an unknown name.
     from zoneinfo import ZoneInfo, ZoneInfoNotFoundError  # noqa: PLC0415
+
     try:
         ZoneInfo(reg.timezone)
     except ZoneInfoNotFoundError as exc:
@@ -1326,9 +1327,7 @@ def _validate_holiday_calendar(*, label: str, reg: RegressorConfig) -> None:
         ) from exc
 
     country = str(reg.country)
-    cache_get = (
-        _regressors._holiday_calendar_cache_get if _regressors is not None else None
-    )
+    cache_get = _regressors._holiday_calendar_cache_get if _regressors is not None else None
     try:
         if not reg.regions:
             if cache_get is not None:
