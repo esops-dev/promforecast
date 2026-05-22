@@ -60,6 +60,13 @@ class CardinalityEstimate:
     preprocess_lines: int
     threshold_eta_lines: int
     growth_rate_lines: int
+    # v1.3 count-aware emission counter — per (query, kind=negative|rounded)
+    # when a query opts in via ``data_profile: count`` or sets the
+    # explicit emission toggles.
+    emission_clipped_lines: int
+    # v1.3 cold-start sibling gauge — per (query) when cold-start is
+    # configured. Bounded; gauge counts as one line per query.
+    cold_start_lines: int
     operational_lines: int
 
     @property
@@ -74,6 +81,8 @@ class CardinalityEstimate:
             + self.preprocess_lines
             + self.threshold_eta_lines
             + self.growth_rate_lines
+            + self.emission_clipped_lines
+            + self.cold_start_lines
             + self.operational_lines
         )
 
@@ -129,6 +138,8 @@ def run_validate(
     write(f"  preprocess lines   {estimate.preprocess_lines:>8}")
     write(f"  threshold ETA      {estimate.threshold_eta_lines:>8}")
     write(f"  growth rate lines  {estimate.growth_rate_lines:>8}")
+    write(f"  emission clipped   {estimate.emission_clipped_lines:>8}")
+    write(f"  cold start lines   {estimate.cold_start_lines:>8}")
     write(f"  operational lines  {estimate.operational_lines:>8}")
     write(f"  total              {estimate.total:>8}")
     if cfg.safety.max_total_series and estimate.total > cfg.safety.max_total_series:
@@ -150,7 +161,7 @@ def run_validate(
     return rc
 
 
-def _estimate_cardinality(cfg: Config) -> CardinalityEstimate:  # noqa: PLR0912
+def _estimate_cardinality(cfg: Config) -> CardinalityEstimate:  # noqa: PLR0912, PLR0915
     """Worst-case forecast/accuracy/deviation/quality/operational line counts.
 
     Lower-bounding (e.g. accounting for ``min_points`` drops) would require
@@ -260,6 +271,34 @@ def _estimate_cardinality(cfg: Config) -> CardinalityEstimate:  # noqa: PLR0912
     if any_changepoint_on:
         preprocess_lines += queries
 
+    # v1.3 count-aware emission clipping: a per-(query, kind=negative|rounded)
+    # counter, bounded to 2 lines per query. Charged only against queries
+    # that explicitly opt in (``emission.clip_non_negative`` /
+    # ``round_to_integer`` set, or ``data_profile: count``) because most
+    # configs leave the toggles off and produce zero samples.
+    emission_clipped_lines = 0
+    for group in cfg.groups:
+        for q in group.queries:
+            clip = q.emission.clip_non_negative
+            rounder = q.emission.round_to_integer
+            profile_enabled = q.data_profile == "count"
+            on = (
+                (clip is True)
+                or (rounder is True)
+                or (profile_enabled and (clip is not False) and (rounder is not False))
+            )
+            if on:
+                # Two ``kind`` values (negative, rounded) per query.
+                emission_clipped_lines += 2
+
+    # v1.3 cold-start: ``forecast_cold_start_siblings{group, query}`` is a
+    # single gauge per query that has cold-start configured.
+    cold_start_lines = 0
+    for group in cfg.groups:
+        for q in group.queries:
+            if q.cold_start.borrow_from is not None:
+                cold_start_lines += 1
+
     # Operational: 7 gauges + N reasons per group; we ballpark 7 per group.
     operational_lines = 7 * len(cfg.groups)
 
@@ -277,6 +316,8 @@ def _estimate_cardinality(cfg: Config) -> CardinalityEstimate:  # noqa: PLR0912
         preprocess_lines=preprocess_lines,
         threshold_eta_lines=threshold_eta_lines,
         growth_rate_lines=growth_rate_lines,
+        emission_clipped_lines=emission_clipped_lines,
+        cold_start_lines=cold_start_lines,
         operational_lines=operational_lines,
     )
 

@@ -68,6 +68,14 @@ auto_ets           = "promforecast.models.auto_ets:AutoETSModel"
 auto_ets_damped    = "promforecast.models.auto_ets_damped:AutoETSDampedModel"
 mstl               = "promforecast.models.mstl:MSTLModel"
 seasonal_naive     = "promforecast.models.seasonal_naive:SeasonalNaiveModel"
+# Intermittent-demand methods (v1.3) for sparse / count-shaped signals.
+# Registered alongside the continuous-trend models so configs reference
+# them by the same ``models:`` array — operators turn them on by
+# adding the name, not by toggling a separate feature flag.
+croston            = "promforecast.models.intermittent:CrostonModel"
+croston_sba        = "promforecast.models.intermittent:CrostonSBAModel"
+adida              = "promforecast.models.intermittent:ADIDAModel"
+imapa              = "promforecast.models.intermittent:IMAPAModel"
 
 [project.urls]
 Homepage      = "https://github.com/esops-dev/promforecast"

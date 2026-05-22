@@ -20,7 +20,7 @@ from typing import TYPE_CHECKING
 
 from . import deviation as deviation_mod
 from . import quality as quality_mod
-from .accuracy import overall_mape
+from .accuracy import overall_mape, overall_mase
 from .exporter import (
     AccuracyPoint,
     CalibrationOffsetPoint,
@@ -124,11 +124,24 @@ class SeriesPointFactory:
         model_name: str,
         selection: SelectionResult | None,
     ) -> Iterable[ForecastPoint]:
-        """Convert the last forecast row into snapshot points.
+        """Convert the *end-of-horizon* forecast row into snapshot points.
 
-        /metrics is a snapshot endpoint, so we expose only the *next* forecast
-        step. The full curve goes to the optional remote_write sink — see
-        :meth:`forecast_curve_points`.
+        /metrics is a snapshot endpoint, so we expose a single forecast
+        value per (series, model, level). The exposed value is the
+        **last** row of the forecast frame — i.e. the value at horizon
+        steps from now (``defaults.horizon`` after the most recent
+        sample). The historical label ``horizon="next"`` reads "the
+        next snapshot value to be served", not "the next time step";
+        the full per-step curve is what the optional remote_write sink
+        carries. See :meth:`forecast_curve_points`.
+
+        This convention matters for capacity-style alerts: an alert
+        like ``node_filesystem_avail_bytes_forecast < 0`` answers
+        "will the disk be empty at the configured horizon", not "will
+        it be empty at the next 5-minute step". The v1.2 ETA family
+        (``<id>_forecast_time_to_threshold_seconds``) is the
+        complementary read for "*when* does the forecast first cross
+        the threshold".
 
         When ``selection`` is set (auto-select mode), additional labels
         ``best_model`` and ``model_fallback`` are attached so dashboards can
@@ -413,17 +426,25 @@ class SeriesPointFactory:
         train_y: list[float],
         coverage: float,
         imputed_fraction: float = 0.0,
+        score_kind: quality_mod.ScoreKind = "mape",
     ) -> Iterable[QualityPoint]:
         """Compute a composite quality score per emitted (series, model).
 
-        Combines (1) overall MAPE across the configured accuracy horizons,
-        (2) the mean backtest band width relative to ``mean(|train_y|)``
-        (paired with actuals during backtest, which is more meaningful than
-        scoring the unvalidated forward bands), and (3) the lookback data
-        coverage. When ``imputed_fraction > 0`` the coverage sub-score is
-        scaled by ``(1 - imputed_fraction)`` so a series whose lookback is
-        mostly synthesised by gap imputation does not silently score well
-        on the coverage dimension.
+        Combines (1) overall accuracy across the configured accuracy
+        horizons — MAPE for continuous series, MASE for intermittent
+        series, (2) the mean backtest band width relative to
+        ``mean(|train_y|)`` (paired with actuals during backtest, which
+        is more meaningful than scoring the unvalidated forward bands),
+        and (3) the lookback data coverage. When ``imputed_fraction > 0``
+        the coverage sub-score is scaled by ``(1 - imputed_fraction)`` so
+        a series whose lookback is mostly synthesised by gap imputation
+        does not silently score well on the coverage dimension.
+
+        ``score_kind`` chooses the scoring unit. The default ``"mape"``
+        preserves the v1.0 behaviour; pass ``"mase"`` when the caller's
+        ``data_profile`` is ``intermittent`` so a series whose actuals
+        are mostly zero (and therefore have NaN MAPE everywhere) still
+        gets a meaningful quality signal.
 
         Models with no backtest data — typically the auto-select fallback
         model when it isn't in the configured ``models`` list — are skipped
@@ -436,21 +457,23 @@ class SeriesPointFactory:
         abs_train = [abs(v) for v in train_y]
         scale = (sum(abs_train) / len(abs_train)) if abs_train else 0.0
         common = self._common_with_id()
+        score_summary = overall_mase if score_kind == "mase" else overall_mape
         for model_name in emitted_models:
             outcome = backtests.get(model_name)
             if outcome is None:
                 continue
-            mape = overall_mape(outcome.results)
+            accuracy = score_summary(outcome.results)
             widths = [b.width for b in outcome.last_bands.values() if math.isfinite(b.width)]
             avg_width = sum(widths) / len(widths) if widths else float("nan")
             band_width_relative = (
                 (avg_width / scale) if scale > 0 and math.isfinite(avg_width) else None
             )
             score = quality_mod.compute(
-                backtest_mape=mape,
+                backtest_mape=accuracy,
                 band_width_relative=band_width_relative,
                 coverage=coverage,
                 imputed_fraction=imputed_fraction,
+                score_kind=score_kind,
             )
             yield QualityPoint(
                 labels={**common, "model": model_name},

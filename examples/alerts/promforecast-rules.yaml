@@ -39,6 +39,24 @@ spec:
               Consider retraining, switching models, or extending the
               lookback window.
 
+        # v1.3: parallel rule for intermittent / count-shaped series. MAPE
+        # is undefined wherever the actual is zero, so the rule above
+        # silently never fires for these series; MASE > 1.0 means the
+        # forecast is doing worse than a seasonal naive baseline.
+        - alert: ForecastModelDegradedMASE
+          expr: forecast_accuracy_mase > 1.0
+          for: 24h
+          labels:
+            severity: warning
+          annotations:
+            summary: "Forecast MASE > 1.0 for {{ $labels.id }} — worse than seasonal naive"
+            description: |
+              Backtest MASE for {{ $labels.id }} model {{ $labels.model }}
+              at horizon {{ $labels.horizon }} has exceeded 1.0 for 24h —
+              the forecast is doing no better than a seasonal naive
+              baseline. Particularly useful for intermittent / count
+              series where MAPE is undefined wherever the actual is zero.
+
         # The exporter keeps falling back to the configured fallback model,
         # which means the configured `models:` list isn't a good fit for
         # this data. Symptom of mis-configuration, not an outage.
@@ -56,8 +74,13 @@ spec:
 
         # Persistently low quality across a group: forecasts shouldn't be
         # trusted for alerting. Tune the threshold; 0.4 is a useful default.
+        # Cold-start fits are excluded because their quality score is
+        # capped at ``cold_start.max_quality_score`` (default 0.5) by
+        # design — they would otherwise drag the per-group average and
+        # noisily trip this alert until the underlying series matures.
         - alert: ForecastQualityLow
-          expr: avg by (group) (forecast_quality_score) < 0.4
+          expr: |
+            avg by (group) (forecast_quality_score{cold_start!="true"}) < 0.4
           for: 6h
           labels:
             severity: info
@@ -65,15 +88,17 @@ spec:
             summary: "Average forecast quality for group {{ $labels.group }} is low"
             description: |
               Average forecast_quality_score for group {{ $labels.group }}
-              is below 0.4 for 6h. Treat downstream forecast-based alerts
-              with caution and investigate model fit, band width, and
-              data coverage.
+              (excluding cold-start fits) is below 0.4 for 6h. Treat
+              downstream forecast-based alerts with caution and
+              investigate model fit, band width, and data coverage.
 
         # Quality score is composed multiplicatively from MAPE / band /
         # coverage; if it sticks at zero for a single series for hours,
         # the inputs are likely degenerate (no MAPE, all-zero data).
+        # Excludes cold-start: those scores can land at a configured
+        # ``max_quality_score`` and are not a model-degradation signal.
         - alert: ForecastQualityZero
-          expr: forecast_quality_score == 0
+          expr: forecast_quality_score{cold_start!="true"} == 0
           for: 1h
           labels:
             severity: info
@@ -84,6 +109,28 @@ spec:
               ({{ $labels.model }}) has been zero for 1h. The model is
               likely producing meaningless output for this series; check
               data coverage and band width.
+
+        # v1.3: cold-start sibling headroom is thinning. The configured
+        # ``min_siblings`` is the contract; once the gauge drops below
+        # the threshold the next cold-start fit will silently fall
+        # through to the standard min_points drop. Catch the early
+        # warning here so operators can fix the borrow query before the
+        # forecast disappears.
+        - alert: ForecastColdStartSiblingsLow
+          expr: forecast_cold_start_siblings < 3
+          for: 30m
+          labels:
+            severity: info
+          annotations:
+            summary: "Cold-start siblings thinning for {{ $labels.group }}/{{ $labels.query }}"
+            description: |
+              The cold-start borrow query for
+              {{ $labels.group }}/{{ $labels.query }} has fewer than 3
+              usable siblings for 30m. Once the count drops below
+              ``min_siblings`` the cold-start path stops emitting and
+              short series fall back to the standard min_points drop —
+              check whether peer renames or label-cardinality drift
+              have thinned the borrow set.
 
     - name: promforecast.deviation
       interval: 1m
@@ -129,18 +176,24 @@ spec:
       interval: 5m
       rules:
         # Replace the metric and threshold with your own; this is a
-        # template — do not deploy as-is without tuning.
+        # template — do not deploy as-is without tuning. The
+        # ``<id>_forecast`` snapshot value is the *end-of-horizon*
+        # forecast (carrying ``horizon="next"``, which means "the next
+        # snapshot value to be served") — see ``docs/models.md`` for
+        # the convention. If ``defaults.horizon: 24h`` is the configured
+        # forecast horizon then this alert reads "the disk is forecast
+        # to be empty 24h from now".
         - alert: NodeFilesystemForecastedFull
-          expr: node_filesystem_avail_bytes_forecast{horizon="24h"} < 0
+          expr: node_filesystem_avail_bytes_forecast < 0
           for: 30m
           labels:
             severity: warning
           annotations:
-            summary: "{{ $labels.instance }}:{{ $labels.mountpoint }} forecast to fill within 24h"
+            summary: "{{ $labels.instance }}:{{ $labels.mountpoint }} forecast to fill before horizon"
             description: |
-              The 24h forecast for free space on {{ $labels.instance }}
-              ({{ $labels.mountpoint }}) is below zero. Provision capacity
-              or clean up.
+              The end-of-horizon forecast for free space on
+              {{ $labels.instance }} ({{ $labels.mountpoint }}) is below
+              zero. Provision capacity or clean up.
 
         # v1.2: alert on the time-to-threshold ETA family directly.
         # Read against the conservative band (``level="95"``) so the

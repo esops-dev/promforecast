@@ -128,14 +128,19 @@ def evaluate(
     """Compute per-horizon MAPE/MASE from a backtest result."""
     if predictions.empty or test.empty:
         return []
-    y_true = test["y"].to_numpy(dtype=float)
-    y_pred = predictions["yhat"].to_numpy(dtype=float)
+    # pandas-stubs reports ``Series.to_numpy(dtype=float)`` as
+    # ``ndarray[tuple[int], dtype[Any]]`` (a 1-D shape) but a slice
+    # returns the unparameterised ``ndarray[tuple[int, ...], dtype[Any]]``
+    # because slicing erases the rank annotation. Binding the slices to
+    # fresh names keeps mypy --strict happy without runtime cost.
+    y_true_full = test["y"].to_numpy(dtype=float)
+    y_pred_full = predictions["yhat"].to_numpy(dtype=float)
     train_y = train["y"].to_numpy(dtype=float)
-    n = min(len(y_true), len(y_pred))
+    n = min(len(y_true_full), len(y_pred_full))
     if n == 0:
         return []
-    y_true = y_true[:n]
-    y_pred = y_pred[:n]
+    y_true = y_true_full[:n]
+    y_pred = y_pred_full[:n]
     scale = _mase_scale(train_y, season_length)
     out: list[AccuracyResult] = []
     for h in horizons:
@@ -161,6 +166,21 @@ def overall_mape(results: list[AccuracyResult]) -> float | None:
     longest horizon (where every model tends to do worst).
     """
     finite = [r.mape for r in results if math.isfinite(r.mape)]
+    if not finite:
+        return None
+    return float(sum(finite) / len(finite))
+
+
+def overall_mase(results: list[AccuracyResult]) -> float | None:
+    """Mean MASE across horizons, ignoring NaNs.
+
+    MASE replaces MAPE as the single-number scoring summary for
+    intermittent-demand series, where MAPE is undefined wherever actuals
+    are zero — exactly the regime intermittent models target. The shape
+    matches :func:`overall_mape` (equal-weighted, NaN-tolerant) so the
+    selector can swap one for the other without further plumbing.
+    """
+    finite = [r.mase for r in results if math.isfinite(r.mase)]
     if not finite:
         return None
     return float(sum(finite) / len(finite))

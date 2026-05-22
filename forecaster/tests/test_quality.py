@@ -87,3 +87,46 @@ def test_imputed_fraction_defaults_to_no_penalty() -> None:
         imputed_fraction=None,
     )
     assert math.isclose(legacy, explicit_none)
+
+
+def test_mase_score_kind_perfect_mase_maps_to_one() -> None:
+    """MASE = 0 (perfect) plus tight band plus full coverage = quality 1.0.
+
+    Mirrors the MAPE = 0 case so an operator who switches profile gets
+    the same upper-bound semantics.
+    """
+    score = compute(backtest_mape=0.0, band_width_relative=0.0, coverage=1.0, score_kind="mase")
+    assert math.isclose(score, 1.0)
+
+
+def test_mase_score_kind_baseline_lands_on_half() -> None:
+    """MASE = 1 (matches seasonal naive) maps to 0.5 — the documented midpoint."""
+    score = compute(backtest_mape=1.0, band_width_relative=0.0, coverage=1.0, score_kind="mase")
+    assert math.isclose(score, 0.5)
+
+
+def test_mase_score_kind_large_mase_decays_but_stays_positive() -> None:
+    """MASE = 4 → accuracy sub-score = 1/5 = 0.2 — never quite zero.
+
+    The smooth ``1 / (1 + mase)`` curve keeps an intermittent series with
+    a noisy model from collapsing to a hard zero quality the way the
+    MAPE-based path does on NaN input — operators still get a signal.
+    """
+    score = compute(backtest_mape=4.0, band_width_relative=0.0, coverage=1.0, score_kind="mase")
+    assert math.isclose(score, 0.2)
+
+
+def test_mase_score_kind_treats_none_as_zero() -> None:
+    """NaN/None MASE maps to 0 — same defensive behaviour as the MAPE path."""
+    assert (
+        compute(backtest_mape=None, band_width_relative=0.0, coverage=1.0, score_kind="mase") == 0.0
+    )
+    assert (
+        compute(
+            backtest_mape=float("nan"),
+            band_width_relative=0.0,
+            coverage=1.0,
+            score_kind="mase",
+        )
+        == 0.0
+    )

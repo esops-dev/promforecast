@@ -22,11 +22,13 @@ from typing import TYPE_CHECKING, Any, Literal
 import structlog
 
 from . import capacity as capacity_mod
+from . import cold_start as cold_start_mod
 from . import conformal as conformal_mod
 from . import contribution as contribution_mod
 from . import discovery as discovery_mod
 from . import models as model_registry
 from . import preprocess as preprocess_mod
+from . import quality as quality_mod
 from . import regressors as regressors_mod
 from . import seasonality as seasonality_mod
 from . import telemetry as telemetry_mod
@@ -37,11 +39,14 @@ from .accuracy import (
     evaluate,
     horizons_from_durations,
     overall_mape,
+    overall_mase,
 )
 from .config import (
     CanaryConfig,
     GroupConfig,
     ModelSpec,
+    QueryConfig,
+    effective_emission_safeguards,
     effective_season_length,
     effective_step,
 )
@@ -69,7 +74,7 @@ from .source import PromSource, SeriesFrame
 if TYPE_CHECKING:
     import pandas as pd
 
-    from .config import Config, QueryConfig
+    from .config import Config
     from .models import ForecastModel
     from .selector import SelectionResult
 
@@ -146,6 +151,14 @@ class _FitResult:
     # Imputed-fraction reported by preprocessing; threaded into the quality
     # score so heavily-imputed series score lower on the coverage dimension.
     imputed_fraction: float = 0.0
+    # v1.3 count-aware safeguard counters: per-``kind`` increments folded
+    # into the run context's per-(query, kind) total. ``kind`` is
+    # ``negative`` (a value clipped from below zero) or ``rounded`` (a
+    # non-trivial fractional component that was rounded to integer).
+    emission_clipped: dict[str, int] = field(default_factory=dict)
+    # v1.3 cold-start: number of usable siblings the borrow query
+    # produced for this series; ``0`` when cold-start did not run.
+    cold_start_siblings: int = 0
 
 
 @dataclass(frozen=True)
@@ -241,6 +254,17 @@ class _RunContext:
     outliers_replaced: dict[tuple[str, str], int] = field(default_factory=dict)
     # Per-query change-point detection count for this run.
     change_points: dict[str, int] = field(default_factory=dict)
+    # v1.3: per-(query, kind) emission clipping counter for this run.
+    # Merged with the previous snapshot in ``run_group`` so the exposed
+    # counter stays monotonic across runs.
+    emission_clipped: dict[tuple[str, str], int] = field(default_factory=dict)
+    # v1.3: per-query usable-sibling count for the most recent cold-start
+    # fit. The runner prefetches the borrow query once per primary query
+    # (see ``_prefetch_cold_start_siblings``), so every cold-start fit
+    # within one run of a given query observes the same usable-sibling
+    # count — the gauge is deterministic per (group, query) regardless of
+    # which short series of the query was processed last.
+    cold_start_siblings: dict[str, int] = field(default_factory=dict)
 
 
 def _compute_global_budgets(groups: list[GroupConfig], max_total_series: int) -> dict[str, int]:
@@ -637,6 +661,21 @@ class Runner:
             )
             for cpkey, cpcount in ctx.change_points.items():
                 merged_changepoints[cpkey] = merged_changepoints.get(cpkey, 0) + cpcount
+            # Monotonic merge for the v1.3 emission-clipped counter, pruned
+            # to query IDs that still exist in the live group config so a
+            # reload that drops a query doesn't leak its old label set
+            # forever.
+            merged_emission_clipped: dict[tuple[str, str], int] = (
+                {
+                    key: count
+                    for key, count in previous_snapshot.emission_clipped_cumulative.items()
+                    if key[0] in current_query_ids
+                }
+                if previous_snapshot is not None
+                else {}
+            )
+            for ekey, ecount in ctx.emission_clipped.items():
+                merged_emission_clipped[ekey] = merged_emission_clipped.get(ekey, 0) + ecount
             self._exporter.update(
                 GroupSnapshot(
                     group=group.name,
@@ -664,6 +703,8 @@ class Runner:
                     gaps_filled_cumulative=merged_gaps,
                     outliers_replaced_cumulative=merged_outliers,
                     change_points_cumulative=merged_changepoints,
+                    emission_clipped_cumulative=merged_emission_clipped,
+                    cold_start_siblings=dict(ctx.cold_start_siblings),
                 )
             )
             log.info(
@@ -733,7 +774,7 @@ class Runner:
         with self._tracer.span("promforecast.query", group=group.name, query=query.id):
             await self._do_run_query(query, group, ctx, qlog)
 
-    async def _do_run_query(
+    async def _do_run_query(  # noqa: PLR0912, PLR0915
         self,
         query: QueryConfig,
         group: GroupConfig,
@@ -808,7 +849,19 @@ class Runner:
 
         min_points = self._config.defaults.min_points
         eff_step = effective_step(query, self._config.defaults)
-        query_stats = ctx.preprocess_stats.setdefault(query.id, PreprocessStats())
+        # Cold-start sibling cache: fetched lazily on the first short
+        # series and reused for every subsequent short series of the
+        # same query. The lazy strategy preserves the "one fetch per
+        # query" guarantee from the per-series-fetch bug fix while
+        # also avoiding a wasted borrow PromQL on the common case
+        # where no series of the query falls below ``min_points``
+        # (e.g. a query with cold-start configured "just in case"
+        # against a fully matured fleet). ``cold_start_siblings`` is
+        # ``None`` either before resolution OR after resolution when
+        # cold-start is ineligible / the fetch failed; the
+        # ``cold_start_resolved`` flag distinguishes the two.
+        cold_start_siblings: list[SeriesFrame] | None = None
+        cold_start_resolved = False
         for frame in allowed:
             cleaned = preprocess_mod.preprocess_series(
                 timestamps=list(frame.timestamps),
@@ -820,6 +873,7 @@ class Runner:
                 ctx.dropped["preprocess_drop"] = ctx.dropped.get("preprocess_drop", 0) + 1
                 # Still record the largest gap so operators see what got
                 # dropped without scraping logs.
+                query_stats = ctx.preprocess_stats.setdefault(query.id, PreprocessStats())
                 query_stats.max_gap_seconds = max(
                     query_stats.max_gap_seconds, cleaned.max_gap_seconds
                 )
@@ -830,14 +884,28 @@ class Runner:
                 cleaned=cleaned,
                 outlier_method=group.preprocess.outliers.method,
             )
-            if len(cleaned.values) < min_points:
-                ctx.dropped["min_points"] = ctx.dropped.get("min_points", 0) + 1
-                continue
             preprocessed_frame = SeriesFrame(
                 labels=frame.labels,
                 timestamps=cleaned.timestamps,
                 values=cleaned.values,
             )
+            if len(cleaned.values) < min_points:
+                if not cold_start_resolved:
+                    cold_start_siblings = await self._prefetch_cold_start_siblings(query, qlog)
+                    cold_start_resolved = True
+                if cold_start_siblings is not None:
+                    handled = await self._try_cold_start(
+                        query=query,
+                        group=group,
+                        frame=preprocessed_frame,
+                        ctx=ctx,
+                        qlog=qlog,
+                        sibling_frames=cold_start_siblings,
+                    )
+                    if handled:
+                        continue
+                ctx.dropped["min_points"] = ctx.dropped.get("min_points", 0) + 1
+                continue
             stop_query = await self._run_one_series(
                 query,
                 group,
@@ -968,6 +1036,249 @@ class Runner:
         _merge_fit_into_ctx(ctx, fit_result, query.id)
         return False
 
+    def _eligible_for_cold_start(self, query: QueryConfig) -> tuple[bool, str | None]:
+        """Decide whether cold-start can run for ``query`` at all.
+
+        Returns ``(eligible, reason)`` where ``reason`` is a short token
+        describing why cold-start is disabled (``None`` when eligible).
+        The check intentionally short-circuits two contracts the
+        SeasonalNaive-style cold-start path cannot honor:
+
+        * **Required regressors**: ``regressors[].required: true`` is the
+          operator saying "this metric must not be forecast without this
+          exogenous input"; synthesising a forecast from peer shapes
+          ignores that input entirely. Better to fall through to the
+          standard ``min_points`` drop than to silently produce a
+          regressor-free forecast for a series whose contract demanded
+          one.
+        * **Intermittent profile**: median-normalising a sparse, zero-
+          heavy series produces a degenerate prior (the per-step median
+          collapses to zero where most siblings sit on the zero
+          baseline). Skipping for ``data_profile: intermittent`` keeps
+          a useless forecast off /metrics; a future Croston-aware
+          cold-start variant can lift this skip when it ships.
+        """
+        if query.cold_start.borrow_from is None:
+            return False, None
+        if any(r.required for r in query.regressors):
+            return False, "required_regressor"
+        if query.data_profile == "intermittent":
+            return False, "intermittent_profile"
+        return True, None
+
+    async def _prefetch_cold_start_siblings(
+        self,
+        query: QueryConfig,
+        qlog: structlog.stdlib.BoundLogger,
+    ) -> list[SeriesFrame] | None:
+        """Fetch the borrow query once per primary query.
+
+        Returns ``None`` when cold-start would refuse to run at all
+        (no ``borrow_from`` configured, intermittent profile, required
+        regressor declared) or when the borrow PromQL fails — in either
+        case the per-frame loop falls through to the standard
+        ``min_points`` drop.
+
+        The sibling list is bounded by ``safety.max_series_per_query``
+        / ``safety.series_overflow`` so a misconfigured borrow PromQL
+        (``up`` instead of ``up{job="peer"}``) cannot load the entire
+        TSDB cardinality into memory.
+        """
+        eligible, reason = self._eligible_for_cold_start(query)
+        if not eligible:
+            if reason is not None:
+                qlog.info("cold_start_disabled", reason=reason)
+            return None
+        cold = query.cold_start
+        borrow = cold.borrow_from
+        assert borrow is not None  # narrowed by _eligible_for_cold_start
+        d = self._config.defaults
+        eff_step = effective_step(query, d)
+        try:
+            frames = await cold_start_mod.fetch_siblings(
+                source=self._source,
+                promql=borrow.promql,
+                lookback=d.lookback,
+                step=eff_step,
+                query_timeout_seconds=self._config.safety.query_timeout.total_seconds(),
+            )
+        except TimeoutError:
+            qlog.warning("cold_start_borrow_timeout")
+            return None
+        except Exception:
+            qlog.warning("cold_start_borrow_failed", exc_info=True)
+            return None
+
+        safety = self._config.safety
+        capped, dropped = _apply_overflow(
+            frames, safety.max_series_per_query, safety.series_overflow
+        )
+        if dropped:
+            qlog.info(
+                "cold_start_siblings_capped",
+                returned=len(frames),
+                allowed=len(capped),
+                dropped=dropped,
+            )
+        return capped
+
+    async def _try_cold_start(
+        self,
+        *,
+        query: QueryConfig,
+        group: GroupConfig,
+        frame: SeriesFrame,
+        ctx: _RunContext,
+        qlog: structlog.stdlib.BoundLogger,
+        sibling_frames: list[SeriesFrame],
+    ) -> bool:
+        """Attempt a cold-start fit when a series is below ``min_points``.
+
+        ``sibling_frames`` was prefetched once per query — see
+        :meth:`_prefetch_cold_start_siblings`. We do not re-issue the
+        borrow PromQL here, so cost is bounded to one TSDB round trip
+        per (group, query) refresh regardless of how many of the
+        query's series fall below ``min_points``.
+
+        Emits a SeasonalNaive-style forecast carrying the
+        ``cold_start="true"`` and ``model="ColdStart"`` labels. Returns
+        ``True`` when a cold-start forecast was emitted, ``False`` when
+        the caller should fall through to the normal ``min_points``
+        drop (insufficient siblings, degenerate shape, etc.).
+
+        ``forecast_quality_score`` for cold-start fits is capped at the
+        configured ``max_quality_score`` so they don't pass strict alert
+        gates like ``forecast_quality_score > 0.6`` on fabricated data.
+
+        Cold-start fits skip backtest / deviation / calibration / capacity
+        ETAs / growth rates by design: the underlying borrowed shape is
+        a prior, not a fit; running backtests against a borrowed series
+        would just amplify noise.
+        """
+        cold = query.cold_start
+        borrow = cold.borrow_from
+        if borrow is None:
+            return False
+
+        d = self._config.defaults
+        eff_step = effective_step(query, d)
+        eff_season_length = effective_season_length(query, d, step=eff_step)
+        horizon = max(1, int(d.horizon.total_seconds() // eff_step.total_seconds()))
+
+        # The forecast anchors at the target series's last observed
+        # timestamp so the cold-start curve continues where the (short)
+        # actuals left off — same convention the model-fit path follows.
+        # For a newly-onboarded service this is "moments ago"; for a
+        # series that stopped reporting hours ago the curve starts in the
+        # past, which is consistent with how the regular path treats stale
+        # input.
+        last_ts = frame.timestamps[-1] if frame.timestamps else None
+        outcome = cold_start_mod.synthesise_cold_start_forecast(
+            target_values=frame.values,
+            sibling_frames=sibling_frames,
+            season_length=eff_season_length,
+            horizon=horizon,
+            step=eff_step,
+            min_siblings=borrow.min_siblings,
+            last_ts=last_ts,
+        )
+        if outcome is None:
+            return False
+
+        # Synthesise a minimal ``_FitResult`` directly so the caller's
+        # standard ``_merge_fit_into_ctx`` plumbing stays unchanged. The
+        # cold-start forecast carries no backtest data, so we skip
+        # accuracy / deviation / capacity / contribution emission and
+        # only produce forecast points + (optionally) a capped quality
+        # sample.
+        factory = SeriesPointFactory(
+            metric_id=query.id,
+            base_labels=frame.labels,
+            group=group.name,
+            levels=list(d.confidence_levels),
+        )
+        fit_result = _FitResult()
+        forecast_points = [
+            ForecastPoint(
+                metric=point.metric,
+                labels={**point.labels, "cold_start": "true"},
+                value=point.value,
+            )
+            for point in factory.forecast_points(
+                outcome.forecast, cold_start_mod.COLD_START_MODEL_NAME, selection=None
+            )
+        ]
+        # Mirror snapshot points into the remote_write curve so a TSDB-
+        # backed deployment sees the same cold-start curve as the
+        # ``/metrics`` scrape. Without this, an operator who enabled the
+        # ``sink.remote_write`` push would see a snapshot row but no
+        # historical curve for cold-start series — a silent gap.
+        forecast_curve = [
+            ForecastCurvePoint(
+                metric=point.metric,
+                labels={**point.labels, "cold_start": "true"},
+                value=point.value,
+                timestamp_ms=point.timestamp_ms,
+            )
+            for point in factory.forecast_curve_points(
+                outcome.forecast, cold_start_mod.COLD_START_MODEL_NAME, selection=None
+            )
+        ]
+
+        # Apply count-aware emission safeguards (v1.3) to cold-start
+        # forecasts as well so a count-shaped series doesn't suddenly
+        # emit negative or fractional values just because its first
+        # forecast came from a borrowed shape. Snapshot pass owns the
+        # counter — the curve pass mutates values only — so we don't
+        # double-count corrections across the two emission paths.
+        clip, rounder = effective_emission_safeguards(query)
+        if clip or rounder:
+            counter: dict[str, int] = {}
+            forecast_points = _apply_safeguards_to_snapshot_points(
+                forecast_points, clip=clip, rounder=rounder, counter=counter
+            )
+            forecast_curve = _apply_safeguards_to_curve_points(
+                forecast_curve, clip=clip, rounder=rounder
+            )
+            for kind, count in counter.items():
+                fit_result.emission_clipped[kind] = fit_result.emission_clipped.get(kind, 0) + count
+
+        fit_result.points = forecast_points
+        fit_result.curve = forecast_curve
+        fit_result.cold_start_siblings = outcome.sibling_count
+
+        if d.emission.quality:
+            # Quality is normally derived from backtest data. Cold-start
+            # forecasts have no backtest, so we synthesise the score from
+            # two cold-start-specific signals — how many siblings
+            # contributed and how tightly they agreed on the shape —
+            # then clamp at ``max_quality_score`` so the score still
+            # cannot pass strict alert gates regardless of how
+            # confident the sibling set looked.
+            quality_label = {
+                **{k: v for k, v in frame.labels.items() if k != "__name__"},
+                "id": query.id,
+                "group": group.name,
+                "model": cold_start_mod.COLD_START_MODEL_NAME,
+                "cold_start": "true",
+            }
+            quality_score = cold_start_mod.cold_start_quality_score(
+                sibling_count=outcome.sibling_count,
+                shape_dispersion=outcome.shape_dispersion,
+                min_siblings=borrow.min_siblings,
+                cap=cold.max_quality_score,
+            )
+            fit_result.quality.append(QualityPoint(labels=quality_label, score=quality_score))
+
+        _merge_fit_into_ctx(ctx, fit_result, query.id)
+        qlog.info(
+            "cold_start_fit_emitted",
+            siblings=outcome.sibling_count,
+            min_siblings=borrow.min_siblings,
+            horizon=horizon,
+        )
+        return True
+
     async def _discover_and_fetch(
         self,
         query: QueryConfig,
@@ -1089,7 +1400,7 @@ class Runner:
             overflow_strategy=s.series_overflow,
         )
 
-    async def _fit_series(
+    async def _fit_series(  # noqa: PLR0912, PLR0915
         self,
         query: QueryConfig,
         frame: SeriesFrame,
@@ -1246,6 +1557,25 @@ class Runner:
         # and ``_RunContext`` retains them across the per-series loop.
         result.capacity_inputs.clear()
 
+        # Count-aware emission safeguards (v1.3). Applied *after* the
+        # calibration widening so a band that widened into negative
+        # territory still gets clipped. Run on both the snapshot and
+        # the remote_write curve so scrape + push see the same numbers;
+        # the counter only ticks on the snapshot pass (see
+        # ``_apply_safeguards_to_curve_points``).
+        clip, rounder = effective_emission_safeguards(query)
+        if clip or rounder:
+            counter: dict[str, int] = {}
+            forecast_points = _apply_safeguards_to_snapshot_points(
+                forecast_points, clip=clip, rounder=rounder, counter=counter
+            )
+            if result.curve:
+                result.curve = _apply_safeguards_to_curve_points(
+                    result.curve, clip=clip, rounder=rounder
+                )
+            for kind, count in counter.items():
+                result.emission_clipped[kind] = result.emission_clipped.get(kind, 0) + count
+
         result.points = forecast_points
 
         if needs.accuracy and backtest_results:
@@ -1269,6 +1599,15 @@ class Runner:
                 int(d.lookback.total_seconds() // max(1, int(eff_step.total_seconds()))),
             )
             coverage = min(1.0, len(frame.values) / float(expected_points))
+            # ``data_profile: intermittent`` swaps MAPE for MASE in the
+            # quality calculation as well — without this the quality
+            # sub-score collapses to 0 for a series whose actuals are
+            # mostly zero (NaN MAPE) and silently trips the
+            # ``ForecastQualityZero`` alert even when the intermittent
+            # model is fitting fine.
+            quality_kind: quality_mod.ScoreKind = (
+                "mase" if query.data_profile == "intermittent" else "mape"
+            )
             result.quality = list(
                 factory.quality_points(
                     backtests,
@@ -1276,6 +1615,7 @@ class Runner:
                     frame.values,
                     coverage,
                     imputed_fraction=imputed_fraction,
+                    score_kind=quality_kind,
                 )
             )
 
@@ -1456,15 +1796,35 @@ class Runner:
         regressors: pd.DataFrame | None = None,
     ) -> list[ForecastPoint]:
         d = self._config.defaults
-        backtest_mape = {
-            model_name: mape
-            for model_name, results in backtest_results.items()
-            if (mape := overall_mape(results)) is not None
-        }
+        # ``data_profile: intermittent`` swaps the comparator from MAPE to
+        # MASE — MAPE is undefined wherever the actual is zero, which is
+        # precisely the regime intermittent models target. The selector
+        # contract is unit-agnostic; we hand it MASE the same way we'd
+        # hand it MAPE and the lowest finite score still wins. The
+        # ``candidate_preference`` whitelist nudges the search toward the
+        # registered intermittent wrappers when any are configured, so an
+        # operator who lists ``[AutoARIMA, Croston, CrostonSBA]`` gets the
+        # Croston family preferred without removing AutoARIMA as a safety
+        # net.
+        is_intermittent = query.data_profile == "intermittent"
+        if is_intermittent:
+            score_map = {
+                model_name: score
+                for model_name, results in backtest_results.items()
+                if (score := overall_mase(results)) is not None
+            }
+        else:
+            score_map = {
+                model_name: mape
+                for model_name, results in backtest_results.items()
+                if (mape := overall_mape(results)) is not None
+            }
+        preference = model_registry.INTERMITTENT_MODEL_NAMES if is_intermittent else None
         selection = select(
             fallback_model=d.accuracy.fallback_model,
             fallback_mape_threshold=d.accuracy.fallback_mape_threshold,
-            backtest_mape=backtest_mape,
+            backtest_mape=score_map,
+            candidate_preference=preference,
         )
         # Look up params for the chosen model. The fallback model may live
         # outside ``defaults.models`` (e.g. SeasonalNaive used as the safety
@@ -1572,15 +1932,20 @@ class Runner:
         if not component_forecasts:
             return out
 
-        # Compute inverse-MAPE weights restricted to models that produced a
-        # forecast this run; otherwise a backtested-but-failed-to-fit model
-        # would leak into the ensemble's denominator.
-        scoreable_mape = {
-            name: mape
+        # Compute inverse-score weights restricted to models that produced
+        # a forecast this run; otherwise a backtested-but-failed-to-fit
+        # model would leak into the ensemble's denominator.
+        # ``data_profile: intermittent`` swaps MAPE for MASE so a series
+        # whose actuals are mostly zero (and therefore has NaN MAPE
+        # everywhere) still produces meaningful weights instead of
+        # silently degrading to equal weights for every component.
+        score_summary = overall_mase if query.data_profile == "intermittent" else overall_mape
+        scoreable_scores = {
+            name: score
             for name, results in backtest_results.items()
-            if name in component_forecasts and (mape := overall_mape(results)) is not None
+            if name in component_forecasts and (score := score_summary(results)) is not None
         }
-        weights = ensemble_weights(scoreable_mape) or {
+        weights = ensemble_weights(scoreable_scores) or {
             name: 1.0 / len(component_forecasts) for name in component_forecasts
         }
         weights = {name: w for name, w in weights.items() if name in component_forecasts}
@@ -2174,6 +2539,120 @@ def _apply_offsets_to_curve_points(
     return out
 
 
+# Count-aware emission safeguards (v1.3).
+#
+# When a query's ``emission.clip_non_negative`` is True every emitted
+# forecast / band value is clamped at zero from below; when its
+# ``emission.round_to_integer`` is True every value is rounded to the
+# nearest integer. Both are applied symmetrically to the snapshot
+# ``ForecastPoint`` list (consumed by /metrics) and to the
+# ``ForecastCurvePoint`` list (consumed by the remote_write sink) so
+# scrape and push see the same numbers.
+#
+# Counter semantics live in :func:`_classify_emission_correction` —
+# ``kind="negative"`` ticks only when the raw value was actually below
+# zero (a real model-output anomaly worth surfacing), and
+# ``kind="rounded"`` ticks only when the fractional component was at
+# least ``_ROUND_COUNTER_TRIGGER`` (so the counter doesn't blow up on
+# every continuous emission that happens to be slightly non-integer).
+
+_ROUND_COUNTER_TRIGGER = 0.05
+
+
+def _classify_emission_correction(
+    raw: float,
+    *,
+    clip: bool,
+    rounder: bool,
+) -> tuple[float, list[str]]:
+    """Return ``(adjusted_value, kinds)`` after applying the safeguards.
+
+    ``kinds`` is a list of bounded tokens ``["negative", "rounded"]``
+    that the caller folds into the per-query emission-clipped counter.
+    Each entry is recorded *once per emission* (a value that is both
+    negative and rounded triggers both counters); a value that didn't
+    need correction produces an empty list and contributes no counter
+    bumps.
+
+    Non-finite values pass through unmodified — clipping or rounding a
+    NaN would surface the silent transformation as a confusing
+    /metrics line later.
+    """
+    if not math.isfinite(raw):
+        return raw, []
+    value = raw
+    kinds: list[str] = []
+    if clip and value < 0.0:
+        value = 0.0
+        kinds.append("negative")
+    if rounder:
+        rounded = float(round(value))
+        if abs(value - rounded) >= _ROUND_COUNTER_TRIGGER:
+            kinds.append("rounded")
+        value = rounded
+    return value, kinds
+
+
+def _apply_safeguards_to_snapshot_points(
+    points: list[ForecastPoint],
+    *,
+    clip: bool,
+    rounder: bool,
+    counter: dict[str, int],
+) -> list[ForecastPoint]:
+    """Apply count-aware safeguards to ``ForecastPoint``s and bump ``counter``.
+
+    Returns a freshly constructed list; the input list is not mutated.
+    ``counter`` is updated in-place with ``kind -> count`` so the
+    runner can fold it into the per-(query, kind) total without
+    threading a second return value.
+    """
+    if not (clip or rounder):
+        return points
+    out: list[ForecastPoint] = []
+    for point in points:
+        new_value, kinds = _classify_emission_correction(point.value, clip=clip, rounder=rounder)
+        for kind in kinds:
+            counter[kind] = counter.get(kind, 0) + 1
+        if kinds or new_value != point.value:
+            out.append(ForecastPoint(metric=point.metric, labels=point.labels, value=new_value))
+        else:
+            out.append(point)
+    return out
+
+
+def _apply_safeguards_to_curve_points(
+    points: list[ForecastCurvePoint],
+    *,
+    clip: bool,
+    rounder: bool,
+) -> list[ForecastCurvePoint]:
+    """Apply count-aware safeguards to ``ForecastCurvePoint``s.
+
+    Counter bumps live with the snapshot pass — the runner emits both
+    families from the same fit and counting twice would double-bump
+    the operator-facing total. The curve pass therefore only mutates
+    values; it does not touch the counter.
+    """
+    if not (clip or rounder):
+        return points
+    out: list[ForecastCurvePoint] = []
+    for point in points:
+        new_value, _ = _classify_emission_correction(point.value, clip=clip, rounder=rounder)
+        if new_value != point.value:
+            out.append(
+                ForecastCurvePoint(
+                    metric=point.metric,
+                    labels=point.labels,
+                    value=new_value,
+                    timestamp_ms=point.timestamp_ms,
+                )
+            )
+        else:
+            out.append(point)
+    return out
+
+
 def _merge_fit_into_ctx(ctx: _RunContext, fit_result: _FitResult, query_id: str) -> None:
     """Splice a ``_FitResult`` into the per-group ``_RunContext``.
 
@@ -2198,6 +2677,11 @@ def _merge_fit_into_ctx(ctx: _RunContext, fit_result: _FitResult, query_id: str)
     for regressor_id, reason in fit_result.regressor_failures:
         rkey = (query_id, regressor_id, reason)
         ctx.regressor_failures[rkey] = ctx.regressor_failures.get(rkey, 0) + 1
+    for kind, count in fit_result.emission_clipped.items():
+        ekey = (query_id, kind)
+        ctx.emission_clipped[ekey] = ctx.emission_clipped.get(ekey, 0) + count
+    if fit_result.cold_start_siblings > 0:
+        ctx.cold_start_siblings[query_id] = fit_result.cold_start_siblings
 
 
 def _resolve_spec(specs: list[ModelSpec], name: str) -> ModelSpec:

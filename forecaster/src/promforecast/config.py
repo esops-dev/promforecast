@@ -367,15 +367,91 @@ class GrowthRateEmissionConfig(BaseModel):
 class QueryEmissionConfig(BaseModel):
     """Per-query emission toggles.
 
-    Today the only setting is :class:`GrowthRateEmissionConfig` (the
-    forecast growth-rate metric). Kept as its own block so future
-    per-query emission options can extend the schema without breaking
-    existing configs.
+    Today three families of settings live here:
+
+    * :class:`GrowthRateEmissionConfig` (the v1.2 forecast growth-rate
+      metric)
+    * ``clip_non_negative`` and ``round_to_integer`` (v1.3 count-aware
+      emission safeguards for non-negative / integer-valued metrics)
+
+    All three are kept on the per-query :class:`EmissionConfig` block so
+    operators opt in *per metric*: a config that mixes a count-valued
+    error counter with a continuous CPU-busy-percent series isn't
+    forced to choose a single rounding policy for both.
+
+    ``clip_non_negative`` / ``round_to_integer`` default to ``None`` so
+    the runner can distinguish "operator left it unset" from "operator
+    explicitly said off". When a query carries ``data_profile: count``,
+    the runner treats unset toggles as opt-in (both default to ``True``)
+    — that's the documented v1.3 behaviour. An operator who wants the
+    count profile but explicit continuous emission still gets the
+    override by setting the toggle to ``False`` directly.
     """
 
     model_config = ConfigDict(extra="forbid")
 
     growth_rate: GrowthRateEmissionConfig = Field(default_factory=GrowthRateEmissionConfig)
+    clip_non_negative: bool | None = None
+    round_to_integer: bool | None = None
+
+
+class ColdStartBorrowConfig(BaseModel):
+    """How to borrow a seasonal shape from sibling series for a cold-start fit.
+
+    Activated by the parent :class:`ColdStartConfig` when the target
+    series has fewer than ``min_points`` samples in its own lookback.
+    The borrow query is expected to return *peer* series — the same
+    metric family for comparable workloads (e.g. the same metric on
+    other instances of the same service) — that the forecaster
+    normalises to its own mean and then medians per step to produce a
+    seasonal prior. The prior is scaled back to the target's recent
+    average before being fed into :class:`SeasonalNaiveModel` as the
+    cold-start forecast.
+
+    ``method`` is fixed at ``median_normalized`` in v1.3 — the only
+    method shipped today — but the field exists so future variants
+    (``mean_normalized``, ``trimmed_median``) can ship without a schema
+    bump.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    promql: str
+    method: Literal["median_normalized"] = "median_normalized"
+    min_siblings: int = Field(default=3, ge=1)
+
+
+class ColdStartConfig(BaseModel):
+    """Cold-start seasonality borrowing for a query.
+
+    Off by default. When ``borrow_from`` is configured and the target
+    series has fewer than the runner's ``min_points``, the forecaster
+    queries the sibling set named by :class:`ColdStartBorrowConfig` and
+    synthesises a seasonal prior rather than dropping the series with
+    ``reason="min_points"``.
+
+    ``max_quality_score`` caps the ``forecast_quality_score`` for cold-
+    start fits so they cannot pass strict alert gates like
+    ``forecast_quality_score > 0.6``. The default of ``0.5`` is the
+    documented behaviour; operators who want a different cap can tune
+    it per query.
+
+    Cold-start fits emit a ``cold_start="true"`` label on every
+    forecast row so dashboards and alerts can route around them.
+
+    **Explicit non-goal**: this is not full hierarchical reconciliation
+    — the borrowed shape is a prior, not a constrained joint forecast.
+    True bottom-up/top-down reconciliation is a v2 model-pack concern.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    borrow_from: ColdStartBorrowConfig | None = None
+    # 0.5 = halfway. Anything above 0.6 would let cold-start forecasts
+    # pass the standard ``forecast_quality_score > 0.6`` alert gate
+    # documented in the example alerts; we cap below that explicitly so
+    # the default behaves the way the alerts assume.
+    max_quality_score: float = Field(default=0.5, ge=0.0, le=1.0)
 
 
 class QueryConfig(BaseModel):
@@ -398,6 +474,15 @@ class QueryConfig(BaseModel):
       query at runtime. See :mod:`promforecast.discovery`.
     * ``thresholds``: named ETA thresholds (see :class:`ThresholdConfig`).
     * ``emission``: per-query emission toggles (see :class:`QueryEmissionConfig`).
+    * ``data_profile``: optional hint about the metric's shape
+      (``intermittent`` | ``count`` | ``continuous``). The selector
+      uses MASE-based ranking for ``intermittent`` series so auto-select
+      can prefer the dedicated intermittent-demand methods; ``count``
+      flips the emission safeguards (``clip_non_negative``,
+      ``round_to_integer``) to default-on when the operator hasn't
+      explicitly chosen.
+    * ``cold_start``: opt-in cold-start sibling borrowing (see
+      :class:`ColdStartConfig`).
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -410,6 +495,8 @@ class QueryConfig(BaseModel):
     discover: list[DiscoveryVariable] = Field(default_factory=list)
     thresholds: list[ThresholdConfig] = Field(default_factory=list)
     emission: QueryEmissionConfig = Field(default_factory=QueryEmissionConfig)
+    data_profile: Literal["intermittent", "count", "continuous"] | None = None
+    cold_start: ColdStartConfig = Field(default_factory=ColdStartConfig)
 
 
 class CanaryConfig(BaseModel):
@@ -910,6 +997,7 @@ def _validate_query_overrides(*, group_name: str, query: QueryConfig) -> None:
                 "each threshold name must be unique within a query"
             )
         threshold_names.add(threshold.name)
+    _validate_cold_start(label=label, query=query)
     growth = query.emission.growth_rate
     if growth.enabled:
         if not growth.windows:
@@ -923,9 +1011,68 @@ def _validate_query_overrides(*, group_name: str, query: QueryConfig) -> None:
                 )
 
 
+def _validate_cold_start(*, label: str, query: QueryConfig) -> None:
+    """Semantic checks for the ``cold_start`` block of a query.
+
+    Pulled out of :func:`_validate_query_overrides` so neither helper
+    grows past ruff's branch limit. The runtime path is already
+    defensive about these conditions, but raising at load time turns a
+    silent skip into a precise error message.
+    """
+    borrow = query.cold_start.borrow_from
+    if borrow is None:
+        return
+    # Pydantic accepts the empty string as a valid ``str``; an empty
+    # borrow PromQL would 4xx the TSDB silently every refresh.
+    if not borrow.promql.strip():
+        raise ValueError(f"{label}.cold_start.borrow_from: promql must be a non-empty PromQL query")
+    # ``max_quality_score <= 0`` would emit cold-start quality samples at
+    # zero and trip ``ForecastQualityZero`` every cycle. Operators who
+    # want cold-start quality disabled should leave ``borrow_from`` out.
+    if query.cold_start.max_quality_score <= 0:
+        raise ValueError(
+            f"{label}.cold_start.max_quality_score must be > 0 when "
+            "borrow_from is configured; remove cold_start.borrow_from to "
+            "disable cold-start entirely."
+        )
+    # Median-normalising a sparse zero-heavy series produces a degenerate
+    # prior; the runner already skips this combination, but failing at
+    # load time turns the silent skip into actionable feedback.
+    if query.data_profile == "intermittent":
+        raise ValueError(
+            f"{label}.cold_start.borrow_from is set together with "
+            "data_profile: intermittent; cold-start cannot synthesise a "
+            "meaningful prior for intermittent series. Remove one of the "
+            "two — the runner would otherwise silently fall through to "
+            "the standard min_points drop on every refresh."
+        )
+
+
 def effective_step(query: QueryConfig, defaults: DefaultsConfig) -> timedelta:
     """Resolve the actual step for ``query`` from its override + defaults."""
     return query.step if query.step is not None else defaults.step
+
+
+def effective_emission_safeguards(query: QueryConfig) -> tuple[bool, bool]:
+    """Resolve ``(clip_non_negative, round_to_integer)`` for a query.
+
+    A query with ``data_profile: count`` opts both toggles on by
+    default so an operator who declared the profile gets count-safe
+    emission without a second knob. An explicit boolean on either
+    toggle wins over the profile default — that's the override
+    pathway documented in v1.3.
+
+    Returns the resolved booleans the runner uses; the values are not
+    persisted back on the query (the original config is read-only by
+    convention and ``data_profile`` already encodes the intent).
+    """
+    profile_default = query.data_profile == "count"
+    clip = query.emission.clip_non_negative
+    rounder = query.emission.round_to_integer
+    return (
+        profile_default if clip is None else clip,
+        profile_default if rounder is None else rounder,
+    )
 
 
 def effective_season_length(

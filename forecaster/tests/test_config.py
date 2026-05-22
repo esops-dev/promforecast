@@ -703,6 +703,117 @@ groups:
         config_module.load(path)
 
 
+def test_load_rejects_cold_start_with_empty_promql(tmp_path: Path) -> None:
+    """``cold_start.borrow_from`` requires a non-empty PromQL — pydantic
+    accepts ``""`` as a valid ``str``, so the validator catches the
+    operator typo at boot rather than letting the borrow query 4xx the
+    TSDB at the first cold-start refresh.
+    """
+    path = _write(
+        tmp_path,
+        """
+apiVersion: promforecast.io/v1
+datasource:
+  url: http://vm:8428/
+groups:
+  - name: g
+    queries:
+      - id: m
+        promql: up
+        cold_start:
+          borrow_from:
+            promql: ""
+            min_siblings: 3
+""",
+    )
+    with pytest.raises(ValueError, match=r"cold_start\.borrow_from: promql must be"):
+        config_module.load(path)
+
+
+def test_load_accepts_cold_start_with_promql(tmp_path: Path) -> None:
+    """A valid cold-start config round-trips through the loader unchanged."""
+    path = _write(
+        tmp_path,
+        """
+apiVersion: promforecast.io/v1
+datasource:
+  url: http://vm:8428/
+groups:
+  - name: g
+    queries:
+      - id: m
+        promql: up
+        cold_start:
+          borrow_from:
+            promql: peer_metric
+            min_siblings: 5
+          max_quality_score: 0.4
+""",
+    )
+    cfg = config_module.load(path)
+    q = cfg.groups[0].queries[0]
+    assert q.cold_start.borrow_from is not None
+    assert q.cold_start.borrow_from.promql == "peer_metric"
+    assert q.cold_start.borrow_from.min_siblings == 5
+    assert q.cold_start.max_quality_score == 0.4
+
+
+def test_load_rejects_cold_start_with_intermittent_profile(tmp_path: Path) -> None:
+    """Cold-start + ``data_profile: intermittent`` is rejected at load time.
+
+    Median-normalising sparse zero-heavy series produces a degenerate
+    prior; the runner skips the combination silently, which surprises
+    operators who configured both expecting a forecast.
+    """
+    path = _write(
+        tmp_path,
+        """
+apiVersion: promforecast.io/v1
+datasource:
+  url: http://vm:8428/
+groups:
+  - name: g
+    queries:
+      - id: m
+        promql: up
+        data_profile: intermittent
+        cold_start:
+          borrow_from:
+            promql: peer_metric
+""",
+    )
+    with pytest.raises(ValueError, match=r"cold_start.*intermittent"):
+        config_module.load(path)
+
+
+def test_load_rejects_cold_start_with_zero_max_quality_score(tmp_path: Path) -> None:
+    """``max_quality_score <= 0`` would fire ``ForecastQualityZero`` every cycle.
+
+    Pydantic's ``ge=0`` lets 0 slip through; the semantic check at load
+    time rejects it so operators see a clear error rather than a noisy
+    alert backlog.
+    """
+    path = _write(
+        tmp_path,
+        """
+apiVersion: promforecast.io/v1
+datasource:
+  url: http://vm:8428/
+groups:
+  - name: g
+    queries:
+      - id: m
+        promql: up
+        cold_start:
+          borrow_from:
+            promql: peer_metric
+          max_quality_score: 0.0
+""",
+    )
+    with pytest.raises(ValueError, match=r"max_quality_score must be > 0"):
+        config_module.load(path)
+
+
 def test_load_accepts_damped_models(tmp_path: Path) -> None:
     """The damped-trend models register and parse via the same model array."""
     path = _write(
