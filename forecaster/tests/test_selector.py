@@ -96,3 +96,51 @@ def test_ensemble_weights_handles_zero_mape_without_blowup() -> None:
 
 def test_ensemble_weights_empty_input_returns_empty() -> None:
     assert ensemble_weights({}) == {}
+
+
+def test_select_prefers_candidate_subset_when_any_finite() -> None:
+    """``candidate_preference`` nudges the search toward the listed names.
+
+    When at least one preferred candidate has a finite score, the
+    winner must come from the preferred set even if a non-preferred
+    model has a lower score. This is the mechanism the runner uses to
+    prefer intermittent-demand wrappers under
+    ``data_profile: intermittent`` without forcing the operator to
+    remove the safety-net continuous models from the config.
+    """
+    result = select(
+        fallback_model="SeasonalNaive",
+        fallback_mape_threshold=50.0,
+        backtest_mape={"AutoARIMA": 5.0, "CrostonSBA": 12.0, "ADIDA": 18.0},
+        candidate_preference=frozenset({"CrostonSBA", "ADIDA"}),
+    )
+    assert result.model == "CrostonSBA"
+
+
+def test_select_falls_back_to_full_set_when_no_preferred_finite() -> None:
+    """Empty preferred-set match -> rank across every model, not the fallback.
+
+    A misconfigured intermittent profile that lists no intermittent
+    models should still produce a forecast — picking the lowest of
+    what's there is more useful than dropping the series.
+    """
+    result = select(
+        fallback_model="SeasonalNaive",
+        fallback_mape_threshold=50.0,
+        backtest_mape={"AutoARIMA": 5.0, "AutoETS": 12.0},
+        candidate_preference=frozenset({"CrostonSBA", "ADIDA"}),
+    )
+    assert result.model == "AutoARIMA"
+
+
+def test_select_candidate_preference_still_honours_fallback_threshold() -> None:
+    """A preferred winner whose score exceeds the threshold still falls back."""
+    result = select(
+        fallback_model="SeasonalNaive",
+        fallback_mape_threshold=10.0,
+        backtest_mape={"AutoARIMA": 8.0, "CrostonSBA": 60.0},
+        candidate_preference=frozenset({"CrostonSBA"}),
+    )
+    assert result.model == "SeasonalNaive"
+    assert result.best_model == "CrostonSBA"
+    assert result.fallback_applied is True

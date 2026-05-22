@@ -256,6 +256,19 @@ class GroupSnapshot:
     outliers_replaced_cumulative: dict[tuple[str, str], int] = field(default_factory=dict)
     # Cumulative per-(query) change-point detection counter.
     change_points_cumulative: dict[str, int] = field(default_factory=dict)
+    # Cumulative per-(query, kind) emission clipping counter (v1.3).
+    # ``kind`` is bounded to ``negative`` (a value clipped from below zero
+    # by ``emission.clip_non_negative``) and ``rounded`` (a value whose
+    # fractional part was non-trivial when ``emission.round_to_integer``
+    # was on). Merged with the previous snapshot so the counter is
+    # monotonic across runs.
+    emission_clipped_cumulative: dict[tuple[str, str], int] = field(default_factory=dict)
+    # Per-(query) cold-start sibling counts from the most recent run.
+    # Gauge — only the latest run's samples belong on /metrics. Surfaces
+    # as ``forecast_cold_start_siblings`` so operators can see when a
+    # cold-start fit is borrowing from a thinner sibling set than the
+    # operator configured (e.g. peer renames thinning the borrow query).
+    cold_start_siblings: dict[str, int] = field(default_factory=dict)
 
 
 class Exporter:
@@ -546,6 +559,8 @@ class _SnapshotCollector:
         yield from _growth_rate_families(groups)
         yield from _calibration_families(groups)
         yield from _preprocess_families(groups)
+        yield from _emission_clipped_families(groups)
+        yield from _cold_start_siblings_families(groups)
         yield from _operational_families(groups)
         yield from _reload_families(reload_state)
         yield from _config_hash_families(config_hash)
@@ -1229,5 +1244,72 @@ def _effective_lookback_family(groups: list[GroupSnapshot]) -> Iterator[GaugeMet
             if stats.effective_lookback_seconds > 0:
                 family.add_metric([snap.group, query_id], float(stats.effective_lookback_seconds))
                 have = True
+    if have:
+        yield family
+
+
+def _emission_clipped_families(
+    groups: list[GroupSnapshot],
+) -> Iterator[CounterMetricFamily]:
+    """Render ``forecast_emission_clipped_total{group, query, kind}``.
+
+    Bumped only when a v1.3 emission safeguard (``clip_non_negative`` or
+    ``round_to_integer``) actually corrected a value:
+
+    * ``kind="negative"`` increments per emission whose model output
+      was clipped from below zero — a real model-output anomaly worth
+      surfacing.
+    * ``kind="rounded"`` increments only when the rounding distance
+      was non-trivial (``|fractional part| >= 0.05``) so the counter
+      does not explode on every emission of an inherently non-integer
+      model. This gives operators a useful signal for "rounding is
+      masking systematic fractional output" without flooding the
+      counter for benign integer-ish forecasts.
+
+    Emitted only when at least one group has produced data so /metrics
+    stays quiet for deployments that don't enable count-aware safeguards.
+    """
+    family = CounterMetricFamily(
+        "forecast_emission_clipped",
+        "Lookback-free emission corrections applied by count-aware safeguards, "
+        "by kind (negative = clipped from below zero | rounded = non-trivial "
+        "fractional component rounded to integer).",
+        labels=["group", "query", "kind"],
+    )
+    have = False
+    for snap in groups:
+        for (query_id, kind), count in snap.emission_clipped_cumulative.items():
+            family.add_metric([snap.group, query_id, kind], float(count))
+            have = True
+    if have:
+        yield family
+
+
+def _cold_start_siblings_families(
+    groups: list[GroupSnapshot],
+) -> Iterator[GaugeMetricFamily]:
+    """Render ``forecast_cold_start_siblings{group, query}``.
+
+    Gauge — the number of usable sibling series the cold-start borrow
+    query produced for the most recent run of the (group, query). A
+    sudden drop (e.g. peer renames thinning the borrow query) is the
+    early-warning signal that the configured ``min_siblings`` threshold
+    may stop being met. Emitted only when at least one cold-start fit
+    has run so /metrics stays empty for deployments that don't use the
+    feature.
+    """
+    family = GaugeMetricFamily(
+        "forecast_cold_start_siblings",
+        "Number of usable sibling series the cold-start borrow query produced "
+        "for the most recent run of the (group, query) tuple. Compared against "
+        "the configured cold_start.borrow_from.min_siblings to see how much "
+        "headroom the borrow has.",
+        labels=["group", "query"],
+    )
+    have = False
+    for snap in groups:
+        for query_id, count in snap.cold_start_siblings.items():
+            family.add_metric([snap.group, query_id], float(count))
+            have = True
     if have:
         yield family

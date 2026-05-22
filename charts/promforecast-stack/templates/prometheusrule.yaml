@@ -36,6 +36,18 @@ spec:
               Backtest MAPE for {{`{{ $labels.id }}`}} model {{`{{ $labels.model }}`}}
               at horizon {{`{{ $labels.horizon }}`}} has exceeded 30% for 24h.
 
+        - alert: ForecastModelDegradedMASE
+          expr: forecast_accuracy_mase > 1.0
+          for: 24h
+          labels:
+            severity: warning
+          annotations:
+            summary: "Forecast MASE > 1.0 for {{`{{ $labels.id }}`}} — worse than seasonal naive"
+            description: |
+              Backtest MASE for {{`{{ $labels.id }}`}} model {{`{{ $labels.model }}`}}
+              at horizon {{`{{ $labels.horizon }}`}} has exceeded 1.0 for 24h —
+              the forecast is doing no better than a seasonal naive baseline.
+
         - alert: ForecastFallbackPersistent
           expr: count by (group) (forecast_quality_score{model_fallback="true"}) > 0
           for: 6h
@@ -48,7 +60,8 @@ spec:
               back to the configured fallback model for 6h.
 
         - alert: ForecastQualityLow
-          expr: avg by (group) (forecast_quality_score) < 0.4
+          expr: |
+            avg by (group) (forecast_quality_score{cold_start!="true"}) < 0.4
           for: 6h
           labels:
             severity: info
@@ -56,11 +69,11 @@ spec:
             summary: "Average forecast quality for group {{`{{ $labels.group }}`}} is low"
             description: |
               Average forecast_quality_score for group {{`{{ $labels.group }}`}}
-              is below 0.4 for 6h. Treat downstream forecast-based alerts
-              with caution.
+              (excluding cold-start fits) is below 0.4 for 6h. Treat
+              downstream forecast-based alerts with caution.
 
         - alert: ForecastQualityZero
-          expr: forecast_quality_score == 0
+          expr: forecast_quality_score{cold_start!="true"} == 0
           for: 1h
           labels:
             severity: info
@@ -70,6 +83,19 @@ spec:
               forecast_quality_score for {{`{{ $labels.id }}`}}
               ({{`{{ $labels.model }}`}}) has been zero for 1h. Check
               data coverage and band width.
+
+        - alert: ForecastColdStartSiblingsLow
+          expr: forecast_cold_start_siblings < 3
+          for: 30m
+          labels:
+            severity: info
+          annotations:
+            summary: "Cold-start siblings thinning for {{`{{ $labels.group }}`}}/{{`{{ $labels.query }}`}}"
+            description: |
+              The cold-start borrow query for
+              {{`{{ $labels.group }}`}}/{{`{{ $labels.query }}`}} has fewer than
+              3 usable siblings for 30m. Check whether peer renames or
+              label-cardinality drift have thinned the borrow set.
 
     - name: promforecast.deviation
       interval: 1m
@@ -101,4 +127,76 @@ spec:
               {{`{{ $labels.id }}`}} (group {{`{{ $labels.group }}`}}, model
               {{`{{ $labels.model }}`}}, level {{`{{ $labels.level }}`}}) has a
               deviation ratio with magnitude above 2 for 5m.
+
+    - name: promforecast.capacity.examples
+      interval: 5m
+      rules:
+        - alert: NodeFilesystemForecastedFull
+          expr: node_filesystem_avail_bytes_forecast < 0
+          for: 30m
+          labels:
+            severity: warning
+          annotations:
+            summary: "{{`{{ $labels.instance }}`}}:{{`{{ $labels.mountpoint }}`}} forecast to fill before horizon"
+            description: |
+              The end-of-horizon forecast for free space on
+              {{`{{ $labels.instance }}`}} ({{`{{ $labels.mountpoint }}`}}) is below
+              zero. Provision capacity or clean up.
+
+        - alert: ForecastDiskFillImminent
+          expr: |
+            node_filesystem_avail_bytes_forecast_time_to_threshold_seconds{
+              name="critical", comparator="lt", level="95"
+            } < 6 * 60 * 60
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: "{{`{{ $labels.instance }}`}} disk will hit the floor within 6h (95% band)"
+            description: |
+              The conservative 95% forecast for {{`{{ $labels.instance }}`}}
+              {{`{{ $labels.mountpoint }}`}} reaches the configured
+              ``critical`` floor within 6h.
+
+        - alert: ForecastCPUSaturationApproaching
+          expr: |
+            node_cpu_busy_pct_forecast_time_to_threshold_seconds{
+              name="warn", comparator="gt"
+            }
+            and on (instance) (
+              node_cpu_busy_pct_forecast_time_to_threshold_seconds{
+                name="warn", comparator="gt"
+              } < 4 * 60 * 60
+            )
+          for: 30m
+          labels:
+            severity: info
+          annotations:
+            summary: "{{`{{ $labels.instance }}`}} CPU forecast to cross warn threshold within 4h"
+            description: |
+              The CPU busy-percent forecast for {{`{{ $labels.instance }}`}} is
+              expected to cross the configured ``warn`` threshold within 4
+              hours.
+
+        - alert: ForecastGrowthRateSpike
+          expr: |
+            abs(node_filesystem_avail_bytes_forecast_growth_rate{window="1d"})
+              /
+            clamp_min(
+              abs(
+                node_filesystem_avail_bytes_forecast_growth_rate{window="7d"} offset 1d
+              ),
+              1
+            )
+              > 3
+          for: 30m
+          labels:
+            severity: warning
+          annotations:
+            summary: "{{`{{ $labels.instance }}`}}{{`{{ $labels.mountpoint }}`}} growth rate has tripled vs last week"
+            description: |
+              The 1-day forecast growth rate for {{`{{ $labels.instance }}`}}
+              ({{`{{ $labels.mountpoint }}`}}) is more than 3x the 7-day
+              baseline. Investigate whether a workload change or leak is
+              driving accelerated consumption.
 {{- end }}

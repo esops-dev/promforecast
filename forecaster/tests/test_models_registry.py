@@ -43,8 +43,13 @@ def test_build_returns_correct_class(name: str, expected_class: type) -> None:
 
 
 def test_build_unknown_model_raises() -> None:
+    # Use a name that no built-in *or* community plug-in registers under,
+    # so the test result is stable whether or not ``promforecast-prophet``
+    # (or any other plug-in) is installed editable in the dev venv. A
+    # name with characters Prometheus would reject as a metric name
+    # also signals "this is intentionally not a real model".
     with pytest.raises(UnknownModelError):
-        model_registry.build("Prophet", season_length=288)
+        model_registry.build("__definitely_not_a_real_model__", season_length=288)
 
 
 def test_each_model_satisfies_protocol() -> None:
@@ -103,15 +108,19 @@ def test_unknown_model_error_lists_alternatives() -> None:
         model_registry.build("AutoArimaa", season_length=288)
 
 
-class _FakeProphet:
+class _FakeExternalModel:
     """Stand-in for an external plug-in registered via entry points.
 
     Lives next to the tests so the registry's discovery path is exercised
-    without depending on the real ``promforecast-prophet`` package being
-    importable in this venv.
+    without depending on a specific external package being importable in
+    this venv. The ``name`` is deliberately unique so the test passes
+    whether or not real plug-ins (``promforecast-prophet``) are installed
+    editable in the developer's venv — a ``Prophet``-named fixture would
+    collide with the real plug-in and surface as a duplicate-registration
+    error.
     """
 
-    name = "Prophet"
+    name = "_FakeExternalModel_v1"
 
     def __init__(self, season_length: int = 288, **params: Any) -> None:
         self._season_length = season_length
@@ -142,9 +151,13 @@ def test_third_party_model_is_discovered_via_entry_point() -> None:
     """A package that registers ``promforecast.models`` ships its model into
     the registry without any forecaster-side code change. This is exactly
     how ``promforecast-prophet`` is wired — verifying the contract here
-    means the real package can rely on it.
+    means the real package can rely on it. The fixture uses a unique
+    name so the test result is stable whether or not real plug-ins are
+    installed editable alongside.
     """
-    fake_ep = _FakeEntryPoint("prophet", "tests.test_models_registry:_FakeProphet", _FakeProphet)
+    fake_ep = _FakeEntryPoint(
+        "fake_external", "tests.test_models_registry:_FakeExternalModel", _FakeExternalModel
+    )
     real_eps = list(
         __import__("importlib.metadata", fromlist=["entry_points"]).entry_points(
             group=model_registry.ENTRY_POINT_GROUP
@@ -160,11 +173,13 @@ def test_third_party_model_is_discovered_via_entry_point() -> None:
     try:
         with patch("promforecast.models.entry_points", _patched):
             model_registry.refresh()
-            assert "Prophet" in model_registry.available()
+            assert _FakeExternalModel.name in model_registry.available()
             built = model_registry.build(
-                "Prophet", season_length=24, params={"seasonality_mode": "multiplicative"}
+                _FakeExternalModel.name,
+                season_length=24,
+                params={"seasonality_mode": "multiplicative"},
             )
-            assert isinstance(built, _FakeProphet)
+            assert isinstance(built, _FakeExternalModel)
             assert built._season_length == 24
             assert built._params == {"seasonality_mode": "multiplicative"}
     finally:

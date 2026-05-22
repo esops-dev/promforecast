@@ -21,41 +21,73 @@ External models can be added via the `promforecast.models` entry-point group (se
 | **AutoETS**         | Exponential smoothing with automatic error/trend/seasonality selection.                     | Clean, smooth seasonal metrics                | Zero-heavy series, sharp regime changes, heavy tails | Faster than AutoARIMA            |
 | **AutoETSDamped**   | AutoETS with a forced damped additive trend (native ETS damping + post-fit bend).            | Capacity metrics over multi-day horizons       | Series with no trend (damping is a no-op)        | Same as AutoETS                  |
 | **MSTL**            | Multiple Seasonal-Trend decomposition (LOESS) + trend forecaster on remainder.              | Strong, regular seasonality                   | Short series (< 2 full cycles) or no seasonality | Comparable to AutoETS            |
+| **Croston**         | Classical Croston decomposition (demand size × inter-demand interval).                       | Sparse / intermittent demand                  | Continuous series with strong seasonality        | Negligible                       |
+| **CrostonSBA**      | Syntetos-Boylan bias-corrected Croston (recommended default).                               | Sparse / intermittent demand                  | Continuous series with strong seasonality        | Negligible                       |
+| **ADIDA**           | Aggregate-Disaggregate Intermittent Demand Approach.                                        | Very sparse signals where Croston struggles   | Continuous series with strong seasonality        | Negligible                       |
+| **IMAPA**           | Intermittent Multiple Aggregation Prediction Algorithm.                                     | Noisy intermittent signals                    | Continuous series with strong seasonality        | Negligible                       |
 
 ### When to choose damped
 
-**Rule of thumb:** for any forecast horizon longer than one full
-seasonal cycle, prefer the damped variant. A 14-day disk-fill forecast
-based on a daily seasonality (`season_length=288`) is exactly the case
-where linear extrapolation lies — turn on damping.
+**Rule of thumb:** for any horizon longer than one full seasonal cycle, prefer the damped variant (`AutoARIMADamped` or `AutoETSDamped`). A 14-day disk-fill forecast with daily seasonality (`season_length=288` at 5 min step) is the classic case.
 
-`damping_parameter` (default `0.98`) controls how aggressively the
-trend is bent. `1.0` is no damping (equivalent to the undamped variant);
-smaller values bend more sharply.
+`damping_parameter` (default `0.98`) controls how quickly the trend bends. `1.0` = no damping.
 
-**Side-by-side numbers.** For a forecast that grows linearly at one
-unit per step, applying damping at the listed `phi` gives the following
-extrapolation at horizon `h` (i.e. how many "trend units" the forecast
-has accumulated by then):
+**Extrapolation table** (linear growth of 1 unit/step):
 
-| `damping_parameter` | h=1   | h=10  | h=24  | h=144 (12h @ 5m) | h=288 (24h @ 5m) | Asymptote |
-|---------------------|-------|-------|-------|------------------|------------------|-----------|
-| `1.00` (undamped)   | 1.00  | 10.00 | 24.00 | 144.00           | 288.00           | ∞         |
-| `0.99`              | 0.99  | 9.47  | 21.22 | 75.71            | 93.52            | 99        |
-| `0.98`              | 0.98  | 8.96  | 18.83 | 46.33            | 48.85            | 49        |
-| `0.95`              | 0.95  | 7.62  | 13.45 | 18.99            | 19.00            | 19        |
-| `0.90`              | 0.90  | 5.86  | 8.28  | 9.00             | 9.00             | 9         |
+| `damping_parameter` | h=1   | h=10  | h=24  | h=144 (12 h) | h=288 (24 h) | Asymptote |
+|---------------------|-------|-------|-------|--------------|--------------|-----------|
+| `1.00` (undamped)   | 1.00  | 10.00 | 24.00 | 144.00       | 288.00       | ∞         |
+| `0.99`              | 0.99  | 9.47  | 21.22 | 75.71        | 93.52        | 99        |
+| `0.98` (default)    | 0.98  | 8.96  | 18.83 | 46.33        | 48.85        | 49        |
+| `0.95`              | 0.95  | 7.62  | 13.45 | 18.99        | 19.00        | 19        |
+| `0.90`              | 0.90  | 5.86  | 8.28  | 9.00         | 9.00         | 9         |
 
-Near-term forecasts (h<10) are barely touched; long-horizon
-extrapolations bend toward the asymptote `phi / (1 - phi)`. The default
-of `0.98` keeps a 12h forecast comfortably above 75% of its undamped
-value at h=24 (~78%) but trims a 24h horizon to a fixed ~49 trend units
-— exactly what you want for multi-day disk-fill or memory-growth
-forecasts.
+See [`capacity.md`](capacity.md) for recommended defaults and decision flow.
 
-See [`docs/capacity.md`](capacity.md) for the recommended
-`examples/configs/node-capacity.yaml` defaults and a "when to choose
-damped" decision flow.
+### When your series is sparse — intermittent-demand models
+
+AutoARIMA/AutoETS/MSTL assume a continuous signal. On series that are zero ≥80 % of the time they collapse to “always zero” or oscillating bands.
+
+**Decision flow**:
+1. Is the lookback ≥80 % zero? → treat as intermittent.
+2. Prefer **CrostonSBA** (bias-corrected; use plain Croston only with a specific reason).
+3. If inter-demand interval is extremely sparse → **ADIDA**.
+4. If aggregation bucket isn’t obvious → **IMAPA** (averages ADIDA over buckets).
+
+Set `data_profile: intermittent` on the query to:
+- Switch auto-selector from MAPE to MASE (MAPE is undefined on zeros).
+- Prefer intermittent wrappers when present.
+- Pair with `forecast_accuracy_mase > 1.0` alerts (see `examples/alerts/promforecast-rules.yaml`).
+
+Intermittent models ignore `season_length` and `regressors`. Confidence bands come from `statsforecast` bootstrap (enabled automatically when `confidence_levels:` is set). Tune via `params.conformal_windows`.
+
+**Worked example** (sparse error counter, 60-step lookback, 12-step hold-out):
+
+| Model        | Forecast at horizon | Band      | MAPE | MASE |
+|--------------|---------------------|-----------|------|------|
+| `AutoARIMA`  | ≈ 0.0               | ±wide     | NaN  | 1.0  |
+| `CrostonSBA` | ≈ 0.10              | ±narrow   | NaN  | 0.6  |
+| `ADIDA`      | ≈ 0.08              | ±narrow   | NaN  | 0.6  |
+
+## Count-aware emission safeguards
+
+For non-negative/integer metrics (counts, queue depths) add:
+
+```yaml
+data_profile: count
+emission:
+  clip_non_negative: true   # default when data_profile=count
+  round_to_integer: true    # default when data_profile=count
+```
+
+- `clip_non_negative` clamps forecasts/bands at zero (`forecast_emission_clipped_total{kind="negative"}`).
+- `round_to_integer` rounds to nearest integer (`forecast_emission_clipped_total{kind="rounded"}` only when fractional part ≥0.05).
+
+Applies to both `/metrics` and `remote_write`.
+
+## Cold-start seasonality borrowing
+
+See [`cold-start.md`](cold-start.md). Short version: when history < `min_points`, set `cold_start.borrow_from.promql` to synthesise a `SeasonalNaive`-style forecast from peer siblings. Emits with `model="ColdStart"` and `cold_start="true"`. Quality score is capped (default 0.5).
 
 ## Multi-horizon accuracy
 
@@ -66,135 +98,86 @@ forecast_accuracy_mape{id, group, model, horizon, ...}
 forecast_accuracy_mase{id, group, model, horizon, ...}
 ```
 
-`horizon` values come from `accuracy.horizons` (default `[1h, 6h, 24h]`). The backtest uses a single hold-out window — the most recent `max(accuracy.horizons)` of the lookback — and slices the forecast accordingly.
+`horizon` values come from `accuracy.horizons` (default `[1h, 6h, 24h]`). Single hold-out window = most recent `max(accuracy.horizons)` of the lookback.
 
 ## Cost model (per series)
 
-- `accuracy.evaluate: false` + `accuracy.auto_select: false` + `emission.{deviation,quality}: false`: **N** fits (one per model) — cheapest.  
-- `accuracy.evaluate: true` + `accuracy.auto_select: false`: **2N** fits (backtest + final forecast per model).  
-- `accuracy.auto_select: true` **or** any emission enabled: **N + 1** fits (backtest per model + one final forecast for the winner).
+- `accuracy.evaluate: false` + `accuracy.auto_select: false` + `emission.{deviation,quality}: false`: **N** fits (cheapest).  
+- `accuracy.evaluate: true` + `accuracy.auto_select: false`: **2N** fits.  
+- `accuracy.auto_select: true` **or** any emission enabled: **N + 1** fits.
 
-Backtest and forecast fits run concurrently in the executor pool, so wall-clock time per series equals the slowest individual fit. The backtest runs whenever *any* of `accuracy.evaluate`, `accuracy.auto_select`, `emission.deviation`, or `emission.quality` is enabled.
+Backtest + forecast fits run concurrently; wall time = slowest fit.
 
 ## Auto-select with fallback
 
-Set `accuracy.auto_select: true` to run a horse race and emit only the winner:
+Set `accuracy.auto_select: true`:
 
-- Winner = lowest mean MAPE across the configured models.  
-- Final forecast labels: `model="<winner>"`, `best_model="<winner>"`, `model_fallback="false"`.  
-- If the winner’s MAPE exceeds `accuracy.fallback_mape_threshold` (default `50`), it is replaced by `accuracy.fallback_model` (default `SeasonalNaive`). Labels become `model="<fallback>"`, `best_model="<original winner>"`, `model_fallback="true"`.
+- Winner = lowest mean MAPE.  
+- Labels: `model="<winner>"`, `best_model="<winner>"`, `model_fallback="false"`.  
+- If winner MAPE > `accuracy.fallback_mape_threshold` (default 50), replace with `accuracy.fallback_model` (default `SeasonalNaive`).  
 
-Set `accuracy.fallback_mape_threshold: null` to disable the check.
+Set threshold to `null` to disable.
 
 ## Ensemble auto-select
 
-Set `accuracy.auto_select: ensemble` to combine every configured model into a single weighted forecast. Weights are inverse-MAPE (lowest backtest MAPE = largest weight).
-
-Output:
-
-- Component models are emitted exactly as in explicit mode (`model="AutoARIMA"`, `model="SeasonalNaive"`, …).  
-- A synthetic `model="ensemble"` row is emitted alongside, carrying the weighted combination.  
-- Weights are exposed via `forecast_ensemble_weight{id, group, model, ...}` for dashboards.
-
-Failure handling:  
-- Failed components are excluded from the ensemble.  
-- If *every* component MAPE is non-finite, equal weights are used as a last resort.  
-- The ensemble row has no backtest data, so `forecast_quality_score{model="ensemble"}` and `forecast_deviation_*{model="ensemble"}` are omitted. Use the per-component metrics instead.
+`accuracy.auto_select: ensemble` emits every component **plus** a weighted `model="ensemble"` row (inverse-MAPE weights).  
+Weights exposed via `forecast_ensemble_weight{...}`.  
+Failed components are dropped; all-non-finite → equal weights. Ensemble row skips backtest/quality/deviation metrics.
 
 ## Per-model hyperparameter overrides
-
-Most users never need this — the `Auto*` wrappers exist so you don’t have to tune.  
-If you want to lock in a specific configuration, every entry in `models:` accepts an optional `params:` dict:
 
 ```yaml
 defaults:
   models:
-    - SeasonalNaive                              # plain string shorthand still works
+    - SeasonalNaive
     - name: AutoARIMA
       params:
         max_p: 5
         max_q: 5
         stepwise: false
-    - name: AutoETS
-      params:
-        model: "ZAA"
 ```
 
-Bare strings are equivalent to `{ name: "<model>", params: {} }`.  
-Supported keys are whatever the underlying `statsforecast` model accepts. Unknown keys surface as fit-time errors tagged `fit_error` in `forecast_failures_total`.
+Bare strings = `{name: "...", params: {}}`. Unknown keys surface as `fit_error`.
 
 ## Multi-frequency support
 
-`step` and `season_length` cascade from `defaults` onto every query, but a query can override either one when its natural cadence doesn't match the rest of the config:
+Override `step` / `season_length` per query:
 
 ```yaml
-defaults:
-  step: 5m
-  season_length: 288        # daily seasonality at 5-minute step
-
-groups:
-  - name: mixed
-    queries:
-      - id: node_cpu_busy_pct       # uses defaults
-        promql: 100 - rate(node_cpu_seconds_total{mode="idle"}[5m]) * 100
-      - id: hourly_business_kpi     # 1h cadence, daily seasonality (24)
-        promql: business_kpi
-        step: 1h
-        season_length: 24
-      - id: hourly_with_auto        # let the forecaster pick the seasonality
-        promql: business_kpi
-        step: 1h
-        season_length: auto
+- id: hourly_business_kpi
+  promql: business_kpi
+  step: 1h
+  season_length: 24          # or auto
 ```
 
-`season_length: auto` derives a daily seasonality from the effective step (`86400 / step_seconds`); steps of a day or longer fall back to a weekly cycle (`7`).
-
-The override flows through every per-query path: PromQL fetch step, regressor pre-fetch step, accuracy horizons (`accuracy.horizons` are still measured in wall-clock duration, but step-aware), and the model's `season_length` parameter.
+`season_length: auto` derives daily (`86400 / step_seconds`) or weekly (`7`) fallback.
 
 ## Exogenous regressors
 
-Per-query `regressors:` lets you feed external drivers into a forecast. Two types are supported:
-
 ```yaml
-groups:
-  - name: traffic_capacity
-    queries:
-      - id: requests_per_second
-        promql: rate(http_requests_total[5m])
-        regressors:
-          - id: hour_of_day
-            type: calendar
-          - id: deploys
-            type: custom
-            promql: changes(kube_deployment_status_observed_generation[1h])
-            required: false   # default; failures degrade gracefully
+regressors:
+  - id: hour_of_day
+    type: calendar
+  - id: deploys
+    type: custom
+    promql: changes(...)
+    required: false
 ```
 
 | Type       | Source                              | Failure behavior                              |
 |------------|-------------------------------------|-----------------------------------------------|
-| `calendar` | Derived from timestamps (`hour_of_day`, `day_of_week`, `is_weekend`) | Never fails                                   |
-| `custom`   | Own PromQL query (mean-aggregated)  | Optional → dropped; `required: true` → whole series skipped |
+| `calendar` | Timestamps (`hour_of_day`, …)       | Never fails                                   |
+| `custom`   | Own PromQL (mean-aggregated)        | Optional → dropped; required → series skipped |
 
-Failures increment `forecast_regressor_failures_total{group, query, regressor, reason}` (optional) or `forecast_failures_total{reason="required_regressor"}` (required).
-
-The built-in `statsforecast` wrappers currently ignore regressors, but the pipeline is ready for third-party models (`promforecast-prophet`, etc.).
-
-### Per-regressor contribution metric
-
-When a query has at least one regressor, the forecaster also emits a normalised explainability share per regressor:
+When regressors are present, also emits normalised contribution:
 
 ```
-<id>_forecast_contribution_ratio{regressor="hour_of_day", group, ...}
+<id>_forecast_contribution_ratio{regressor="...", ...}
 ```
 
-Values live in `[0, 1]`; the ratios across regressors of a single series sum to 1 when at least one regressor produces a finite Pearson correlation against the series actuals. Constant regressors and constant targets land at `0.0` rather than dragging the rest of the share down. Disable via `defaults.emission.contribution: false`.
-
-Because the built-in models don't expose per-regressor coefficients, the metric is a data-only proxy: |Pearson correlation|, normalised across the configured regressors. It's a useful first-order view today and a stable name for plug-in models that later derive a real per-coefficient contribution.
+Disable via `defaults.emission.contribution: false`.
 
 ## remote_write sink
-
-By default the forecaster only exposes the *next* forecast row via `/metrics`.  
-For historical forecast curves (the kind Grafana draws continuously) enable `remote_write`:
 
 ```yaml
 sink:
@@ -202,56 +185,31 @@ sink:
     enabled: true
     url: http://victoriametrics:8428/api/v1/import/prometheus
     timeout: 30s
-    headers:
-      X-Forecaster: promforecast
 ```
 
-After every successful run the full forecast curve is pushed as Prometheus text format with explicit millisecond timestamps.  
-VictoriaMetrics requires `-futureRetention=2d` (or higher than your `defaults.horizon`) to accept future-dated samples.
+Full forecast curve is pushed after every run (Prometheus text format + ms timestamps).  
+VictoriaMetrics needs `-futureRetention=2d` (or higher than `defaults.horizon`).
 
-The body is chunked (`chunk_size` defaults to 10000 rows) to avoid huge requests.
-Each chunk is retried up to 3 times with exponential backoff on transient failures (transport errors, timeouts, 5xx); 4xx fails fast.
-If retries are exhausted, the chunk failure aborts the rest of the push for that run and the next cycle re-sends everything.
-`/metrics` continues to expose the latest snapshot.
+Body is chunked (default 10 000 rows). Each chunk retries up to 3× with backoff on transient errors; 4xx fails fast.  
+Failures tracked in `forecast_remote_write_failures_total` and `forecast_remote_write_retries_total`.  
+Pool sizing via `max_connections` / `max_keepalive_connections`.
 
-Push failures are tracked in `forecast_remote_write_failures_total{group, reason}` (terminal — bumps after retries are exhausted).
-`forecast_remote_write_retries_total{group, reason}` bumps on every retry attempt, including ones that eventually succeed — so a flaky TSDB papered over by retries is observable before it tips into outright failure.
-PromQL retries on the read side are surfaced symmetrically as `forecast_source_retries_total{reason}` (`transport` | `http_5xx`); the source counter is unlabelled by group because the read client is shared across groups.
-
-Pool sizing is configurable via `sink.remote_write.max_connections` / `max_keepalive_connections` (and the symmetric `datasource.max_concurrent_requests` / `max_keepalive_connections` on the read side).
-Tune the sink pool up when many groups push concurrently; tune the datasource pool with the read fan-out (groups × per-query regressor fan-out).
+`/metrics` always shows the latest snapshot.
 
 ## Extending the registry
 
-The forecaster discovers models through the standard Python `promforecast.models` entry-point group. Any installed package that registers under this group appears in the registry automatically — no fork, no PR, no forecaster-side code change.
+Models are discovered via the `promforecast.models` entry point.
 
-The first community model is [`promforecast-prophet`](../community/promforecast-prophet/) — install it and `Prophet` becomes available in the `models:` array immediately.
-
-### Adding a model in your own package
+**Community model example** (`promforecast-prophet`):
 
 ```toml
-# pyproject.toml of your-promforecast-extra
-[project]
-name = "your-promforecast-extra"
-dependencies = ["promforecast"]
-
 [project.entry-points."promforecast.models"]
-my_model = "your_promforecast_extra:MyModel"
+prophet = "promforecast_prophet:ProphetModel"
 ```
 
-`MyModel` must:
-- Expose a class-level `name: str` (becomes the value users put in their config — e.g. `name = "MyModel"` makes `models: [MyModel]` work).
-- Accept `season_length: int` and `**params: Any` in `__init__`.
-- Implement `fit_predict(df, horizon, freq, levels, regressors=None) -> pd.DataFrame` returning the standard `unique_id, ds, yhat[, yhat_lower_<level>, yhat_upper_<level>]` shape.
+**In-tree (built-ins)**:
+1. Implement `ForecastModel` protocol in `forecaster/src/promforecast/models/<name>.py`.
+2. Register in `forecaster/pyproject.toml`.
+3. Document here.
 
-The registry is lazy and cached — the first call after import discovers all entry points; subsequent calls reuse the result. Two packages that register the same `name` produce a clear `ModelRegistrationError` at boot rather than silently shadowing each other.
-
-### Adding a model in-tree (built-ins)
-
-For models that ship in this repo:
-
-1. Implement the `ForecastModel` protocol in `forecaster/src/promforecast/models/<name>.py`.
-2. Register it under the `promforecast.models` entry point in `forecaster/pyproject.toml`.
-3. Document it here.
-
-CI automatically verifies all registered models via the registry tests.
+CI verifies the full registry. The registry is lazy and cached; duplicate names raise `ModelRegistrationError` at boot.
