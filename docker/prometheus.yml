@@ -42,13 +42,28 @@ scrape_configs:
     static_configs:
       - targets: ["forecaster:9091"]
     # Drop forecast snapshot gauges (``*_forecast``, ``*_forecast_lower``,
-    # ``*_forecast_upper``) from the scrape. The forecaster's remote_write
-    # sink already pushes the full forecast curve into VM directly; the
-    # scraped snapshot is a duplicate with a different label set (carries
-    # ``instance="forecaster:9091"``) that confuses dashboards. Operational
-    # metrics (``forecast_failures_total``, ``forecast_quality_score``,
+    # ``*_forecast_upper``) from the scrape.
+    #
+    # *** Coupled to ``sink.remote_write.enabled`` in docker/dev-config.yaml. ***
+    #
+    # The dev-stack forecaster runs with ``sink.remote_write.enabled: true``
+    # (see docker/dev-config.yaml) so the full forecast curve is pushed into
+    # VictoriaMetrics directly. The scraped snapshot would be a duplicate
+    # under a different label set (carries ``instance="forecaster:9091"``,
+    # ``job="promforecast"``) and any dashboard not pre-filtering on the
+    # labelset renders an average of the two — masking the smooth curve
+    # under the 5-min snapshot staircase. The Helm charts derive the same
+    # drop from the same toggle (see ``serviceMonitor.dropForecastSnapshots``
+    # in charts/promforecast/values.yaml and the umbrella default in
+    # charts/promforecast-stack/values.yaml). If you turn the sink off in
+    # docker/dev-config.yaml, comment out the metric_relabel_configs block
+    # below so the snapshot becomes the canonical write path again.
+    #
+    # Operational metrics (``forecast_failures_total``, ``forecast_quality_score``,
     # ``forecast_run_duration_seconds``, etc.) stay scraped — they only
-    # exist on /metrics.
+    # exist on /metrics regardless of sink configuration. See
+    # docs/architecture/emission-paths.md for the dual-source trap and the
+    # cross-metric-join labelset asymmetry this drop preserves.
     metric_relabel_configs:
       - source_labels: [__name__]
         regex: '.+_forecast(_lower|_upper)?'

@@ -33,6 +33,18 @@ helm install promforecast promforecast/promforecast-stack
 This installs VictoriaMetrics, the forecaster, and example dashboards.
 For an existing TSDB, install only `promforecast/promforecast`.
 
+The umbrella chart ships **sink + VictoriaMetrics** as the canonical
+forecast write path: the forecaster pushes the full forecast curve into
+VM with native future timestamps, and the bundled ServiceMonitor drops
+the redundant `*_forecast` / `*_forecast_lower` / `*_forecast_upper`
+snapshot families from the scrape so dashboards plot a smooth forward
+curve rather than averaging the sink push against a 5-minute snapshot
+staircase. See [`docs/architecture/emission-paths.md`](docs/architecture/emission-paths.md)
+for what each path emits and the dual-source trap that motivates the
+defaults. Existing snapshot-only installs upgrading to the new defaults
+should follow [`docs/how-to/migrate-to-sink-first.md`](docs/how-to/migrate-to-sink-first.md)
+and use `promforecast diagnose duplicates` to confirm the cutover.
+
 Editing the YAML config does **not** require a pod restart: the
 forecaster watches the mounted ConfigMap, validates the new config
 in-place, and rolls back on validation failure (`kubectl apply` to the

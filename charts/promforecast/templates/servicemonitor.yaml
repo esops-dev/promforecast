@@ -1,4 +1,30 @@
 {{- if .Values.serviceMonitor.enabled }}
+{{- /*
+    Derive the forecast-snapshot drop block from the sink toggle when the
+    operator has not pinned ``dropForecastSnapshots`` to a literal value.
+    ``null`` (the values.yaml default) means "follow sink.remote_write.enabled";
+    a literal true/false overrides the derivation. We pull the sink toggle
+    out of the nested config map with ``dig`` so unset intermediate keys
+    don't crash the render.
+
+    When the operator manages the forecaster config out-of-band
+    (``existingConfigMap``), the chart cannot see the sink toggle and the
+    derivation is ambiguous. Defaulting silently to off would land the
+    GitOps user in the dual-source state; we fail the template instead and
+    force an explicit ``dropForecastSnapshots`` decision.
+*/}}
+{{- $explicit := .Values.serviceMonitor.dropForecastSnapshots }}
+{{- if and .Values.existingConfigMap (not (kindIs "bool" $explicit)) }}
+{{- fail "serviceMonitor.dropForecastSnapshots must be set explicitly (true/false) when existingConfigMap is set — the chart cannot read the sink toggle from an externally-managed ConfigMap. See docs/architecture/emission-paths.md for the dual-source labelset trap." }}
+{{- end }}
+{{- $sinkOn := dig "sink" "remote_write" "enabled" false .Values.config }}
+{{- $drop := ternary $explicit $sinkOn (kindIs "bool" $explicit) }}
+{{- $extraRelabelings := default (list) .Values.serviceMonitor.metricRelabelings }}
+{{- $relabelings := $extraRelabelings }}
+{{- if $drop }}
+{{- $dropRule := dict "sourceLabels" (list "__name__") "regex" ".+_forecast(_lower|_upper)?" "action" "drop" }}
+{{- $relabelings = prepend $extraRelabelings $dropRule }}
+{{- end }}
 apiVersion: monitoring.coreos.com/v1
 kind: ServiceMonitor
 metadata:
@@ -10,17 +36,34 @@ metadata:
     {{- include "promforecast.labels" . | nindent 4 }}
     {{- with .Values.serviceMonitor.labels }}{{- toYaml . | nindent 4 }}{{- end }}
 spec:
+  # Pin the scrape ``job`` label to the Service's ``app.kubernetes.io/name``
+  # (``promforecast``) so it's a stable, release-name-agnostic value.
+  # Without this prometheus-operator auto-generates
+  # ``<namespace>/<servicemonitor>/<endpoint>`` as the job, which makes the
+  # umbrella's ``tests.labelsetUniqueness`` probe and the example PromQL in
+  # ``examples/alerts/promforecast-rules.yaml`` impossible to write
+  # generically.
+  jobLabel: app.kubernetes.io/name
   selector:
     matchLabels: {{- include "promforecast.selectorLabels" . | nindent 6 }}
   endpoints:
     - port: http
       path: /metrics
+      # ``honorLabels: true`` keeps the source ``instance`` (and any other
+      # source-side labels) that the forecaster exposes on its operational
+      # and derived ``*_forecast_*`` families — without this, Prometheus
+      # would clobber ``instance`` with the forecaster pod's own address,
+      # making the example alerts in ``examples/alerts/promforecast-rules.yaml``
+      # (which interpolate ``{{`{{ $labels.instance }}`}}`` to identify the
+      # node-exporter target) report the wrong host. Matches the
+      # ``honor_labels: true`` snippet in ``docs/architecture/emission-paths.md``.
+      honorLabels: true
       interval: {{ .Values.serviceMonitor.interval }}
       scrapeTimeout: {{ .Values.serviceMonitor.scrapeTimeout }}
       {{- with .Values.serviceMonitor.relabelings }}
       relabelings: {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- with .Values.serviceMonitor.metricRelabelings }}
+      {{- with $relabelings }}
       metricRelabelings: {{- toYaml . | nindent 8 }}
       {{- end }}
 {{- end }}

@@ -1,0 +1,47 @@
+{{- if .Values.datasources.enabled }}
+{{- /*
+    Grafana datasource provisioning shipped as ConfigMaps with the sidecar
+    label so a Grafana running the kiwigrid/k8s-sidecar pattern picks them
+    up automatically. VictoriaMetrics is registered as the default so the
+    bundled dashboards land on the sink-fed copy of the forecast metrics
+    (smooth curves) rather than the scraped snapshot (5-min staircase).
+    See ``docs/architecture/emission-paths.md`` for why the default matters.
+*/}}
+{{- $vm := .Values.datasources.victoriaMetrics }}
+{{- $prom := .Values.datasources.prometheus }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ printf "%s-datasources" (include "promforecast-stack.fullname" .) | trunc 63 | trimSuffix "-" }}
+  labels:
+{{- include "promforecast-stack.labels" . | nindent 4 }}
+{{- range $k, $v := .Values.datasources.labels }}
+    {{ $k }}: {{ $v | quote }}
+{{- end }}
+data:
+  promforecast-datasources.yaml: |-
+    apiVersion: 1
+    datasources:
+      - name: VictoriaMetrics
+        type: prometheus
+        access: proxy
+        uid: {{ $vm.uid | quote }}
+        url: {{ $vm.url | quote }}
+        isDefault: {{ $vm.isDefault }}
+        editable: true
+        jsonData:
+          httpMethod: POST
+          timeInterval: 15s
+{{- if $prom.url }}
+      - name: Prometheus
+        type: prometheus
+        access: proxy
+        uid: {{ $prom.uid | quote }}
+        url: {{ $prom.url | quote }}
+        isDefault: {{ $prom.isDefault }}
+        editable: true
+        jsonData:
+          httpMethod: POST
+          timeInterval: 15s
+{{- end }}
+{{- end }}

@@ -115,6 +115,16 @@ exit('!! forecast_query_cache_events_total{kind=\"miss\"} is zero -- the cache i
 r=json.loads(u.urlopen('http://localhost:9090/api/v1/query?query=forecast_accuracy_mape').read())['data']['result']; \
 print(f'  forecast_accuracy_mape: {len(r)} series'); \
 exit('!! Prometheus has 0 series - check the prometheus scrape config and forecaster reachability') if not r else None"
+	@echo ">> no label-divergent dual-source forecast labelsets in VM (regression guard for the scrape-drop)"
+	@cd $(FORECASTER) && .venv/bin/promforecast diagnose duplicates --datasource http://localhost:8428 --since 10m \
+	  > /tmp/promforecast-diagnose.txt 2>&1 \
+	  && echo ">> diagnose duplicates: clean" \
+	  || (echo "!! diagnose duplicates flagged a label-divergent duplicate state; see /tmp/promforecast-diagnose.txt"; tail -30 /tmp/promforecast-diagnose.txt; exit 1)
+	@echo ">> no same-labelset dual-source forecast ingest in VM (regression guard for sample-rate contamination)"
+	@cd $(FORECASTER) && .venv/bin/promforecast diagnose sample-rate --datasource http://localhost:8428 --window 10m --max-samples 5 \
+	  > /tmp/promforecast-sample-rate.txt 2>&1 \
+	  && echo ">> diagnose sample-rate: clean" \
+	  || (echo "!! diagnose sample-rate flagged at least one series above the per-window cap; see /tmp/promforecast-sample-rate.txt"; tail -30 /tmp/promforecast-sample-rate.txt; exit 1)
 	@if docker compose -f docker-compose.dev.yml ps --status running --services 2>/dev/null | grep -qx grafana; then \
 	  echo ">> dashboards reachable in Grafana at http://localhost:3000 (admin / admin)"; \
 	else \

@@ -9,9 +9,12 @@ The docs follow the [Diataxis](https://diataxis.fr/) framework:
 
 ## Index
 
+- [Emission paths (snapshot vs. sink + VM)](architecture/emission-paths.md) — what each path emits, the dual-source trap, and why the official charts default to sink + VM
 - [Config schema](config-schema.md) — `apiVersion`, stability guarantees, and the `v1alpha1` → `v1` migration
 - [Models](models.md) — built-in forecasters, auto-select, accuracy metrics
-- [CLI](cli.md) — `promforecast run` and `promforecast validate`
+- [CLI](cli.md) — `promforecast run`, `promforecast validate`, `promforecast diagnose`
+- [Reload verification](operations/reload.md) — confirming a config reload actually picked up the expected queries
+- [Duplicate-labelset diagnosis](operations/diagnose.md) — detecting and remediating the scrape+sink dual-source state
 - [High availability](ha.md) — Lease-based leader election, Redis snapshot cache
 - [Query cache](cache.md) — in-memory LRU + optional Redis dedup for overlapping PromQL
 - [Series discovery](discovery.md) — template-driven auto-fan-out over label values
