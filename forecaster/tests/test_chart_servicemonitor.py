@@ -40,6 +40,69 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+def _umbrella_deps_resolved() -> bool:
+    """Check whether ``charts/promforecast-stack/charts/`` carries both subcharts.
+
+    A fresh checkout (and the CI ``test`` job, which doesn't run
+    ``helm dependency update``) starts with the ``charts/`` directory
+    empty. ``helm template`` then bails with ``found in Chart.yaml,
+    but missing in charts/ directory``. The fixture below resolves
+    them lazily; this helper is the cheap idempotency check.
+    """
+    subcharts_dir = UMBRELLA_CHART / "charts"
+    if not subcharts_dir.is_dir():
+        return False
+    names = {p.name for p in subcharts_dir.iterdir()}
+    has_vm = any(n.startswith("victoria-metrics-single") and n.endswith(".tgz") for n in names)
+    has_pf = any(n.startswith("promforecast-") and n.endswith(".tgz") for n in names)
+    return has_vm and has_pf
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _resolve_umbrella_chart_deps() -> None:
+    """Resolve the umbrella chart's subchart dependencies once per session.
+
+    The CI ``test`` job (pytest) runs without the ``helm dependency
+    update`` step that ``chart-lint`` runs, so ``helm template
+    charts/promforecast-stack`` would fail with missing ``victoria-
+    metrics-single`` / ``promforecast`` subcharts. The chart-template
+    tests live next to the rest of the forecaster suite, so the
+    resolution has to happen here rather than be assumed at job-level.
+
+    The VictoriaMetrics chart repo is registered idempotently (helm's
+    ``repo add`` errors on a pre-existing entry; ``|| true`` is wrong
+    because we want the real error if it's a different problem, so we
+    inspect the exit code). The dependency-update itself is cheap on a
+    warm cache and unconditional so a stale ``charts/*.tgz`` from a
+    different version always gets refreshed.
+    """
+    if helm is None or _umbrella_deps_resolved():
+        return
+    # Register the upstream repo. ``helm repo add`` exits 0 on a fresh
+    # add and 1 if the same name is already present with a different
+    # URL — for our case the URL is fixed, so a non-zero on the
+    # "already exists" path is benign. We discriminate by checking the
+    # stderr message rather than swallowing every failure.
+    repo_add = subprocess.run(
+        [helm, "repo", "add", "victoria-metrics", "https://victoriametrics.github.io/helm-charts/"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if repo_add.returncode != 0 and "already exists" not in (repo_add.stderr or ""):
+        pytest.skip(
+            "could not register the victoria-metrics helm repo, skipping chart-template tests: "
+            f"{repo_add.stderr.strip()}"
+        )
+    subprocess.run([helm, "repo", "update"], capture_output=True, text=True, check=False)
+    subprocess.run(
+        [helm, "dependency", "update", str(UMBRELLA_CHART)],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+
 def _helm_template(chart: Path, *sets: str) -> list[dict]:
     """Render ``chart`` with the supplied ``--set`` flags and return docs."""
     cmd = [helm, "template", str(chart)]
