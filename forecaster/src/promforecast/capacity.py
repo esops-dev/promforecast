@@ -67,6 +67,66 @@ class GrowthRate:
     rate: float
 
 
+@dataclass(frozen=True)
+class WillBreach:
+    """0/1 predictive sample derived from an ETA + an ``alert_within`` window.
+
+    ``value`` is ``1.0`` when the threshold ETA is finite and below the
+    operator's ``alert_within`` lookahead, ``0.0`` otherwise. ``level`` is
+    ``None`` for the central forecast, a numeric level for band-edge
+    samples — same convention as :class:`ThresholdEta`.
+    """
+
+    name: str
+    severity: str
+    level: int | None
+    value: float
+
+
+def compute_will_breach(
+    *,
+    etas: list[ThresholdEta],
+    thresholds: list[ThresholdConfig],
+) -> list[WillBreach]:
+    """Project ``etas`` onto 0/1 will-breach samples for the configured thresholds.
+
+    Walks the (threshold, level) ETAs already produced by
+    :func:`compute_threshold_etas` and emits a :class:`WillBreach` for
+    each (threshold, level) whose threshold opted into the predictive
+    family (``alert_within`` + ``severity`` both set). ETAs whose
+    threshold did not opt in are skipped; non-finite ETAs (no crossing
+    in the horizon) emit ``0`` rather than being suppressed so an alert
+    on ``forecast_will_breach == 1`` has a stable zero-baseline series
+    to chart against.
+    """
+    if not etas or not thresholds:
+        return []
+    by_name = {
+        t.name: t for t in thresholds if t.alert_within is not None and t.severity is not None
+    }
+    if not by_name:
+        return []
+    out: list[WillBreach] = []
+    for eta in etas:
+        threshold = by_name.get(eta.name)
+        if threshold is None:
+            continue
+        # mypy: narrowed by ``by_name`` filter above.
+        assert threshold.alert_within is not None
+        assert threshold.severity is not None
+        window_seconds = threshold.alert_within.total_seconds()
+        value = 1.0 if math.isfinite(eta.seconds) and eta.seconds < window_seconds else 0.0
+        out.append(
+            WillBreach(
+                name=eta.name,
+                severity=threshold.severity,
+                level=eta.level,
+                value=value,
+            )
+        )
+    return out
+
+
 def compute_threshold_etas(
     *,
     forecast: pd.DataFrame,

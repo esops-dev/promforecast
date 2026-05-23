@@ -211,6 +211,96 @@ async def test_runner_eta_band_reflects_conformal_calibration(
 
 
 @pytest.mark.asyncio
+async def test_runner_emits_will_breach_family(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A threshold with ``alert_within`` + ``severity`` emits the boolean.
+
+    The RampForecastModel's central forecast crosses 60 mid-horizon and 70
+    near the end. We pick ``alert_within`` so the warn threshold fires
+    (1.0) and critical does not (0.0). Per-level rows are produced for
+    each emitted band.
+    """
+    from promforecast import models as model_registry  # noqa: PLC0415
+
+    monkeypatch.setattr(model_registry, "build", lambda *a, **kw: _RampForecastModel())
+
+    cfg = _config_with_query(
+        QueryConfig(
+            id="disk_used_pct",
+            promql="up",
+            thresholds=[
+                ThresholdConfig(
+                    name="warn",
+                    value=60.0,
+                    comparator="gt",
+                    alert_within=timedelta(hours=2),
+                    severity="warning",
+                ),
+                ThresholdConfig(
+                    name="critical",
+                    value=70.0,
+                    comparator="gt",
+                    alert_within=timedelta(minutes=1),
+                    severity="critical",
+                ),
+            ],
+        )
+    )
+    source = _FakeSource({"up": [_frame(20)]})
+    runner = Runner(config=cfg, source=source, exporter=(exporter := Exporter()))
+
+    await runner.run_group(cfg.groups[0])
+
+    body = exporter.render().decode()
+    assert "disk_used_pct_forecast_will_breach" in body
+    assert 'severity="warning"' in body
+    assert 'severity="critical"' in body
+    # warn alert_within=2h easily contains the ~11min ETA → 1.
+    warn_lines = [
+        line
+        for line in body.splitlines()
+        if line.startswith("disk_used_pct_forecast_will_breach{")
+        and 'name="warn"' in line
+        and 'level="80"' not in line
+    ]
+    assert warn_lines and warn_lines[0].endswith(" 1.0")
+    # critical alert_within=1min cannot contain the ~21min ETA → 0.
+    crit_lines = [
+        line
+        for line in body.splitlines()
+        if line.startswith("disk_used_pct_forecast_will_breach{")
+        and 'name="critical"' in line
+        and 'level="80"' not in line
+    ]
+    assert crit_lines and crit_lines[0].endswith(" 0.0")
+
+
+@pytest.mark.asyncio
+async def test_runner_omits_will_breach_when_threshold_opts_out(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A threshold without ``alert_within`` does not emit the boolean."""
+    from promforecast import models as model_registry  # noqa: PLC0415
+
+    monkeypatch.setattr(model_registry, "build", lambda *a, **kw: _RampForecastModel())
+
+    cfg = _config_with_query(
+        QueryConfig(
+            id="quiet_metric",
+            promql="up",
+            thresholds=[ThresholdConfig(name="warn", value=60.0, comparator="gt")],
+        )
+    )
+    source = _FakeSource({"up": [_frame(20)]})
+    runner = Runner(config=cfg, source=source, exporter=(exporter := Exporter()))
+    await runner.run_group(cfg.groups[0])
+    body = exporter.render().decode()
+    # ETA family exists, will_breach does not — the operator opted into
+    # one and not the other.
+    assert "quiet_metric_forecast_time_to_threshold_seconds" in body
+    assert "quiet_metric_forecast_will_breach" not in body
+
+
+@pytest.mark.asyncio
 async def test_runner_omits_capacity_families_when_unconfigured(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -191,6 +191,68 @@ def test_cardinality_estimate_counts_threshold_and_growth_rate_lines() -> None:
     assert est.growth_rate_lines == 100 * 1 * 2
 
 
+def test_validate_strict_cardinality_passes_when_under_budget(tmp_path: Path) -> None:
+    """A config whose estimated total fits inside the cap exits 0 in strict mode."""
+    path = _write(tmp_path, _GOOD_CONFIG)
+    out = io.StringIO()
+    rc = run_validate(path, strict_cardinality=True, out=out)
+    assert rc == 0
+
+
+def test_validate_strict_cardinality_fails_when_over_budget(tmp_path: Path) -> None:
+    """Strict mode flips the over-budget WARN into a non-zero exit code.
+
+    Tiny ``max_total_series`` against the default emission set guarantees
+    the estimate overshoots, so the test is deterministic without
+    materialising a contrived large config.
+    """
+    path = _write(
+        tmp_path,
+        """
+apiVersion: promforecast.io/v1
+datasource:
+  url: http://vm:8428/
+safety:
+  max_total_series: 1
+defaults:
+  models: [SeasonalNaive]
+groups:
+  - name: g
+    queries:
+      - id: m
+        promql: up
+""",
+    )
+    out = io.StringIO()
+    rc = run_validate(path, strict_cardinality=True, out=out)
+    assert rc == 1
+
+
+def test_validate_advisory_mode_returns_zero_when_over_budget(tmp_path: Path) -> None:
+    """Default (non-strict) mode keeps the historical advisory-only behaviour."""
+    path = _write(
+        tmp_path,
+        """
+apiVersion: promforecast.io/v1
+datasource:
+  url: http://vm:8428/
+safety:
+  max_total_series: 1
+defaults:
+  models: [SeasonalNaive]
+groups:
+  - name: g
+    queries:
+      - id: m
+        promql: up
+""",
+    )
+    out = io.StringIO()
+    rc = run_validate(path, out=out)
+    assert rc == 0
+    assert "WARN: total exceeds safety.max_total_series" in out.getvalue()
+
+
 def test_validate_dry_run_reports_failure_when_datasource_unreachable(tmp_path: Path) -> None:
     """Dry-run failures must not crash the CLI; they return rc=2."""
     path = _write(

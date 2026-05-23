@@ -375,6 +375,13 @@ class ThresholdConfig(BaseModel):
     so capacity ETAs are conservative at the upper band — "disk fills
     no later than 24h from now" rather than "the central forecast hits
     full in 24h".
+
+    ``alert_within`` + ``severity`` opt the threshold into the
+    ``<id>_forecast_will_breach`` predictive boolean: a derived 0/1 gauge
+    that fires when the time-to-threshold ETA is below ``alert_within``.
+    Both fields are required together (one without the other is
+    rejected at load time) — the predictive metric is a derived shape and
+    cannot be partially configured.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -382,6 +389,8 @@ class ThresholdConfig(BaseModel):
     name: str
     value: float
     comparator: Literal["gt", "lt"] = "gt"
+    alert_within: Duration | None = None
+    severity: Literal["warning", "critical"] | None = None
 
 
 class GrowthRateEmissionConfig(BaseModel):
@@ -459,7 +468,7 @@ class BandCoverageConfig(BaseModel):
 class QueryEmissionConfig(BaseModel):
     """Per-query emission toggles.
 
-    Today five families of settings live here:
+    Today six families of settings live here:
 
     * :class:`GrowthRateEmissionConfig` — forecast growth-rate metric.
     * ``clip_non_negative`` and ``round_to_integer`` — count-aware
@@ -468,6 +477,8 @@ class QueryEmissionConfig(BaseModel):
       drift telemetry.
     * :class:`BandCoverageConfig` — empirical band coverage rolling
       gauges.
+    * ``conditional`` — parallel ``<id>_forecast_conditional*`` family
+      that re-runs the fit with regressors held at their current value.
 
     Every family is kept on the per-query :class:`EmissionConfig` block so
     operators opt in *per metric*: a config that mixes a count-valued
@@ -481,6 +492,14 @@ class QueryEmissionConfig(BaseModel):
     An operator who wants the count profile but explicit continuous
     emission still gets the override by setting the toggle to ``False``
     directly.
+
+    ``conditional`` is off by default. When on, the runner re-fits every
+    emitted model with a regressors frame whose values are flat-held at
+    the most recent observation. Models that ignore the regressors
+    parameter (the built-in ARIMA/ETS/SeasonalNaive wrappers) produce
+    a conditional forecast equal to the unconditional one — the family
+    still emits so downstream alerts have a stable schema; regressor-aware
+    models register additional gain.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -490,6 +509,12 @@ class QueryEmissionConfig(BaseModel):
     round_to_integer: bool | None = None
     drift: DriftEmissionConfig = Field(default_factory=DriftEmissionConfig)
     band_coverage: BandCoverageConfig = Field(default_factory=BandCoverageConfig)
+    conditional: bool = False
+    # Component decomposition emission (trend/seasonal/level/residual). Off by
+    # default; opt-in per query because decomposition adds N_components rows
+    # per (series, model) per horizon step. See `models.py` for which models
+    # actually decompose; non-decomposable models bump a skip counter.
+    decompose: bool = False
 
 
 class ColdStartBorrowConfig(BaseModel):
@@ -1100,6 +1125,18 @@ def _validate_query_overrides(*, group_name: str, query: QueryConfig) -> None:  
                 "each threshold name must be unique within a query"
             )
         threshold_names.add(threshold.name)
+        has_alert_within = threshold.alert_within is not None
+        has_severity = threshold.severity is not None
+        if has_alert_within != has_severity:
+            raise ValueError(
+                f"{label}.thresholds[{threshold.name}]: alert_within and severity "
+                "must be set together (the will_breach metric is a derived shape "
+                "and cannot be partially configured)"
+            )
+        if threshold.alert_within is not None and threshold.alert_within.total_seconds() <= 0:
+            raise ValueError(
+                f"{label}.thresholds[{threshold.name}]: alert_within must be a positive duration"
+            )
     _validate_cold_start(label=label, query=query)
     growth = query.emission.growth_rate
     if growth.enabled:

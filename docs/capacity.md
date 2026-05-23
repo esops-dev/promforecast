@@ -121,6 +121,55 @@ ETA is reported as **0** (read: already in violation).
 - **Quota exhaustion**: forecast the in-use side of any quota,
   `comparator: gt`, `value` = the quota cap.
 
+### Predictive will-breach boolean
+
+`time_to_threshold_seconds < 6h` is a perfectly good alert, but every
+operator who writes one re-derives the same arithmetic. Set
+`alert_within` + `severity` on a threshold and the forecaster emits a
+boolean shaped exactly for `forecast_will_breach == 1`:
+
+```yaml
+queries:
+  - id: node_filesystem_avail_bytes
+    promql: node_filesystem_avail_bytes{fstype!~"tmpfs|overlay|squashfs"}
+    thresholds:
+      - name: critical
+        value: 5368709120     # 5 GiB
+        comparator: lt
+        alert_within: 6h      # opt into the will_breach gauge
+        severity: critical
+```
+
+| Field            | Required               | Meaning                                                                              |
+|------------------|------------------------|--------------------------------------------------------------------------------------|
+| `alert_within`   | only when paired       | Lookahead window. The boolean fires whenever the ETA is finite and below this value. |
+| `severity`       | only when paired       | Becomes the `severity` label on the emitted metric.                                  |
+
+Both fields must be set together — the predictive metric is a derived
+shape and partial config is rejected at load time. The metric is emitted
+even when the predicate is `0`, so dashboards have a baseline series to
+chart from boot:
+
+```
+node_filesystem_avail_bytes_forecast_will_breach{
+  name="critical", severity="critical", level="95",
+  group="node_capacity", model="AutoETSDamped", instance="host-a"
+} 1.0
+```
+
+The same fan-out as the ETA family applies: a row for the central
+forecast (no `level` label) plus one row per confidence level so
+operators can choose how conservative to be. Alerts read like:
+
+```promql
+forecast_will_breach{severity="critical", level="95"} == 1
+```
+
+The corresponding `forecast_time_to_threshold_seconds` value at the
+same labelset is the operator-visible "when" for the breach. See
+`examples/alerts/promforecast-rules.yaml` for the `ForecastWillBreach`
+rule template.
+
 ## Forecast growth rate
 
 Configure per-query growth-rate emission to publish how fast the
@@ -178,6 +227,8 @@ them:
 
 - Threshold ETA: `N_series × N_models × N_thresholds × (1 + N_levels)`
   per query that configures thresholds.
+- Will-breach: `N_series × N_models × N_thresholds_with_alert × (1 + N_levels)`
+  per query — only thresholds with `alert_within` + `severity` count.
 - Growth rate: `N_series × N_models × N_windows` per query that opts in.
 
 Run `promforecast validate config.yaml` after adding thresholds or

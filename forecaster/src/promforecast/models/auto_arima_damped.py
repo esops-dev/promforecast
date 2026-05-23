@@ -27,6 +27,7 @@ if TYPE_CHECKING:
 
 class AutoARIMADampedModel:
     name = "AutoARIMADamped"
+    uses_regressors = False
 
     def __init__(self, season_length: int = 288, **params: Any) -> None:
         self._season_length = season_length

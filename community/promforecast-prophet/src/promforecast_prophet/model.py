@@ -49,6 +49,12 @@ class ProphetModel:
     """
 
     name = "Prophet"
+    # Prophet's ``fit_predict`` actually merges and consumes the
+    # ``regressors`` frame (see lines below) — so the forecaster's
+    # conditional-forecast pass needs to refit Prophet with the
+    # held-constant regressors instead of aliasing the unconditional
+    # output.
+    uses_regressors = True
 
     def __init__(self, season_length: int = 288, **params: Any) -> None:
         self._season_length = season_length

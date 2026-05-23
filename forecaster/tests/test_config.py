@@ -680,6 +680,102 @@ groups:
         config_module.load(path)
 
 
+def test_load_accepts_threshold_with_alert_within_and_severity(tmp_path: Path) -> None:
+    """A threshold with ``alert_within`` + ``severity`` round-trips through the loader."""
+    path = _write(
+        tmp_path,
+        """
+apiVersion: promforecast.io/v1
+datasource:
+  url: http://vm:8428/
+groups:
+  - name: g
+    queries:
+      - id: disk_used_pct
+        promql: up
+        thresholds:
+          - name: warn
+            value: 80
+            alert_within: 6h
+            severity: warning
+""",
+    )
+    cfg = config_module.load(path)
+    threshold = cfg.groups[0].queries[0].thresholds[0]
+    assert threshold.alert_within == timedelta(hours=6)
+    assert threshold.severity == "warning"
+
+
+def test_load_rejects_threshold_with_severity_but_no_alert_within(tmp_path: Path) -> None:
+    """``severity`` without ``alert_within`` is the half-configured-shape error."""
+    path = _write(
+        tmp_path,
+        """
+apiVersion: promforecast.io/v1
+datasource:
+  url: http://vm:8428/
+groups:
+  - name: g
+    queries:
+      - id: m
+        promql: up
+        thresholds:
+          - name: warn
+            value: 80
+            severity: warning
+""",
+    )
+    with pytest.raises(ValueError, match="alert_within and severity must be set together"):
+        config_module.load(path)
+
+
+def test_load_rejects_threshold_with_alert_within_but_no_severity(tmp_path: Path) -> None:
+    """``alert_within`` without ``severity`` is the inverse half-configured error."""
+    path = _write(
+        tmp_path,
+        """
+apiVersion: promforecast.io/v1
+datasource:
+  url: http://vm:8428/
+groups:
+  - name: g
+    queries:
+      - id: m
+        promql: up
+        thresholds:
+          - name: warn
+            value: 80
+            alert_within: 6h
+""",
+    )
+    with pytest.raises(ValueError, match="alert_within and severity must be set together"):
+        config_module.load(path)
+
+
+def test_load_rejects_zero_alert_within(tmp_path: Path) -> None:
+    """``alert_within: 0s`` is rejected — every finite ETA satisfies < 0 is False."""
+    path = _write(
+        tmp_path,
+        """
+apiVersion: promforecast.io/v1
+datasource:
+  url: http://vm:8428/
+groups:
+  - name: g
+    queries:
+      - id: m
+        promql: up
+        thresholds:
+          - name: warn
+            value: 80
+            alert_within: 0s
+            severity: warning
+""",
+    )
+    with pytest.raises(ValueError, match="alert_within must be a positive duration"):
+        config_module.load(path)
+
+
 def test_load_rejects_growth_rate_enabled_without_windows(tmp_path: Path) -> None:
     """``growth_rate.enabled: true`` with empty windows must fail at load time."""
     path = _write(

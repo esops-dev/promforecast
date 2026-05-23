@@ -262,6 +262,30 @@ spec:
               expected to cross the configured ``warn`` threshold within
               4 hours. Right-size before SLO-impacting saturation.
 
+        # Predictive will-breach alert. Reads the boolean directly so the
+        # rule stays a one-liner — the heavy lifting (ETA + alert_within
+        # comparison) is done by the forecaster. Pin ``level="95"`` so the
+        # rule fires once per series on the conservative band; the
+        # corresponding ``forecast_time_to_threshold_seconds`` value at the
+        # same labelset is the operator-visible "when" for the breach.
+        - alert: ForecastWillBreach
+          expr: |
+            node_filesystem_avail_bytes_forecast_will_breach{
+              severity="critical", level="95"
+            } == 1
+          for: 10m
+          labels:
+            severity: critical
+          annotations:
+            summary: "{{ $labels.instance }}{{ $labels.mountpoint }} will breach within the configured alert_within window"
+            description: |
+              {{ $labels.id }} for {{ $labels.instance }}
+              {{ $labels.mountpoint }} (95% band) is predicted to cross the
+              ``{{ $labels.name }}`` threshold inside the configured
+              ``alert_within`` window. Cross-reference
+              ``forecast_time_to_threshold_seconds`` at the same label set
+              for the exact ETA.
+
         # Growth-rate-change alert. Compares the 1d window slope
         # against the 7d baseline; magnitudes are kept absolute so the
         # alert catches sudden *deceleration* of a free-space metric

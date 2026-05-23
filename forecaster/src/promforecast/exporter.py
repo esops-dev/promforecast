@@ -33,6 +33,9 @@ __all__ = [
     "AccuracyPoint",
     "BandCoveragePoint",
     "CalibrationOffsetPoint",
+    "ComponentDecompositionPoint",
+    "ConditionalDeviationPoint",
+    "ConditionalForecastPoint",
     "ContributionPoint",
     "DeviationPoint",
     "DriftPoint",
@@ -45,6 +48,7 @@ __all__ = [
     "PreprocessStats",
     "QualityPoint",
     "ThresholdEtaPoint",
+    "WillBreachPoint",
     "validate_metric_name",
 ]
 
@@ -139,6 +143,69 @@ class ThresholdEtaPoint:
     metric: str
     labels: dict[str, str]
     seconds: float
+
+
+@dataclass(frozen=True)
+class ConditionalForecastPoint:
+    """A single conditional forecast row destined for /metrics.
+
+    Mirrors :class:`ForecastPoint` but its metric name carries the
+    ``_forecast_conditional`` / ``_forecast_conditional_lower`` /
+    ``_forecast_conditional_upper`` suffix family. Emitted by the
+    conditional re-fit path when ``emission.conditional`` is on for the
+    query.
+    """
+
+    metric: str
+    labels: dict[str, str]
+    value: float
+
+
+@dataclass(frozen=True)
+class ConditionalDeviationPoint:
+    """A single conditional deviation observation.
+
+    Rendered as ``forecast_conditional_deviation_ratio`` and
+    ``forecast_conditional_deviation_outside_band`` gauges. Mirrors the
+    existing :class:`DeviationPoint` shape — the band reference is the
+    conditional fit's leading row rather than the backtest trailing
+    band.
+    """
+
+    labels: dict[str, str]
+    ratio: float
+    outside_band: bool
+
+
+@dataclass(frozen=True)
+class ComponentDecompositionPoint:
+    """A single ``<id>_forecast_component`` sample.
+
+    The metric name is per-id (mirrors the forecast family). ``labels``
+    carry ``component`` (one of ``trend``/``seasonal``/``level``/
+    ``residual``) plus the standard ``model`` / ``horizon`` discriminators
+    and the source series labels. One sample is emitted per horizon step
+    per component when ``emission.decompose`` is on for a decomposable
+    model.
+    """
+
+    metric: str
+    labels: dict[str, str]
+    value: float
+
+
+@dataclass(frozen=True)
+class WillBreachPoint:
+    """One ``<id>_forecast_will_breach`` 0/1 sample.
+
+    The metric name is per-id (mirrors the ETA family). ``labels`` carry
+    ``name``, ``severity``, and ``model``; ``level`` is added for
+    per-band rows and absent for the central forecast.
+    """
+
+    metric: str
+    labels: dict[str, str]
+    value: float
 
 
 @dataclass(frozen=True)
@@ -244,6 +311,22 @@ class GroupSnapshot:
     # exposition until they reappear.
     threshold_etas: list[ThresholdEtaPoint] = field(default_factory=list)
     growth_rates: list[GrowthRatePoint] = field(default_factory=list)
+    # Predictive will-breach gauge: per-(series, model, threshold[, level])
+    # 0/1 sample derived from the ETA + threshold ``alert_within`` window.
+    # Snapshot-style — only the most recent run's samples belong on
+    # /metrics; thresholds that drop out of config disappear from the
+    # exposition until they reappear.
+    will_breach_points: list[WillBreachPoint] = field(default_factory=list)
+    # Parallel conditional forecast family. Same shape as ``points`` —
+    # rendered through one ``GaugeMetricFamily`` per distinct metric name —
+    # but the metric names carry the ``_forecast_conditional`` suffix
+    # family.
+    conditional_points: list[ConditionalForecastPoint] = field(default_factory=list)
+    # Conditional deviation gauges (one per emitted (series, model, level)).
+    conditional_deviation_points: list[ConditionalDeviationPoint] = field(default_factory=list)
+    # Per-horizon-step component decomposition (per emitted series, model).
+    # Rendered as ``<id>_forecast_component{component="trend|...|residual"}``.
+    component_points: list[ComponentDecompositionPoint] = field(default_factory=list)
     last_run_timestamp: float = 0.0
     run_duration_seconds: float = 0.0
     # Per-query run duration in seconds for the most recent fit of each
@@ -366,6 +449,25 @@ class Exporter:
         # Per-(group, query) expansion count (gauge): how many concrete
         # PromQL fetches the most recent run derived from this template.
         self._discovery_expansions: dict[tuple[str, str], int] = {}
+        # Per-(group, query, model, reason) decomposition-skipped counter.
+        # Bumped when ``emission.decompose: true`` is set on a query but
+        # the chosen model does not decompose cleanly. The ``reason`` set
+        # is bounded by the runner (``unsupported_model``, ``fit_failed``,
+        # ``components_unavailable``, ``invariant_violation``); the
+        # ``group``/``query`` labels let operators alert "which query
+        # keeps tripping the skip path" without log scraping. The
+        # cardinality multiplier stays small (typical decompose-opted-in
+        # query has 1-2 emitted models, and skips only fire when
+        # something is wrong).
+        self._decomposition_skipped: dict[tuple[str, str, str, str], int] = {}
+        # Per-(group, query, model) conditional-aliased counter. Bumped
+        # whenever the conditional emission path short-circuits the
+        # refit (because the model advertises ``uses_regressors=False``
+        # or no regressors are configured). Lets operators confirm the
+        # CPU saving from the short-circuit is actually firing in
+        # their deployment; a flat-zero counter means every conditional
+        # emission is paying the refit cost.
+        self._conditional_aliased: dict[tuple[str, str, str], int] = {}
         # Per-(group, query, source) season_length auto-detection counter.
         # ``source`` is bounded to {detected, snapped, fallback, too_short}
         # so cardinality is small and predictable. Useful for alerting on
@@ -514,6 +616,38 @@ class Exporter:
                 k: v for k, v in self._season_length_detections.items() if k[0] in names
             }
 
+    def increment_conditional_aliased(self, group: str, query: str, model: str) -> None:
+        """Bump the per-(group, query, model) conditional-aliased counter.
+
+        Called by the runner whenever the conditional emission path
+        aliases the unconditional forecast instead of refitting. The
+        operator can chart ``rate(forecast_conditional_aliased_total[5m])``
+        to confirm the short-circuit is firing.
+        """
+        with self._lock:
+            key = (group, query, model)
+            self._conditional_aliased[key] = self._conditional_aliased.get(key, 0) + 1
+
+    def increment_decomposition_skipped(
+        self,
+        group: str,
+        query: str,
+        model: str,
+        reason: str,
+    ) -> None:
+        """Bump the per-(group, query, model, reason) decomposition-skipped counter.
+
+        Bounded ``reason`` set lives on the runner (``unsupported_model``,
+        ``fit_failed``, ``components_unavailable``, ``invariant_violation``)
+        so cardinality stays small even with the four-label fan-out.
+        Operators can alert per (group, query) on persistent skips
+        instead of relying on a global "something is being skipped"
+        signal.
+        """
+        with self._lock:
+            key = (group, query, model, reason)
+            self._decomposition_skipped[key] = self._decomposition_skipped.get(key, 0) + 1
+
     def increment_season_length_detection(self, group: str, query: str, source: str) -> None:
         """Bump the auto-seasonality detection counter for one outcome.
 
@@ -578,6 +712,14 @@ class Exporter:
         with self._lock:
             return dict(self._discovery_expansions), dict(self._discovery_failures)
 
+    def _decomposition_skipped_state(self) -> dict[tuple[str, str, str, str], int]:
+        with self._lock:
+            return dict(self._decomposition_skipped)
+
+    def _conditional_aliased_state(self) -> dict[tuple[str, str, str], int]:
+        with self._lock:
+            return dict(self._conditional_aliased)
+
     def _season_length_state(self) -> dict[tuple[str, str, str], int]:
         with self._lock:
             return dict(self._season_length_detections)
@@ -600,13 +742,19 @@ class _SnapshotCollector:
         cache_state = self._exporter._query_cache_state()
         discovery_state = self._exporter._discovery_state()
         season_length_state = self._exporter._season_length_state()
+        decomposition_skipped_state = self._exporter._decomposition_skipped_state()
+        conditional_aliased_state = self._exporter._conditional_aliased_state()
         yield from _forecast_families(groups)
+        yield from _conditional_forecast_families(groups)
+        yield from _conditional_deviation_families(groups)
+        yield from _component_families(groups)
         yield from _accuracy_families(groups)
         yield from _deviation_families(groups)
         yield from _quality_families(groups)
         yield from _ensemble_families(groups)
         yield from _contribution_families(groups)
         yield from _threshold_eta_families(groups)
+        yield from _will_breach_families(groups)
         yield from _growth_rate_families(groups)
         yield from _calibration_families(groups)
         yield from _preprocess_families(groups)
@@ -624,6 +772,8 @@ class _SnapshotCollector:
         yield from _query_cache_families(cache_state)
         yield from _discovery_families(discovery_state)
         yield from _season_length_families(season_length_state)
+        yield from _decomposition_skipped_families(decomposition_skipped_state)
+        yield from _conditional_aliased_families(conditional_aliased_state)
 
 
 def _emit_gauge_family(
@@ -828,6 +978,156 @@ def _threshold_eta_families(
         )
 
 
+def _conditional_forecast_families(
+    groups: list[GroupSnapshot],
+) -> Iterator[GaugeMetricFamily]:
+    """Render the ``<id>_forecast_conditional*`` family, one per distinct name.
+
+    Same bucketing as the unconditional forecast family. The metric
+    names that show up here are ``<id>_forecast_conditional``,
+    ``<id>_forecast_conditional_lower``, ``<id>_forecast_conditional_upper``.
+    """
+    by_metric: dict[str, list[ConditionalForecastPoint]] = {}
+    for snap in groups:
+        for point in snap.conditional_points:
+            by_metric.setdefault(point.metric, []).append(point)
+    for metric_name, points in sorted(by_metric.items()):
+        yield from _emit_gauge_family(
+            points,
+            metric_name,
+            "promforecast conditional forecast value — model re-fit with "
+            "regressors held at their most-recent value.",
+            value_fn=lambda p: p.value,
+        )
+
+
+def _conditional_deviation_families(
+    groups: list[GroupSnapshot],
+) -> Iterator[GaugeMetricFamily]:
+    """Render the conditional-deviation ratio + outside-band gauges.
+
+    Mirrors the unconditional ``_deviation_families`` shape; the
+    conditional ratio drops NaN samples while the boolean outside-band
+    still emits a 0 / 1 reading so alerts can detect "outside the
+    conditional band" cleanly.
+    """
+    points = [p for snap in groups for p in snap.conditional_deviation_points]
+    yield from _emit_gauge_family(
+        points,
+        "forecast_conditional_deviation_ratio",
+        "Signed deviation of the most recent actual from the conditional "
+        "forecast band (regressors held at their current value).",
+        value_fn=lambda p: p.ratio,
+        skip_fn=lambda p: not math.isfinite(p.ratio),
+    )
+    yield from _emit_gauge_family(
+        points,
+        "forecast_conditional_deviation_outside_band",
+        "1 if the most recent actual is outside the conditional forecast band, else 0.",
+        value_fn=lambda p: 1.0 if p.outside_band else 0.0,
+    )
+
+
+def _component_families(
+    groups: list[GroupSnapshot],
+) -> Iterator[GaugeMetricFamily]:
+    """Render the ``<id>_forecast_component`` decomposition family per id."""
+    by_metric: dict[str, list[ComponentDecompositionPoint]] = {}
+    for snap in groups:
+        for point in snap.component_points:
+            by_metric.setdefault(point.metric, []).append(point)
+    for metric_name, points in sorted(by_metric.items()):
+        yield from _emit_gauge_family(
+            points,
+            metric_name,
+            "Per-component decomposition of the forecast curve "
+            "(trend / seasonal / level / residual). Components sum to "
+            "the central forecast within numerical tolerance.",
+            value_fn=lambda p: p.value,
+            skip_fn=lambda p: not math.isfinite(p.value),
+        )
+
+
+def _conditional_aliased_families(
+    state: dict[tuple[str, str, str], int],
+) -> Iterator[CounterMetricFamily]:
+    """Render ``forecast_conditional_aliased_total{group, query, model}``.
+
+    Bumped every time the conditional emission path skips the refit
+    and aliases the unconditional forecast frame instead. Lets
+    operators chart how often the short-circuit is firing
+    (and therefore how much CPU it is saving them); a deployment
+    where the counter stays at 0 is paying the doubled-fit cost for
+    every conditional emission.
+
+    Emitted only after at least one alias has fired so /metrics stays
+    quiet for deployments that don't enable ``emission.conditional``.
+    """
+    if not state:
+        return
+    counter = CounterMetricFamily(
+        "forecast_conditional_aliased",
+        "Number of times the conditional emission path aliased the unconditional "
+        "forecast frame instead of refitting with held-constant regressors. "
+        "Bumped per (series, model) when no regressors are configured or the model "
+        "advertises uses_regressors=False.",
+        labels=["group", "query", "model"],
+    )
+    for (group, query, model), count in state.items():
+        counter.add_metric([group, query, model], float(count))
+    yield counter
+
+
+def _decomposition_skipped_families(
+    state: dict[tuple[str, str, str, str], int],
+) -> Iterator[CounterMetricFamily]:
+    """Render ``forecast_decomposition_skipped_total{group, query, model, reason}``.
+
+    Emitted only when at least one skip has occurred so /metrics stays
+    quiet for deployments that don't enable decomposition (or only
+    enable it for decomposable models).
+    """
+    if not state:
+        return
+    counter = CounterMetricFamily(
+        "forecast_decomposition_skipped",
+        "Number of times the runner skipped component-decomposition emission "
+        "for the (group, query, model, reason) tuple. Reason is one of "
+        "(unsupported_model | fit_failed | components_unavailable | "
+        "invariant_violation).",
+        labels=["group", "query", "model", "reason"],
+    )
+    for (group, query, model, reason), count in state.items():
+        counter.add_metric([group, query, model, reason], float(count))
+    yield counter
+
+
+def _will_breach_families(
+    groups: list[GroupSnapshot],
+) -> Iterator[GaugeMetricFamily]:
+    """Render ``<id>_forecast_will_breach`` gauges, one family per id.
+
+    The metric name is per-id (mirrors the ETA family). Values are
+    always 0 or 1 — operators alert with
+    ``forecast_will_breach{severity="critical"} == 1 for 10m`` and the
+    zero-baseline samples keep the panel/chart well-defined even before
+    the first crossing.
+    """
+    by_metric: dict[str, list[WillBreachPoint]] = {}
+    for snap in groups:
+        for point in snap.will_breach_points:
+            by_metric.setdefault(point.metric, []).append(point)
+    for metric_name, points in sorted(by_metric.items()):
+        yield from _emit_gauge_family(
+            points,
+            metric_name,
+            "1 if the forecast predicts a threshold crossing within the "
+            "configured `alert_within` window for the (name, severity[, level]) "
+            "label set; 0 otherwise.",
+            value_fn=lambda p: p.value,
+        )
+
+
 def _growth_rate_families(
     groups: list[GroupSnapshot],
 ) -> Iterator[GaugeMetricFamily]:
@@ -928,7 +1228,8 @@ def _operational_families(  # noqa: PLR0912
         "forecast_failures",
         "Forecast run failures, by reason "
         "(query_error | query_timeout | fit_error | fit_timeout | "
-        "invalid_metric_name | group_error).",
+        "invalid_metric_name | group_error | conditional_fit_error | "
+        "conditional_fit_timeout).",
         labels=["group", "reason"],
     )
     for snap in groups:

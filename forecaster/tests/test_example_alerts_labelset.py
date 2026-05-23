@@ -1,5 +1,5 @@
 """Audit ``examples/alerts/promforecast-rules.yaml`` against the sink+VM
-labelset that the v1.5 defaults emit.
+labelset that the sink-first defaults emit.
 
 The forecaster ships two write paths for forecast metrics: the
 ``/metrics`` snapshot scraped by Prometheus (carries the forecaster's own
@@ -223,6 +223,22 @@ FIXTURE: dict[str, list[dict[str, str]]] = {
         )
         for w in ("1d", "7d")
     ],
+    "node_filesystem_avail_bytes_forecast_will_breach": [
+        _with(
+            _SNAPSHOT_OP_LABELS,
+            id="node_filesystem_avail_bytes",
+            group="node_storage",
+            model="AutoARIMA",
+            instance="node-exporter:9100",
+            mountpoint="/var",
+            name=name,
+            severity=sev,
+            level=lvl,
+        )
+        for name in THRESHOLD_NAMES
+        for sev in ("warning", "critical")
+        for lvl in LEVELS
+    ],
 }
 
 # ---------------------------------------------------------------------------
@@ -320,7 +336,7 @@ def _labelset_matches(labels: dict[str, str], matchers: list[tuple[str, str, str
 def test_rule_metric_names_avoid_reserved_colons(group: str, alert: str, expr: str) -> None:
     """Forecaster output metric names must never use colons.
 
-    Design principle 6 in ``CLAUDE.md`` reserves ``:`` for Prometheus
+    The project's naming convention reserves ``:`` for Prometheus
     recording rules — exporters and direct instrumentation never use it.
     ``exporter.py`` rejects colons at runtime, but bundled alerts could
     drift independently (a recording-rule expression copy-pasted here
@@ -331,7 +347,7 @@ def test_rule_metric_names_avoid_reserved_colons(group: str, alert: str, expr: s
             raise AssertionError(
                 f"{group}/{alert}: rule references metric {metric!r} which uses the "
                 "reserved ``:`` character. Forecaster output metrics never use colons "
-                "(see CLAUDE.md design principle 6). Did a recording-rule expression "
+                "(forecaster naming convention). Did a recording-rule expression "
                 "slip into the bundled alerts?"
             )
 

@@ -6,7 +6,7 @@ discoverable via the ``promforecast.models`` entry-point group.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, ClassVar, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
     import pandas as pd
@@ -18,9 +18,18 @@ class ForecastModel(Protocol):
 
     Implementations must be safe to instantiate without arguments and must
     not mutate inputs.
+
+    ``uses_regressors`` advertises whether the model's ``fit_predict``
+    actually consumes the ``regressors`` parameter. The conditional-forecast
+    emission path reads this to skip the held-constant refit for models
+    that ignore regressors entirely (every built-in wrapper here) — without
+    it, opting into ``emission.conditional: true`` doubles the per-series
+    fit cost for no analytical gain. Plug-ins that do consume regressors
+    (e.g. the Prophet wrapper) override this to ``True``.
     """
 
     name: str
+    uses_regressors: ClassVar[bool]
 
     def fit_predict(
         self,

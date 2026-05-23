@@ -98,9 +98,17 @@ groups:
         strategy: forward_fill
         max_gap: 10m
     queries:
+      # Exercises the conditional-forecast emission end-to-end — the
+      # runner re-fits with regressors flattened to their current value
+      # so the parallel ``..._forecast_conditional*`` family populates
+      # in dev. No regressors are configured on this query, so the
+      # conditional curve equals the unconditional one for the built-in
+      # models that ignore regressors — the wiring is what's exercised.
       - id: node_cpu_busy_pct
         promql: |
           100 - (avg by (instance) (rate(node_cpu_seconds_total{mode="idle"}[2m])) * 100)
+        emission:
+          conditional: true
       - id: node_memory_used_bytes
         promql: |
           node_memory_MemTotal_bytes - node_memory_MemAvailable_bytes
@@ -118,10 +126,23 @@ groups:
     queries:
       # Filesystem fill: predict where used % is heading. The capacity
       # dashboard uses this to surface "disk will be full in N hours".
+      # Also exercises two predictive emission families end-to-end:
+      # * thresholds + alert_within emit ``..._forecast_will_breach``
+      #   (operators alert on the boolean directly).
+      # * ``emission.decompose: true`` emits ``..._forecast_component``
+      #   (stacked-area explainability).
       - id: node_filesystem_used_pct
         promql: |
           100 * (1 - node_filesystem_avail_bytes{fstype!~"tmpfs|overlay|squashfs|ramfs"}
                 / node_filesystem_size_bytes{fstype!~"tmpfs|overlay|squashfs|ramfs"})
+        thresholds:
+          - name: warn
+            value: 80
+            comparator: gt
+            alert_within: 30m
+            severity: warning
+        emission:
+          decompose: true
       - id: node_disk_read_bytes_rate
         promql: rate(node_disk_read_bytes_total[2m])
       - id: node_disk_written_bytes_rate

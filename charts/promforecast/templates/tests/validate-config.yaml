@@ -1,0 +1,53 @@
+{{- /*
+    Post-install ``helm test`` hook: runs ``promforecast validate
+    --strict-cardinality`` against the same ConfigMap the live
+    Deployment mounts. The strict flag flips the projected
+    cardinality overshoot from an advisory ``WARN`` line into a
+    non-zero exit code, so an operator can chain ``helm test`` into
+    a GitOps PostSync gate that rejects configs whose opt-in
+    emission would blow ``safety.max_total_series``.
+
+    Wired as a ``helm test`` hook (not a normal apply) so it costs
+    nothing during the standard install — operators opt in by
+    running ``helm test <release>``. CI does not execute the hook
+    (no kind cluster), but ``helm template`` still renders it and
+    ``kubeconform`` validates the Pod schema.
+
+    Set ``tests.validateConfig.enabled=false`` to suppress the
+    asset entirely for managed clusters that forbid hook resources.
+*/}}
+{{- if .Values.tests.validateConfig.enabled }}
+apiVersion: v1
+kind: Pod
+metadata:
+  name: {{ printf "%s-test-validate" (include "promforecast.fullname" .) | trunc 63 | trimSuffix "-" }}
+  labels: {{- include "promforecast.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": test
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  serviceAccountName: {{ include "promforecast.serviceAccountName" . }}
+  restartPolicy: Never
+  securityContext: {{- toYaml .Values.podSecurityContext | nindent 4 }}
+  {{- with .Values.image.pullSecrets }}
+  imagePullSecrets: {{- toYaml . | nindent 4 }}
+  {{- end }}
+  containers:
+    - name: validate
+      image: {{ include "promforecast.image" . }}
+      imagePullPolicy: {{ .Values.image.pullPolicy }}
+      securityContext: {{- toYaml .Values.securityContext | nindent 8 }}
+      args:
+        - validate
+        - --config=/etc/promforecast/config.yaml
+        - --strict-cardinality
+      resources: {{- toYaml .Values.resources | nindent 8 }}
+      volumeMounts:
+        - name: config
+          mountPath: /etc/promforecast
+          readOnly: true
+  volumes:
+    - name: config
+      configMap:
+        name: {{ include "promforecast.configMapName" . }}
+{{- end }}
