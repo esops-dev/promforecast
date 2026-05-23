@@ -18,6 +18,7 @@ from fastapi import FastAPI, Response
 from fastapi.responses import JSONResponse, PlainTextResponse
 
 from . import config as config_module
+from . import diagnose as diagnose_module
 from . import ha_cache as ha_cache_module
 from . import preview as preview_module
 from . import telemetry as telemetry_module
@@ -25,7 +26,7 @@ from . import validate as validate_module
 from .cache import MemoryQueryCache, QueryCache, QueryCacheBackend, RedisQueryCache
 from .exporter import Exporter
 from .leader import KubernetesLeaseClient, LeaderElector, LeaderElectorConfig, default_identity
-from .reload import ConfigMapWatcher, ConfigReloader, ReloadError
+from .reload import ConfigMapWatcher, ConfigReloader, ReloadError, log_group_queries_loaded
 from .runner import Runner
 from .sink import ForecastSink, RemoteWriteSink
 from .source import PromSource
@@ -52,6 +53,41 @@ def cli() -> None:
             datasource_url_override=args.datasource_url,
         )
         sys.exit(rc)
+
+    if args.command == "diagnose":
+        if args.diagnose_command == "duplicates":
+            datasource_url = _resolve_diagnose_datasource(args)
+            auth = _resolve_diagnose_auth(args)
+            since = _parse_prom_duration(args.since, flag_name="--since") if args.since else None
+            rc = diagnose_module.run_diagnose_duplicates(
+                datasource_url=datasource_url,
+                selector=args.selector,
+                since_seconds=since,
+                auth=auth,
+                json_output=args.json,
+                max_concurrent=args.max_concurrent,
+            )
+            sys.exit(rc)
+        if args.diagnose_command == "sample-rate":
+            datasource_url = _resolve_diagnose_datasource(args)
+            auth = _resolve_diagnose_auth(args)
+            window_seconds = _parse_prom_duration(args.window, flag_name="--window")
+            rc = diagnose_module.run_diagnose_sample_rate(
+                datasource_url=datasource_url,
+                window_seconds=window_seconds,
+                max_samples_per_window=args.max_samples,
+                selector=args.selector,
+                auth=auth,
+                json_output=args.json,
+                max_concurrent=args.max_concurrent,
+            )
+            sys.exit(rc)
+        # No diagnose subcommand given → print help and exit non-zero so a
+        # CI pipeline that mistyped the subcommand fails loudly.
+        sys.stderr.write(
+            "error: 'diagnose' requires a subcommand (e.g. 'duplicates' or 'sample-rate')\n"
+        )
+        sys.exit(2)
 
     run(config_path=args.config, log_level=args.log_level)
 
@@ -109,7 +145,273 @@ def _build_parser() -> argparse.ArgumentParser:
             "when the production URL is unreachable from CI."
         ),
     )
+
+    diagnose_p = sub.add_parser(
+        "diagnose",
+        help="Operator diagnostics against the long-term TSDB.",
+    )
+    diagnose_sub = diagnose_p.add_subparsers(dest="diagnose_command")
+    dup_p = diagnose_sub.add_parser(
+        "duplicates",
+        help=(
+            "Scan the configured TSDB for forecast metrics that appear under "
+            "more than one labelset family — the dual-source state from "
+            "running both the /metrics scrape and the remote_write sink at "
+            "the same time."
+        ),
+    )
+    _add_diagnose_common_flags(dup_p)
+    dup_p.add_argument(
+        "--since",
+        default=None,
+        help=(
+            "Optional lookback window for the series scan as a Prometheus "
+            "duration (e.g. ``6h``, ``2d``). Without this the TSDB applies "
+            "its own default (Prometheus: ~2h; VictoriaMetrics: configured "
+            "retention) — tighten it when a known-clean past window would "
+            "otherwise drown the live duplicate."
+        ),
+    )
+
+    rate_p = diagnose_sub.add_parser(
+        "sample-rate",
+        help=(
+            "Probe per-series sample rate to find suspected duplicate ingest. "
+            "Covers the same-labelset case the ``duplicates`` subcommand "
+            "cannot see from labelset shape alone."
+        ),
+    )
+    _add_diagnose_common_flags(rate_p)
+    rate_p.add_argument(
+        "--window",
+        default="10m",
+        help=(
+            "Backward window for the per-series sample count (Prometheus "
+            "duration, e.g. ``10m``, ``1h``). Default ``10m``."
+        ),
+    )
+    rate_p.add_argument(
+        "--max-samples",
+        type=_positive_int,
+        default=5,
+        help=(
+            "Per-series sample-count threshold over the window. Any series "
+            "above this is flagged as likely-duplicate ingestion. Default "
+            "``5`` — high enough to allow a sink push that emits a curve, "
+            "low enough that a 15-30s scrape interval (which adds ~20-40 "
+            "samples per 10min) trips the detector."
+        ),
+    )
     return parser
+
+
+def _add_diagnose_common_flags(parser: argparse.ArgumentParser) -> None:
+    """Apply the flags shared by every ``diagnose`` subcommand.
+
+    Auth + datasource + output knobs are identical across subcommands;
+    splitting them into a helper avoids drift between subparsers and lets
+    new subcommands inherit the same surface area for free.
+    """
+    parser.add_argument(
+        "--datasource",
+        default=None,
+        help=(
+            "Base URL of the long-term TSDB (e.g. http://victoriametrics:8428). "
+            "Either ``--datasource`` or ``--config`` must be provided; if "
+            "both are given, ``--datasource`` wins for the URL."
+        ),
+    )
+    parser.add_argument(
+        "--config",
+        default=None,
+        type=Path,
+        help=(
+            "Optional path to a forecaster YAML config. When provided, "
+            "``datasource.url`` is inherited for the scan; useful in cluster "
+            "where the operator already has the same YAML mounted into the "
+            "forecaster pod and doesn't want to retype the URL."
+        ),
+    )
+    parser.add_argument(
+        "--selector",
+        default=None,
+        help=(
+            "Optional PromQL series-selector body (e.g. '{cluster=\"prod\"}') "
+            "spliced into each per-metric lookup so the scan can be pinned "
+            "to a single tenant / cluster / namespace."
+        ),
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help=(
+            "Emit the report as machine-readable JSON instead of the "
+            "human-friendly text format. Stable shape — safe to consume "
+            "from CI."
+        ),
+    )
+    parser.add_argument(
+        "--max-concurrent",
+        type=_positive_int,
+        default=8,
+        help=(
+            "Cap on simultaneous in-flight TSDB requests. Matches the "
+            "forecaster's own ``datasource.max_concurrent_requests`` default."
+        ),
+    )
+
+    auth_group = parser.add_argument_group("authentication")
+    cred_group = auth_group.add_mutually_exclusive_group()
+    cred_group.add_argument(
+        "--bearer-token",
+        default=None,
+        help=(
+            "Bearer token sent as ``Authorization: Bearer <token>``. Falls "
+            "back to ``$PROMFORECAST_BEARER_TOKEN`` when the flag is omitted "
+            "so secrets stay off the shell history."
+        ),
+    )
+    cred_group.add_argument(
+        "--basic-user",
+        default=None,
+        help=(
+            "Username for HTTP Basic auth. Pair with ``--basic-password`` "
+            "(or ``$PROMFORECAST_BASIC_PASSWORD``)."
+        ),
+    )
+    auth_group.add_argument(
+        "--basic-password",
+        default=None,
+        help=("Password for HTTP Basic auth. Falls back to ``$PROMFORECAST_BASIC_PASSWORD``."),
+    )
+    auth_group.add_argument(
+        "--tls-cert",
+        default=None,
+        type=Path,
+        help="Path to a client certificate for mTLS.",
+    )
+    auth_group.add_argument(
+        "--tls-key",
+        default=None,
+        type=Path,
+        help="Path to the private key for ``--tls-cert``.",
+    )
+    auth_group.add_argument(
+        "--tls-ca",
+        default=None,
+        type=Path,
+        help=(
+            "Path to a custom CA bundle for verifying the TSDB's server "
+            "certificate. Mutually exclusive with "
+            "``--tls-insecure-skip-verify``."
+        ),
+    )
+    auth_group.add_argument(
+        "--tls-insecure-skip-verify",
+        action="store_true",
+        help=(
+            "Disable TLS verification entirely. Off by default — only flip "
+            "this on for ad-hoc debugging against a self-signed development "
+            "endpoint."
+        ),
+    )
+
+
+def _positive_int(value: str) -> int:
+    """argparse type for ``--max-samples`` / ``--max-concurrent``.
+
+    Raises argparse's own error type so the helpful "argument: invalid
+    int value: 'foo'" message is consistent with other failing flags.
+    """
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"must be a positive integer; got {value!r}") from exc
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError(f"must be > 0; got {parsed}")
+    return parsed
+
+
+def _resolve_diagnose_datasource(args: argparse.Namespace) -> str:
+    """``--datasource`` wins; otherwise pull ``datasource.url`` from ``--config``.
+
+    Exits non-zero when neither is set so the CLI fails fast with a
+    targeted error instead of a confusing ``DiagnoseError`` from the
+    HTTP layer about an empty URL.
+    """
+    if args.datasource:
+        return str(args.datasource)
+    if args.config is not None:
+        try:
+            cfg = config_module.load(args.config)
+        except Exception as exc:
+            raise SystemExit(f"error: failed to load --config {args.config}: {exc}") from exc
+        return cfg.datasource.url
+    raise SystemExit("error: one of --datasource or --config must be provided to identify the TSDB")
+
+
+def _resolve_diagnose_auth(args: argparse.Namespace) -> diagnose_module.DiagnoseAuth:
+    """Build the diagnose auth bundle from flags + env-var fallbacks.
+
+    Env-var precedence is intentionally below CLI flags: explicit
+    ``--bearer-token`` overrides ``$PROMFORECAST_BEARER_TOKEN`` so a
+    one-off invocation with a different token doesn't need an
+    ``unset`` first.
+    """
+    bearer = args.bearer_token or os.environ.get("PROMFORECAST_BEARER_TOKEN") or None
+    basic_password = args.basic_password or os.environ.get("PROMFORECAST_BASIC_PASSWORD") or None
+    if args.tls_ca is not None and args.tls_insecure_skip_verify:
+        raise SystemExit("error: --tls-ca and --tls-insecure-skip-verify are mutually exclusive")
+    if (args.tls_cert is None) != (args.tls_key is None):
+        raise SystemExit("error: --tls-cert and --tls-key must be provided together")
+    return diagnose_module.DiagnoseAuth(
+        bearer_token=bearer,
+        basic_user=args.basic_user,
+        basic_password=basic_password,
+        tls_cert=str(args.tls_cert) if args.tls_cert is not None else None,
+        tls_key=str(args.tls_key) if args.tls_key is not None else None,
+        tls_ca=str(args.tls_ca) if args.tls_ca is not None else None,
+        insecure_skip_verify=args.tls_insecure_skip_verify,
+    )
+
+
+def _load_config_for_boot(config_path: Path) -> config_module.Config:
+    """Load the YAML, emit the boot-time visibility lines, return the config.
+
+    Two structured log events fire in a deterministic order:
+
+    * ``config_loaded`` with the path and the group count.
+    * ``group_queries_loaded`` once per group with the query IDs that
+      were actually loaded — the operator's signal that a partial
+      bind-mount projection wasn't truncated mid-read (the macOS Docker
+      Desktop footgun documented in ``docs/operations/reload.md``).
+
+    Extracted from ``run()`` so the ordering is testable without standing
+    up the full FastAPI + scheduler stack.
+    """
+    cfg = config_module.load(config_path)
+    logger.info("config_loaded", path=str(config_path), groups=len(cfg.groups))
+    log_group_queries_loaded(cfg, source="boot")
+    return cfg
+
+
+def _parse_prom_duration(value: str, *, flag_name: str = "duration") -> int:
+    """Resolve a Prometheus-duration string to a positive integer second count.
+
+    Re-uses the parser in :mod:`config` so the CLI accepts the same
+    ``5m``/``1h``/``14d`` forms as YAML configs. ``flag_name`` is the
+    user-facing name of the flag that supplied the value, so the error
+    message can point at the right flag (``--since``, ``--window``, ...).
+    """
+    parsed = config_module.parse_duration(value)
+    if not hasattr(parsed, "total_seconds"):
+        raise SystemExit(
+            f"error: {flag_name} must be a Prometheus duration like '6h' / '2d'; got {value!r}"
+        )
+    seconds = int(parsed.total_seconds())
+    if seconds <= 0:
+        raise SystemExit(f"error: {flag_name} must be a positive duration; got {value!r}")
+    return seconds
 
 
 def run(config_path: Path, log_level: str) -> None:
@@ -119,8 +421,7 @@ def run(config_path: Path, log_level: str) -> None:
     the leader lease (HA only), starts FastAPI, and schedules per-group runs.
     """
     _configure_logging(log_level)
-    cfg = config_module.load(config_path)
-    logger.info("config_loaded", path=str(config_path), groups=len(cfg.groups))
+    cfg = _load_config_for_boot(config_path)
 
     exporter = Exporter()
     # Snapshot the SHA-256 of the bytes we just loaded so /metrics carries

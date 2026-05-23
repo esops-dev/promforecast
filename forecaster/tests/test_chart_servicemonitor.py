@@ -310,7 +310,11 @@ def test_umbrella_vm_service_name_is_release_name_agnostic() -> None:
     for release in ("promforecast-stack", "foo", "team-prod"):
         docs = _helm_template(UMBRELLA_CHART)  # baseline
         vm = next(
-            (d for d in docs if d.get("kind") == "Service" and "victoria-metrics-single" in d["metadata"]["name"]),
+            (
+                d
+                for d in docs
+                if d.get("kind") == "Service" and "victoria-metrics-single" in d["metadata"]["name"]
+            ),
             None,
         )
         assert vm is not None
@@ -365,4 +369,4 @@ def test_umbrella_helm_test_pod_polls_for_first_refresh() -> None:
     assert "FIRST_REFRESH_TIMEOUT_SECONDS" in script
     # Fail-fast on the dup case (no waiting) — but wait for sink presence.
     assert "exit 1" in script
-    assert 'sleep 5' in script
+    assert "sleep 5" in script

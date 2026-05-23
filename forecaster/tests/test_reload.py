@@ -24,7 +24,12 @@ from promforecast.config import (
     ServerConfig,
 )
 from promforecast.exporter import Exporter, GroupSnapshot
-from promforecast.reload import ConfigMapWatcher, ConfigReloader, ReloadError
+from promforecast.reload import (
+    ConfigMapWatcher,
+    ConfigReloader,
+    ReloadError,
+    log_group_queries_loaded,
+)
 from promforecast.runner import Runner
 from promforecast.source import PromSource
 
@@ -315,6 +320,112 @@ async def test_apply_config_hard_cancels_after_drain_grace_expires(
     # to hard cancellation when the grace period expires.
     await asyncio.wait_for(runner.apply_config(cfg_v2), timeout=2.0)
     await runner.stop()
+
+
+def test_log_group_queries_loaded_emits_one_line_per_group() -> None:
+    """Boot/reload emission lists every loaded query ID per group.
+
+    The line set must mirror what's *actually* in the live config — so a
+    macOS Docker Desktop bind-mount that ships a truncated YAML on reload
+    is visible from the logs (one missing query == one missing line, or a
+    short ``queries`` list).
+    """
+    import structlog  # noqa: PLC0415
+
+    cfg = _config(
+        [
+            GroupConfig(
+                name="full",
+                queries=[
+                    QueryConfig(id="m1", promql="up"),
+                    QueryConfig(id="m2", promql="rate(up[5m])"),
+                ],
+            ),
+            GroupConfig(name="empty", queries=[QueryConfig(id="m3", promql="up")]),
+        ]
+    )
+    with structlog.testing.capture_logs() as captured:
+        log_group_queries_loaded(cfg, source="boot")
+    events = [e for e in captured if e["event"] == "group_queries_loaded"]
+    assert [(e["group"], e["queries"], e["source"]) for e in events] == [
+        ("full", ["m1", "m2"], "boot"),
+        ("empty", ["m3"], "boot"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_reload_logs_truncated_query_set(tmp_path: Path) -> None:
+    """Truncated YAML on reload → emitted log lines match the truncation.
+
+    Re-enacts the macOS Docker Desktop bind-mount footgun: the file on
+    disk loses a query and the next reload picks up the shorter set. The
+    ``group_queries_loaded`` line emitted after ``config_reload_succeeded``
+    is the operator's signal that the swap did not include the missing
+    query — which would otherwise be invisible behind the still-green
+    reload status.
+    """
+    import structlog  # noqa: PLC0415
+
+    full_config = (
+        _BASE_CONFIG
+        + """      - id: m2
+        promql: rate(up[5m])
+"""
+    )
+    path = _write(tmp_path, full_config)
+    from promforecast import config as config_module  # noqa: PLC0415
+
+    cfg = config_module.load(path)
+    exporter = Exporter()
+    runner = Runner(config=cfg, source=_NullSource(), exporter=exporter)
+    reloader = ConfigReloader(runner=runner, exporter=exporter, config_path=path)
+
+    # Drop ``m2`` on disk — mimics a truncated bind-mount projection.
+    path.write_text(_BASE_CONFIG)
+    with structlog.testing.capture_logs() as captured:
+        await reloader.reload()
+
+    events = [e for e in captured if e["event"] == "group_queries_loaded"]
+    assert len(events) == 1
+    assert events[0]["group"] == "g1"
+    assert events[0]["queries"] == ["m"]
+    assert events[0]["source"] == "reload"
+    await runner.stop()
+
+
+def test_boot_load_emits_config_loaded_then_group_queries_in_order(tmp_path: Path) -> None:
+    """``main._load_config_for_boot`` must emit ``config_loaded`` first, then
+    one ``group_queries_loaded`` per group with ``source="boot"``.
+
+    Guards the ordering contract documented in
+    ``docs/operations/reload.md`` so a log filter pinned to
+    ``config_loaded -> group_queries_loaded`` keeps working even if the
+    boot path is refactored.
+    """
+    import structlog  # noqa: PLC0415
+
+    from promforecast.main import _load_config_for_boot  # noqa: PLC0415
+
+    full_config = (
+        _BASE_CONFIG
+        + """      - id: m2
+        promql: rate(up[5m])
+"""
+    )
+    path = _write(tmp_path, full_config)
+    with structlog.testing.capture_logs() as captured:
+        cfg = _load_config_for_boot(path)
+
+    events = [e for e in captured if e["event"] in {"config_loaded", "group_queries_loaded"}]
+    assert events[0]["event"] == "config_loaded"
+    assert events[0]["groups"] == len(cfg.groups)
+    # Every other event must be the group line tagged ``source="boot"``.
+    boot_events = [e for e in events[1:] if e["event"] == "group_queries_loaded"]
+    assert boot_events, "boot path did not emit any group_queries_loaded line"
+    for event in boot_events:
+        assert event["source"] == "boot"
+    assert [e["group"] for e in boot_events] == [g.name for g in cfg.groups]
+    assert [e["queries"] for e in boot_events] == [[q.id for q in g.queries] for g in cfg.groups]
 
 
 @pytest.mark.asyncio

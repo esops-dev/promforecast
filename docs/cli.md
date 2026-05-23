@@ -1,6 +1,7 @@
 # CLI reference
 
-The `promforecast` binary provides two subcommands.  
+The `promforecast` binary provides three subcommands: `run`, `validate`,
+and `diagnose` (with `duplicates` and `sample-rate` sub-subcommands).  
 Running `promforecast --config foo.yaml` is identical to `promforecast run --config foo.yaml`, so existing container entrypoints continue to work unchanged.
 
 ## `promforecast run`
@@ -81,3 +82,46 @@ Estimated cardinality (worst case at max_series_per_query):
   total                34621
   WARN: total exceeds safety.max_total_series (5000); series_overflow will drop the excess
 ```
+
+## `promforecast diagnose`
+
+Operator diagnostics that run against the long-term TSDB rather than the
+config file. Two subcommands:
+
+### `promforecast diagnose duplicates`
+
+```bash
+promforecast diagnose duplicates \
+    [--datasource <url> | --config <path>] \
+    [--selector '{...}'] [--since <duration>] [--json] \
+    [--bearer-token <token>] [--basic-user <user> --basic-password <pass>] \
+    [--tls-cert <path> --tls-key <path>] [--tls-ca <path>] [--tls-insecure-skip-verify]
+```
+
+Scans the configured TSDB for forecast metrics
+(`*_forecast` / `*_forecast_lower` / `*_forecast_upper`) that appear
+under more than one labelset family — the dual-source state described
+in [the architecture page](architecture/emission-paths.md). Exit codes
+are CI-friendly: `0` for clean, `1` for duplicates detected, `2` for
+datasource unreachable.
+
+### `promforecast diagnose sample-rate`
+
+```bash
+promforecast diagnose sample-rate \
+    [--datasource <url> | --config <path>] \
+    [--window <duration>] [--max-samples <N>] \
+    [--selector '{...}'] [--json] \
+    [auth flags as above]
+```
+
+Probes the per-series sample rate via
+`count_over_time(<metric>[<window>])` and flags any series whose count
+over the window exceeds `--max-samples`. Covers the same-labelset case
+`duplicates` cannot see from labelset shape alone — two ingest paths
+writing to the **same** series produce a count higher than either path
+alone would.
+
+See [operations/diagnose.md](operations/diagnose.md) for the full
+reference, authentication recipes, in-cluster invocation
+(`kubectl exec`), and CI-integration patterns.

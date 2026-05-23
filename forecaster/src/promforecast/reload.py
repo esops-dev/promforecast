@@ -130,6 +130,13 @@ class ConfigReloader:
                 changed=result.changed,
                 config_hash=new_hash,
             )
+            # Visibility for partial-config loads: macOS Docker Desktop has
+            # been observed to project a truncated bind-mount mid-reload,
+            # leaving the forecaster running fewer queries than the source
+            # YAML declares. Emitting one line per group with the query
+            # IDs that were actually loaded lets an operator catch the
+            # truncation from the logs alone (see docs/operations/reload.md).
+            log_group_queries_loaded(new_config, source="reload")
             return ReloadOutcome(result=result, timestamp=now)
 
 
@@ -249,6 +256,25 @@ def _content_hash(path: Path) -> str | None:
         return hashlib.sha256(path.read_bytes()).hexdigest()
     except FileNotFoundError:
         return None
+
+
+def log_group_queries_loaded(config: config_module.Config, *, source: str) -> None:
+    """Emit one ``group_queries_loaded`` line per group in ``config``.
+
+    ``source`` is the trigger that produced this load (``"boot"`` or
+    ``"reload"``) so an operator filtering the journal can tell a
+    fresh-boot truncation apart from a configmap-driven reload truncation.
+    Empty-query groups still emit a line (with ``queries=[]``) — the
+    point is to detect *missing* queries, and silence on an empty group
+    would be ambiguous.
+    """
+    for group in config.groups:
+        logger.info(
+            "group_queries_loaded",
+            group=group.name,
+            queries=[q.id for q in group.queries],
+            source=source,
+        )
 
 
 def _hash_config_file(path: Path) -> str:
