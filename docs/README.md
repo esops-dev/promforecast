@@ -20,6 +20,7 @@ The docs follow the [Diataxis](https://diataxis.fr/) framework:
 - [Conformal calibration](conformal.md) — empirical-coverage band correction
 - [Capacity planning](capacity.md) — damped trend, time-to-threshold ETAs, growth rate
 - [Forecast drift](drift.md) — prediction-vs-prediction shift telemetry
+- [Reading the numbers](reading-the-numbers.md) — how to interpret quality and accuracy in practice (mean vs p95, horizon paradox, "wait three cycles", when to actually worry)
 - [Scheduling](scheduling.md) — per-query refresh intervals, max-concurrent-fits cap
 - [Forecast preview](preview.md) — opt-in ad-hoc what-if endpoint
 - [Regressors](regressors.md) — calendar, custom PromQL, and holiday regressors
