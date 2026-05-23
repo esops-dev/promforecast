@@ -23,6 +23,49 @@
         "enabled": { "type": "boolean" },
         "labels": { "type": "object" }
       }
+    },
+    "datasources": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "labels": { "type": "object" },
+        "victoriaMetrics": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "uid": { "type": "string", "minLength": 1 },
+            "url": { "type": "string" },
+            "isDefault": { "type": "boolean" }
+          }
+        },
+        "prometheus": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "uid": { "type": "string", "minLength": 1 },
+            "url": { "type": "string" },
+            "isDefault": { "type": "boolean" }
+          }
+        }
+      }
+    },
+    "tests": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "image": { "type": "string", "minLength": 1 },
+        "victoriaMetricsUrl": { "type": "string" },
+        "scrapeJobPattern": { "type": "string" },
+        "firstRefreshTimeoutSeconds": { "type": "integer", "minimum": 0 },
+        "labelsetUniqueness": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": { "type": "boolean" }
+          }
+        }
+      }
     }
   }
 }

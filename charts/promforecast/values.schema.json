@@ -71,7 +71,11 @@
         "scrapeTimeout": { "type": "string" },
         "labels": { "type": "object" },
         "relabelings": { "type": "array" },
-        "metricRelabelings": { "type": "array" }
+        "metricRelabelings": { "type": "array" },
+        "dropForecastSnapshots": {
+          "description": "When true, the generated ServiceMonitor drops *_forecast / *_forecast_lower / *_forecast_upper metrics so the sink+TSDB copy is the only one stored. When null (the default) the value is derived from config.sink.remote_write.enabled — true if the sink is on, false otherwise. Set explicitly to false to keep snapshot gauges alongside the sink-pushed curves.",
+          "type": ["boolean", "null"]
+        }
       }
     },
     "resources": { "type": "object" },

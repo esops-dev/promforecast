@@ -4,9 +4,16 @@
   "schemaVersion": 39,
   "version": 1,
   "editable": true,
-  "tags": ["promforecast", "forecasting", "anomaly"],
+  "tags": [
+    "promforecast",
+    "forecasting",
+    "anomaly"
+  ],
   "timezone": "",
-  "time": { "from": "now-24h", "to": "now" },
+  "time": {
+    "from": "now-24h",
+    "to": "now"
+  },
   "refresh": "1m",
   "templating": {
     "list": [
@@ -14,12 +21,18 @@
         "name": "datasource",
         "type": "datasource",
         "query": "prometheus",
-        "current": {}
+        "current": {
+          "text": "VictoriaMetrics",
+          "value": "victoriametrics"
+        }
       },
       {
         "name": "group",
         "type": "query",
-        "datasource": { "type": "prometheus", "uid": "${datasource}" },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
         "query": "label_values(forecast_deviation_outside_band, group)",
         "refresh": 2,
         "includeAll": true,
@@ -28,7 +41,10 @@
       {
         "name": "id",
         "type": "query",
-        "datasource": { "type": "prometheus", "uid": "${datasource}" },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
         "query": "label_values(forecast_deviation_outside_band{group=~\"$group\"}, id)",
         "refresh": 2,
         "includeAll": true,
@@ -37,17 +53,26 @@
       {
         "name": "level",
         "type": "query",
-        "datasource": { "type": "prometheus", "uid": "${datasource}" },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
         "query": "label_values(forecast_deviation_outside_band{group=~\"$group\",id=~\"$id\"}, level)",
         "refresh": 2,
         "includeAll": false,
         "multi": false,
-        "current": { "text": "95", "value": "95" }
+        "current": {
+          "text": "95",
+          "value": "95"
+        }
       },
       {
         "name": "quality_floor",
         "type": "textbox",
-        "current": { "text": "0.6", "value": "0.6" }
+        "current": {
+          "text": "0.6",
+          "value": "0.6"
+        }
       }
     ]
   },
@@ -56,8 +81,16 @@
       "type": "stat",
       "id": 1,
       "title": "Series outside band right now (quality > $quality_floor)",
-      "datasource": { "type": "prometheus", "uid": "${datasource}" },
-      "gridPos": { "h": 6, "w": 8, "x": 0, "y": 0 },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 8,
+        "x": 0,
+        "y": 0
+      },
       "targets": [
         {
           "expr": "sum(forecast_deviation_outside_band{group=~\"$group\",id=~\"$id\",level=\"$level\"} == 1 and on (id, group, model) forecast_quality_score > $quality_floor)",
@@ -70,9 +103,18 @@
           "thresholds": {
             "mode": "absolute",
             "steps": [
-              { "color": "green", "value": null },
-              { "color": "yellow", "value": 1 },
-              { "color": "red", "value": 5 }
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 1
+              },
+              {
+                "color": "red",
+                "value": 5
+              }
             ]
           }
         },
@@ -83,64 +125,124 @@
       "type": "stat",
       "id": 2,
       "title": "Median |deviation ratio|",
-      "datasource": { "type": "prometheus", "uid": "${datasource}" },
-      "gridPos": { "h": 6, "w": 8, "x": 8, "y": 0 },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 8,
+        "x": 8,
+        "y": 0
+      },
       "targets": [
         {
           "expr": "quantile(0.5, abs(forecast_deviation_ratio{group=~\"$group\",id=~\"$id\",level=\"$level\"}))",
           "legendFormat": "median"
         }
       ],
-      "fieldConfig": { "defaults": { "unit": "none" }, "overrides": [] }
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none"
+        },
+        "overrides": []
+      }
     },
     {
       "type": "stat",
       "id": 3,
       "title": "p99 |deviation ratio|",
-      "datasource": { "type": "prometheus", "uid": "${datasource}" },
-      "gridPos": { "h": 6, "w": 8, "x": 16, "y": 0 },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 8,
+        "x": 16,
+        "y": 0
+      },
       "targets": [
         {
           "expr": "quantile(0.99, abs(forecast_deviation_ratio{group=~\"$group\",id=~\"$id\",level=\"$level\"}))",
           "legendFormat": "p99"
         }
       ],
-      "fieldConfig": { "defaults": { "unit": "none" }, "overrides": [] }
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none"
+        },
+        "overrides": []
+      }
     },
     {
       "type": "timeseries",
       "id": 4,
       "title": "Outside-band count over time",
-      "datasource": { "type": "prometheus", "uid": "${datasource}" },
-      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 6 },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 6
+      },
       "targets": [
         {
           "expr": "sum by (id) (forecast_deviation_outside_band{group=~\"$group\",id=~\"$id\",level=\"$level\"})",
           "legendFormat": "{{id}}"
         }
       ],
-      "fieldConfig": { "defaults": { "unit": "none" }, "overrides": [] }
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none"
+        },
+        "overrides": []
+      }
     },
     {
       "type": "timeseries",
       "id": 5,
       "title": "Deviation ratio (signed)",
-      "datasource": { "type": "prometheus", "uid": "${datasource}" },
-      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 6 },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 6
+      },
       "targets": [
         {
           "expr": "forecast_deviation_ratio{group=~\"$group\",id=~\"$id\",level=\"$level\"}",
           "legendFormat": "{{id}} {{model}}"
         }
       ],
-      "fieldConfig": { "defaults": { "unit": "none" }, "overrides": [] }
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none"
+        },
+        "overrides": []
+      }
     },
     {
       "type": "table",
       "id": 6,
       "title": "Series currently outside band (gated by quality > $quality_floor)",
-      "datasource": { "type": "prometheus", "uid": "${datasource}" },
-      "gridPos": { "h": 9, "w": 24, "x": 0, "y": 15 },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 24,
+        "x": 0,
+        "y": 15
+      },
       "targets": [
         {
           "expr": "forecast_deviation_outside_band{group=~\"$group\",id=~\"$id\",level=\"$level\"} == 1 and on (id, group, model) forecast_quality_score > $quality_floor",
@@ -149,7 +251,15 @@
         }
       ],
       "transformations": [
-        { "id": "organize", "options": { "excludeByName": { "Time": true, "__name__": true } } }
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true,
+              "__name__": true
+            }
+          }
+        }
       ]
     }
   ]

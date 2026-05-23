@@ -4,9 +4,16 @@
   "schemaVersion": 39,
   "version": 1,
   "editable": true,
-  "tags": ["promforecast", "forecasting", "capacity"],
+  "tags": [
+    "promforecast",
+    "forecasting",
+    "capacity"
+  ],
   "timezone": "",
-  "time": { "from": "now-24h", "to": "now" },
+  "time": {
+    "from": "now-24h",
+    "to": "now"
+  },
   "refresh": "1m",
   "templating": {
     "list": [
@@ -14,13 +21,19 @@
         "name": "datasource",
         "type": "datasource",
         "query": "prometheus",
-        "current": {}
+        "current": {
+          "text": "VictoriaMetrics",
+          "value": "victoriametrics"
+        }
       },
       {
         "name": "group",
         "type": "query",
-        "datasource": { "type": "prometheus", "uid": "${datasource}" },
-        "query": "label_values({__name__=~\".*_forecast_time_to_threshold_seconds\"}, group)",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "query": "label_values(forecast_quality_score, group)",
         "refresh": 2,
         "includeAll": true,
         "multi": true
@@ -28,8 +41,11 @@
       {
         "name": "id",
         "type": "query",
-        "datasource": { "type": "prometheus", "uid": "${datasource}" },
-        "query": "label_values({__name__=~\".*_forecast_time_to_threshold_seconds\",group=~\"$group\"}, id)",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "query": "label_values(forecast_quality_score{group=~\"$group\"}, id)",
         "refresh": 2,
         "includeAll": true,
         "multi": true
@@ -37,32 +53,50 @@
       {
         "name": "level",
         "type": "query",
-        "datasource": { "type": "prometheus", "uid": "${datasource}" },
-        "query": "label_values({__name__=~\".*_forecast_time_to_threshold_seconds\",group=~\"$group\"}, level)",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "query": "label_values(forecast_deviation_outside_band{group=~\"$group\"}, level)",
         "refresh": 2,
         "includeAll": false,
         "multi": false,
-        "current": { "text": "95", "value": "95" }
+        "current": {
+          "text": "95",
+          "value": "95"
+        }
       },
       {
         "name": "threshold",
         "type": "query",
-        "datasource": { "type": "prometheus", "uid": "${datasource}" },
-        "query": "label_values({__name__=~\".*_forecast_time_to_threshold_seconds\",group=~\"$group\"}, name)",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "query": "label_values({__name__=~\".+_forecast_time_to_threshold_seconds\",group=~\"$group\"}, name)",
         "refresh": 2,
         "includeAll": false,
         "multi": false,
-        "current": { "text": "critical", "value": "critical" }
+        "current": {
+          "text": "critical",
+          "value": "critical"
+        }
       },
       {
         "name": "growth_window",
         "type": "query",
-        "datasource": { "type": "prometheus", "uid": "${datasource}" },
-        "query": "label_values({__name__=~\".*_forecast_growth_rate\",group=~\"$group\"}, window)",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "query": "label_values({__name__=~\".+_forecast_growth_rate\",group=~\"$group\"}, window)",
         "refresh": 2,
         "includeAll": false,
         "multi": false,
-        "current": { "text": "1d", "value": "1d" }
+        "current": {
+          "text": "1d",
+          "value": "1d"
+        }
       }
     ]
   },
@@ -71,11 +105,19 @@
       "type": "stat",
       "id": 1,
       "title": "Series with ETA < 6h ($threshold @ $level)",
-      "datasource": { "type": "prometheus", "uid": "${datasource}" },
-      "gridPos": { "h": 6, "w": 8, "x": 0, "y": 0 },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 8,
+        "x": 0,
+        "y": 0
+      },
       "targets": [
         {
-          "expr": "count({__name__=~\".*_forecast_time_to_threshold_seconds\",group=~\"$group\",id=~\"$id\",name=\"$threshold\",level=\"$level\"} < 6 * 60 * 60)",
+          "expr": "count({__name__=~\".+_forecast_time_to_threshold_seconds\",group=~\"$group\",id=~\"$id\",name=\"$threshold\",level=\"$level\"} < 6 * 60 * 60)",
           "legendFormat": "imminent"
         }
       ],
@@ -85,9 +127,18 @@
           "thresholds": {
             "mode": "absolute",
             "steps": [
-              { "color": "green", "value": null },
-              { "color": "yellow", "value": 1 },
-              { "color": "red", "value": 5 }
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 1
+              },
+              {
+                "color": "red",
+                "value": 5
+              }
             ]
           }
         },
@@ -98,39 +149,73 @@
       "type": "stat",
       "id": 2,
       "title": "Median ETA ($threshold @ $level)",
-      "datasource": { "type": "prometheus", "uid": "${datasource}" },
-      "gridPos": { "h": 6, "w": 8, "x": 8, "y": 0 },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 8,
+        "x": 8,
+        "y": 0
+      },
       "targets": [
         {
-          "expr": "quantile(0.5, {__name__=~\".*_forecast_time_to_threshold_seconds\",group=~\"$group\",id=~\"$id\",name=\"$threshold\",level=\"$level\"})",
+          "expr": "quantile(0.5, {__name__=~\".+_forecast_time_to_threshold_seconds\",group=~\"$group\",id=~\"$id\",name=\"$threshold\",level=\"$level\"})",
           "legendFormat": "median"
         }
       ],
-      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] }
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      }
     },
     {
       "type": "stat",
       "id": 3,
       "title": "Worst ETA ($threshold @ $level)",
-      "datasource": { "type": "prometheus", "uid": "${datasource}" },
-      "gridPos": { "h": 6, "w": 8, "x": 16, "y": 0 },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 8,
+        "x": 16,
+        "y": 0
+      },
       "targets": [
         {
-          "expr": "min({__name__=~\".*_forecast_time_to_threshold_seconds\",group=~\"$group\",id=~\"$id\",name=\"$threshold\",level=\"$level\"})",
+          "expr": "min({__name__=~\".+_forecast_time_to_threshold_seconds\",group=~\"$group\",id=~\"$id\",name=\"$threshold\",level=\"$level\"})",
           "legendFormat": "min"
         }
       ],
-      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] }
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      }
     },
     {
       "type": "table",
       "id": 4,
       "title": "Fleet ETAs ($threshold @ $level — soonest first)",
-      "datasource": { "type": "prometheus", "uid": "${datasource}" },
-      "gridPos": { "h": 12, "w": 24, "x": 0, "y": 6 },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 12,
+        "w": 24,
+        "x": 0,
+        "y": 6
+      },
       "targets": [
         {
-          "expr": "topk(50, -{__name__=~\".*_forecast_time_to_threshold_seconds\",group=~\"$group\",id=~\"$id\",name=\"$threshold\",level=\"$level\"})",
+          "expr": "topk(50, -{__name__=~\".+_forecast_time_to_threshold_seconds\",group=~\"$group\",id=~\"$id\",name=\"$threshold\",level=\"$level\"})",
           "instant": true,
           "format": "table"
         }
@@ -139,14 +224,21 @@
         {
           "id": "organize",
           "options": {
-            "excludeByName": { "Time": true, "__name__": true }
+            "excludeByName": {
+              "Time": true,
+              "__name__": true
+            }
           }
         },
         {
           "id": "calculateField",
           "options": {
             "mode": "binary",
-            "binary": { "left": "Value", "operator": "*", "right": "-1" },
+            "binary": {
+              "left": "Value",
+              "operator": "*",
+              "right": "-1"
+            },
             "alias": "seconds_to_threshold",
             "replaceFields": true
           }
@@ -157,16 +249,26 @@
       "type": "bargauge",
       "id": 5,
       "title": "Top-N fastest growing (window=$growth_window)",
-      "datasource": { "type": "prometheus", "uid": "${datasource}" },
-      "gridPos": { "h": 12, "w": 12, "x": 0, "y": 18 },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 12,
+        "w": 12,
+        "x": 0,
+        "y": 18
+      },
       "targets": [
         {
-          "expr": "topk(10, {__name__=~\".*_forecast_growth_rate\",group=~\"$group\",id=~\"$id\",window=\"$growth_window\"})",
+          "expr": "topk(10, {__name__=~\".+_forecast_growth_rate\",group=~\"$group\",id=~\"$id\",window=\"$growth_window\"})",
           "legendFormat": "{{id}} {{instance}}"
         }
       ],
       "fieldConfig": {
-        "defaults": { "unit": "short" },
+        "defaults": {
+          "unit": "short"
+        },
         "overrides": []
       }
     },
@@ -174,16 +276,26 @@
       "type": "bargauge",
       "id": 6,
       "title": "Top-N fastest shrinking (window=$growth_window)",
-      "datasource": { "type": "prometheus", "uid": "${datasource}" },
-      "gridPos": { "h": 12, "w": 12, "x": 12, "y": 18 },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 12,
+        "w": 12,
+        "x": 12,
+        "y": 18
+      },
       "targets": [
         {
-          "expr": "bottomk(10, {__name__=~\".*_forecast_growth_rate\",group=~\"$group\",id=~\"$id\",window=\"$growth_window\"})",
+          "expr": "bottomk(10, {__name__=~\".+_forecast_growth_rate\",group=~\"$group\",id=~\"$id\",window=\"$growth_window\"})",
           "legendFormat": "{{id}} {{instance}}"
         }
       ],
       "fieldConfig": {
-        "defaults": { "unit": "short" },
+        "defaults": {
+          "unit": "short"
+        },
         "overrides": []
       }
     },
@@ -191,15 +303,28 @@
       "type": "timeseries",
       "id": 7,
       "title": "ETA evolution ($threshold @ $level)",
-      "datasource": { "type": "prometheus", "uid": "${datasource}" },
-      "gridPos": { "h": 9, "w": 24, "x": 0, "y": 30 },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 24,
+        "x": 0,
+        "y": 30
+      },
       "targets": [
         {
-          "expr": "{__name__=~\".*_forecast_time_to_threshold_seconds\",group=~\"$group\",id=~\"$id\",name=\"$threshold\",level=\"$level\"}",
+          "expr": "{__name__=~\".+_forecast_time_to_threshold_seconds\",group=~\"$group\",id=~\"$id\",name=\"$threshold\",level=\"$level\"}",
           "legendFormat": "{{id}} {{instance}}"
         }
       ],
-      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] }
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      }
     }
   ]
 }

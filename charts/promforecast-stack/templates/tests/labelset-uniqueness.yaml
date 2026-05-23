@@ -1,0 +1,136 @@
+{{- /*
+    Post-install test: assert that every ``*_forecast`` / ``*_forecast_lower``
+    / ``*_forecast_upper`` series in VictoriaMetrics exists under exactly
+    one labelset family — specifically, no copy carries the forecaster's
+    own scrape labels (``job=<release>-promforecast`` / a forecaster-pod
+    ``instance``) alongside the sink-emitted copy that lacks them. The
+    dual-source state silently rendered the forecast curve as an average
+    of the smooth sink copy with the 5-minute snapshot staircase before
+    the sink-first realignment. Wired as a ``helm test`` hook (not part
+    of the normal install) so an operator can run it on demand. CI does
+    not execute it — no kind cluster — but ``helm template`` still
+    renders it and ``kubeconform`` validates the Pod schema. Set
+    ``tests.labelsetUniqueness.enabled=false`` to suppress the asset for
+    managed clusters that forbid hook resources.
+
+    The probe uses VictoriaMetrics' ``/api/v1/series`` endpoint with a
+    URL-encoded ``match[]`` selector that filters in-VM on the
+    forecaster-scrape labels. The expected response under the sink-first
+    defaults is an empty result set; any series returned signals dual
+    source. We deliberately do NOT scan for the *presence* of an
+    ``instance`` label on forecast series — the sink legitimately
+    propagates the source ``instance`` (e.g. ``node-exporter:9100``),
+    so a presence-only check would false-fire on a clean install.
+*/}}
+{{- if .Values.tests.labelsetUniqueness.enabled }}
+{{- /*
+    The standalone forecaster ServiceMonitor sets
+    ``jobLabel: app.kubernetes.io/name``, so the Prometheus scrape job
+    label is the stable value ``promforecast`` regardless of Helm
+    release name. The probe's selector targets that exact job string.
+    Override ``tests.scrapeJobPattern`` only when an external scrape
+    (i.e. not the umbrella-managed ServiceMonitor) re-labels the job.
+*/}}
+{{- $jobPattern := default "promforecast" .Values.tests.scrapeJobPattern }}
+apiVersion: v1
+kind: Pod
+metadata:
+  name: {{ printf "%s-test-labelset" (include "promforecast-stack.fullname" .) | trunc 63 | trimSuffix "-" }}
+  labels:
+{{- include "promforecast-stack.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": test
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  restartPolicy: Never
+  containers:
+    - name: assert
+      image: {{ .Values.tests.image | quote }}
+      env:
+        - name: VM_URL
+          # Pinned to the VM subchart's Service name, which the umbrella
+          # locks with ``victoria-metrics-single.fullnameOverride`` so the
+          # URL is release-name-agnostic.
+          value: {{ .Values.tests.victoriaMetricsUrl | default "http://promforecast-stack-victoria-metrics-single-server:8428" | quote }}
+        - name: SCRAPE_JOB_PATTERN
+          value: {{ $jobPattern | quote }}
+        - name: FIRST_REFRESH_TIMEOUT_SECONDS
+          value: {{ .Values.tests.firstRefreshTimeoutSeconds | default 300 | quote }}
+      command:
+        - sh
+        - -c
+        - |
+          set -eu
+          echo "Querying ${VM_URL} for the labelset-uniqueness assertion..."
+          # URL-encode the selectors by hand because busybox lacks ``jq``
+          # and a plain interpolation of the literal ``{__name__=~"..."}``
+          # characters into a URL would not survive HTTP parsing. The
+          # first selector asks VM for forecast-family series carrying
+          # the forecaster's scrape ``job`` label — under the sink-first
+          # defaults the snapshot drop strips them, so the count must be
+          # zero. The second selector asks VM for forecast-family series
+          # without that ``job`` label — those are the sink-pushed copies
+          # and the count must be non-zero (a broken sink + applied drop
+          # would silently leave VM with no forecast data at all, which
+          # is also a regression we want to surface).
+          dup_selector='%7B__name__%3D~%22.%2B_forecast%28_lower%7C_upper%29%3F%22%2Cjob%3D~%22'"$SCRAPE_JOB_PATTERN"'%22%7D'
+          sink_selector='%7B__name__%3D~%22.%2B_forecast%28_lower%7C_upper%29%3F%22%2Cjob%3D%22%22%7D'
+          # The first scheduled fit completes some seconds-to-minutes after
+          # ``helm install`` finishes; the sink push lands in VM only after
+          # that. Poll for up to ``FIRST_REFRESH_TIMEOUT_SECONDS`` (5min
+          # default) before declaring the sink-side empty. The dup check
+          # is meaningful at any point — even before the first fit, the
+          # scraped snapshot family should never reach VM under the
+          # sink-first defaults — but we re-evaluate it on each iteration
+          # so a single ``helm test`` invocation reports both failure modes.
+          deadline=$(( $(date +%s) + FIRST_REFRESH_TIMEOUT_SECONDS ))
+          while :; do
+            dup_out=$(wget -q -O - "${VM_URL}/api/v1/series?match%5B%5D=${dup_selector}") || {
+              echo "ERROR: could not query VictoriaMetrics at $VM_URL" >&2
+              exit 2
+            }
+            sink_out=$(wget -q -O - "${VM_URL}/api/v1/series?match%5B%5D=${sink_selector}") || {
+              echo "ERROR: could not query VictoriaMetrics at $VM_URL" >&2
+              exit 2
+            }
+            # ``grep -c`` over the ``__name__`` key is good enough — we only
+            # need zero-vs-non-zero. A clean install returns
+            # ``{"status":"success","data":[]}`` for the dup query and a
+            # non-empty data array for the sink query.
+            dup_n=$(echo "$dup_out" | grep -oE '"__name__":"[^"]+"' | wc -l | tr -d ' ')
+            sink_n=$(echo "$sink_out" | grep -oE '"__name__":"[^"]+"' | wc -l | tr -d ' ')
+            # Dup detection is fail-fast: the snapshot drop is a static
+            # ServiceMonitor relabel that does not depend on the first fit,
+            # so any series carrying the scrape job at any point is a
+            # config bug we should report immediately rather than waiting
+            # for the timeout to elapse.
+            if [ "$dup_n" -gt 0 ]; then
+              echo "FAIL: $dup_n forecast series carry the forecaster scrape job ($SCRAPE_JOB_PATTERN)." >&2
+              echo "      The snapshot scrape and the sink push are both being stored." >&2
+              echo "Remediation: promforecast.serviceMonitor.enabled=true (the umbrella default)" >&2
+              echo "             so the standalone chart drops the snapshot families. For an" >&2
+              echo "             externally-managed Prometheus, add the metric_relabel_configs" >&2
+              echo "             snippet from docs/architecture/emission-paths.md." >&2
+              echo "$dup_out" >&2
+              exit 1
+            fi
+            if [ "$sink_n" -gt 0 ]; then
+              echo "OK: $sink_n sink-pushed forecast series in VM, zero copies carrying the forecaster scrape job."
+              exit 0
+            fi
+            now=$(date +%s)
+            if [ "$now" -ge "$deadline" ]; then
+              echo "FAIL: no *_forecast series found without the forecaster scrape job." >&2
+              echo "      Waited ${FIRST_REFRESH_TIMEOUT_SECONDS}s for the first scheduled" >&2
+              echo "      refresh to push curves to VM. Either the forecaster's" >&2
+              echo "      ``refresh_interval`` is longer than this timeout, the sink" >&2
+              echo "      configuration is broken, or the forecaster has not become" >&2
+              echo "      ready yet. Check ``forecast_failures_total`` and" >&2
+              echo "      ``forecast_remote_write_failures_total`` on the forecaster" >&2
+              echo "      ``/metrics`` endpoint, or raise ``tests.firstRefreshTimeoutSeconds``." >&2
+              exit 1
+            fi
+            echo "waiting for first sink push (${sink_n} sink series so far, $((deadline - now))s left)..."
+            sleep 5
+          done
+{{- end }}

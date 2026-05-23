@@ -3,6 +3,14 @@
 
 victoria-metrics-single:
   enabled: true
+  # Pin the VM Service name regardless of Helm release name so the
+  # forecaster's hardcoded ``datasource.url`` / ``sink.remote_write.url``
+  # below resolve in any installation. Without this, ``helm install foo
+  # ./promforecast-stack`` would create a Service called
+  # ``foo-victoria-metrics-single-server`` while the forecaster still
+  # tries to reach ``promforecast-stack-victoria-metrics-single-server``.
+  # Override only when integrating into an existing VM deployment.
+  fullnameOverride: promforecast-stack-victoria-metrics-single
   server:
     # IMPORTANT: forecasts are written with future timestamps when the
     # forecaster's `sink.remote_write` is enabled. Without this flag
@@ -30,14 +38,37 @@ promforecast:
       auth:
         type: none
     # Push the full forecast curve back into VictoriaMetrics so historical
-    # forecast lines are queryable in Grafana. Disabled by default — the
-    # /metrics snapshot endpoint is enough for many users; flip this on
-    # when you want forecasts as first-class historical data.
+    # forecast lines are queryable in Grafana as a smooth projection rather
+    # than a 5-minute snapshot staircase. Default ON in the umbrella — the
+    # sink+VM pair is the canonical write path for this stack. The
+    # forecaster-chart ServiceMonitor below pairs with this by dropping the
+    # ``*_forecast`` / ``*_forecast_lower`` / ``*_forecast_upper`` snapshot
+    # families from the scrape, so the long-term TSDB stores one canonical
+    # labelset per forecast metric and dashboards do not silently average
+    # the scraped staircase across the sink-pushed curve.
+    # VictoriaMetrics accepts the future-timestamped samples because the
+    # subchart above sets ``futureRetention: "2d"``. Increase that knob if
+    # you increase ``defaults.horizon`` above 2d.
     sink:
       remote_write:
-        enabled: false
+        enabled: true
         url: http://promforecast-stack-victoria-metrics-single-server:8428/api/v1/import/prometheus
         timeout: 30s
+  # Turn the forecaster's ServiceMonitor on by default and let it derive
+  # the snapshot-drop from the sink toggle above (``dropForecastSnapshots:
+  # null`` resolves to true when the sink is on).
+  #
+  # **Requires the prometheus-operator ServiceMonitor CRD** to be
+  # installed in the cluster (kube-prometheus-stack, the stand-alone
+  # prometheus-operator chart, or any equivalent). ``helm install`` will
+  # fail with ``no matches for kind ServiceMonitor`` on a cluster without
+  # the CRD. For installs that scrape with a plain Prometheus (no
+  # operator), flip this off and paste the ``metric_relabel_configs``
+  # snippet from ``docs/architecture/emission-paths.md`` into your scrape
+  # config — the snapshot families must be dropped somewhere or the
+  # dual-source trap reappears.
+  serviceMonitor:
+    enabled: true
 
 # Bundled dashboards / alerts toggles. Off by default; enable explicitly so
 # users on shops with their own asset pipelines aren't surprised.
@@ -46,6 +77,72 @@ dashboards:
   labels:
     grafana_dashboard: "1"
 
+# Optional Grafana datasource provisioning shipped as ConfigMaps with the
+# sidecar label (``grafana_datasource: "1"``) so a Grafana running the
+# kiwigrid/k8s-sidecar pattern (kube-prometheus-stack, official Grafana
+# chart) picks them up. Off by default — flip on alongside
+# ``dashboards.enabled`` if you want this chart to wire up the datasources
+# for you. VictoriaMetrics is registered as the default datasource so the
+# bundled dashboards land on the sink-fed copy of the forecast metrics
+# rather than the snapshot.
+datasources:
+  enabled: false
+  labels:
+    grafana_datasource: "1"
+  # Pre-set so the dashboards' ``${datasource}`` template variables resolve
+  # to it. Override only when integrating into an existing Grafana that
+  # already provisions VM under a different UID.
+  #
+  # ``isDefault`` flips VM to Grafana's default datasource. Set to
+  # ``false`` when Grafana already has a default (e.g. kube-prometheus-stack
+  # registering Prometheus as default) — otherwise the sidecar reload
+  # collides and one of the entries is silently dropped depending on
+  # Grafana version. The bundled dashboards always carry an explicit
+  # ``uid: victoriametrics`` reference so they keep working even when VM
+  # is not the global default.
+  victoriaMetrics:
+    uid: victoriametrics
+    url: http://promforecast-stack-victoria-metrics-single-server:8428
+    isDefault: true
+  # Prometheus is registered alongside VM but not as the default; the
+  # dashboards still let you flip to it from the dropdown for scrape-pipeline
+  # debugging. Leave ``url`` empty to skip Prometheus provisioning entirely.
+  prometheus:
+    uid: prometheus
+    url: ""
+    isDefault: false
+
 prometheusRules:
   enabled: false
   labels: {}
+
+# ``helm test`` hooks shipped with this chart. The labelset-uniqueness
+# probe queries the bundled VM for ``*_forecast`` series that carry the
+# forecaster's scrape ``job`` label (i.e., the snapshot copy) and
+# asserts the count is zero. Under the sink-first default install only
+# the sink copy lives in VM, so the probe passes. Suppress with
+# ``tests.labelsetUniqueness.enabled=false`` in managed clusters that
+# forbid hook resources.
+tests:
+  image: busybox:1.36
+  # Override only when VM lives outside the umbrella (e.g. an existing
+  # cluster-shared VM). Empty resolves to the umbrella's bundled
+  # ``<release>-victoria-metrics-single-server``.
+  victoriaMetricsUrl: ""
+  # Regex matched against forecast-series ``job`` labels to identify the
+  # snapshot copy. Defaults to ``promforecast`` — the value the
+  # forecaster's ServiceMonitor pins via
+  # ``jobLabel: app.kubernetes.io/name`` so the probe is release-name
+  # agnostic. Override only when an external (non-operator) scrape job
+  # re-labels the job to something else.
+  scrapeJobPattern: ""
+  # How long the labelset-uniqueness probe waits for the first
+  # scheduled refresh to push curves into VM before declaring the
+  # sink-side empty. Defaults to 5 minutes — enough for a default
+  # ``refresh_interval: 1h`` install where the first run fires
+  # immediately at boot. Raise when the forecaster takes longer to
+  # become ready (large model registry, slow datasource), or lower for
+  # tight CI loops that already pre-fit before running the probe.
+  firstRefreshTimeoutSeconds: 300
+  labelsetUniqueness:
+    enabled: true

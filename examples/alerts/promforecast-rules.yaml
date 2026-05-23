@@ -1,3 +1,14 @@
+# These example rules assume the sink+VM emission path: the forecaster's
+# ``sink.remote_write`` is on and the ``*_forecast`` / ``*_forecast_lower``
+# / ``*_forecast_upper`` snapshot families have been dropped from the
+# Prometheus scrape (the umbrella chart and the standalone chart's
+# ``serviceMonitor.dropForecastSnapshots`` default this on whenever the
+# sink is enabled). Under that path forecast curves carry only their
+# source labels (``instance``, ``device``, etc.) — no
+# ``instance="<forecaster-pod>:9091"`` and no ``job="promforecast"`` —
+# so the expressions below filter purely on source-side labels. See
+# ``docs/architecture/emission-paths.md`` for the two-path picture and
+# the scrape-drop snippet for an externally-managed Prometheus.
 apiVersion: monitoring.coreos.com/v1
 kind: PrometheusRule
 metadata:
@@ -60,17 +71,24 @@ spec:
         # The exporter keeps falling back to the configured fallback model,
         # which means the configured `models:` list isn't a good fit for
         # this data. Symptom of mis-configuration, not an outage.
+        # Cold-start fits are excluded for the same reason as the quality
+        # rules below: cold-start routinely engages the fallback while the
+        # model adapts, so including them would mask configured-models
+        # failures and noisily flag healthy cold-start ramps.
         - alert: ForecastFallbackPersistent
-          expr: count by (group) (forecast_quality_score{model_fallback="true"}) > 0
+          expr: |
+            count by (group) (
+              forecast_quality_score{model_fallback="true", cold_start!="true"}
+            ) > 0
           for: 6h
           labels:
             severity: info
           annotations:
             summary: "Auto-select keeps falling back for group {{ $labels.group }}"
             description: |
-              At least one series in {{ $labels.group }} has been falling
-              back to the configured fallback model for 6h. The configured
-              models are likely a poor fit for this data.
+              At least one steady-state series in {{ $labels.group }} has
+              been falling back to the configured fallback model for 6h.
+              The configured models are likely a poor fit for this data.
 
         # Persistently low quality across a group: forecasts shouldn't be
         # trusted for alerting. Tune the threshold; 0.4 is a useful default.
@@ -139,38 +157,48 @@ spec:
         # band. Gated on quality so poor forecasts don't fire false
         # positives. Tune `for:` and the quality threshold to your noise
         # tolerance.
+        # Pinned to ``level="95"`` (the conservative band) so the rule
+        # fires once per series when the actual leaves *that* band, not
+        # twice — once for the 80% band and again for the 95%. The
+        # ``forecast_deviation_outside_band`` metric carries a ``level``
+        # label that ``forecast_quality_score`` does not, so without
+        # pinning, the join's right-hand side would bind both 80% and
+        # 95% rows of the same series and Alertmanager would receive
+        # two distinct alerts for one incident.
         - alert: ForecastDeviation
           expr: |
-            forecast_deviation_outside_band == 1
+            forecast_deviation_outside_band{level="95"} == 1
             and on (id, group, model) forecast_quality_score > 0.6
           for: 15m
           labels:
             severity: warning
           annotations:
-            summary: "Actual {{ $labels.id }} is outside its forecast band"
+            summary: "Actual {{ $labels.id }} is outside its 95% forecast band"
             description: |
               {{ $labels.id }} (group {{ $labels.group }}, model
-              {{ $labels.model }}, level {{ $labels.level }}) has been
-              outside its forecast confidence band for 15m. Quality score
-              for this series is above 0.6, so the deviation is likely
-              meaningful.
+              {{ $labels.model }}) has been outside its 95% forecast
+              confidence band for 15m. Quality score for this series is
+              above 0.6, so the deviation is likely meaningful.
 
         # Stronger signal: actual is far outside the band (|ratio| > 2 means
         # it's a full band-width past the edge). Good candidate for paging.
+        # Pinned to ``level="95"`` for the same reason as ``ForecastDeviation``
+        # above: the metric carries ``level`` and a naive join would fire
+        # twice per series.
         - alert: ForecastDeviationSevere
           expr: |
-            abs(forecast_deviation_ratio) > 2
+            abs(forecast_deviation_ratio{level="95"}) > 2
             and on (id, group, model) forecast_quality_score > 0.6
           for: 5m
           labels:
             severity: critical
           annotations:
-            summary: "Actual {{ $labels.id }} is far outside its forecast band"
+            summary: "Actual {{ $labels.id }} is far outside its 95% forecast band"
             description: |
               {{ $labels.id }} (group {{ $labels.group }}, model
-              {{ $labels.model }}, level {{ $labels.level }}) has a
-              deviation ratio with magnitude above 2 for 5m. The actual is
-              well past the edge of the high-confidence forecast band.
+              {{ $labels.model }}) has a deviation ratio with magnitude
+              above 2 for 5m. The actual is well past the edge of the
+              high-confidence forecast band.
 
     - name: promforecast.capacity.examples
       interval: 5m
@@ -223,12 +251,7 @@ spec:
           expr: |
             node_cpu_busy_pct_forecast_time_to_threshold_seconds{
               name="warn", comparator="gt"
-            }
-            and on (instance) (
-              node_cpu_busy_pct_forecast_time_to_threshold_seconds{
-                name="warn", comparator="gt"
-              } < 4 * 60 * 60
-            )
+            } < 4 * 60 * 60
           for: 30m
           labels:
             severity: info

@@ -9,6 +9,7 @@ The docs follow the [Diataxis](https://diataxis.fr/) framework:
 
 ## Index
 
+- [Emission paths (snapshot vs. sink + VM)](architecture/emission-paths.md) — what each path emits, the dual-source trap, and why the official charts default to sink + VM
 - [Config schema](config-schema.md) — `apiVersion`, stability guarantees, and the `v1alpha1` → `v1` migration
 - [Models](models.md) — built-in forecasters, auto-select, accuracy metrics
 - [CLI](cli.md) — `promforecast run` and `promforecast validate`

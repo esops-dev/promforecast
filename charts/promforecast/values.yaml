@@ -196,6 +196,30 @@ serviceMonitor:
   labels: {}
   relabelings: []
   metricRelabelings: []
+  # Drop the forecast snapshot gauges (``*_forecast``, ``*_forecast_lower``,
+  # ``*_forecast_upper``) from the scrape when the remote_write sink is on.
+  # The sink pushes the full forecast curve into the TSDB directly with
+  # native future timestamps; the scraped snapshot is a duplicate carrying a
+  # different labelset (``instance="<forecaster-pod>:9091"``,
+  # ``job="<release>"``) that dashboards either average across or have to
+  # pre-filter. Default ``null`` resolves to ``true`` when
+  # ``sink.remote_write.enabled`` is true, ``false`` otherwise — so the
+  # default install never ends up in the dual-source state. Set explicitly
+  # to ``false`` to override and keep both copies (rare; useful only when
+  # the snapshot end-of-horizon gauges are wanted alongside the curves).
+  # Operational ``forecast_*`` metrics (``forecast_quality_score``,
+  # ``forecast_failures_total``, etc.) are unaffected — only the
+  # ``*_forecast`` / ``*_forecast_lower`` / ``*_forecast_upper`` families
+  # are dropped.
+  #
+  # **Edge case for ``existingConfigMap``**: the chart cannot inspect the
+  # sink setting inside an out-of-band ConfigMap, so the ``null``
+  # derivation falls through to ``false``. If you use ``existingConfigMap``
+  # AND the external config has ``sink.remote_write.enabled: true``, pin
+  # ``dropForecastSnapshots: true`` here explicitly — otherwise the
+  # snapshot copy stays scraped alongside the sink push and you end up in
+  # the dual-source state.
+  dropForecastSnapshots: null
 
 resources:
   requests:
