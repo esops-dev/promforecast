@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING
 from . import deviation as deviation_mod
 from . import quality as quality_mod
 from .accuracy import overall_mape, overall_mase
+from .capacity import DRAIN_COMPARATORS
 from .exporter import (
     AccuracyPoint,
     CalibrationOffsetPoint,
@@ -30,10 +31,13 @@ from .exporter import (
     ContributionPoint,
     DeviationPoint,
     EnsembleWeightPoint,
+    ErrorBudgetPoint,
     ForecastPoint,
     GrowthRatePoint,
     QualityPoint,
+    RecommendedMaintenanceWindowPoint,
     ThresholdEtaPoint,
+    TimeToDrainPoint,
     WillBreachPoint,
 )
 from .sink import ForecastCurvePoint
@@ -46,7 +50,9 @@ if TYPE_CHECKING:
     from .accuracy import AccuracyResult
     from .capacity import GrowthRate, ThresholdEta, WillBreach
     from .contribution import ContributionResult
+    from .maintenance import RecommendedWindow
     from .selector import SelectionResult
+    from .slo import BudgetSample
 
 
 def format_window(seconds: float) -> str:
@@ -516,7 +522,7 @@ class SeriesPointFactory:
         etas: list[ThresholdEta],
         selection: SelectionResult | None,
     ) -> Iterable[ThresholdEtaPoint]:
-        """Yield one ``<id>_forecast_time_to_threshold_seconds`` per ETA.
+        """Yield one ``<id>_forecast_time_to_threshold_seconds`` per non-drain ETA.
 
         ``etas`` carries the per-(threshold, level) ETA computed by
         :func:`promforecast.capacity.compute_threshold_etas`. The metric
@@ -526,12 +532,20 @@ class SeriesPointFactory:
         plus optional ``best_model``/``model_fallback``) and add
         ``name`` + ``comparator`` for the threshold, and ``level`` when
         the ETA was computed against a band.
+
+        ETAs whose comparator is one of :data:`promforecast.capacity.DRAIN_COMPARATORS`
+        are *routed* to the drain family — see :meth:`time_to_drain_points` —
+        and not emitted here. Keeping the routing in the factory (rather
+        than the runner) means a future ``ge_fill`` or similar can land
+        with one new dispatch line and no runner change.
         """
         if not etas:
             return
         common = self._build_common_labels(model_name, selection)
         metric_name = f"{self._metric_id}_forecast_time_to_threshold_seconds"
         for eta in etas:
+            if eta.comparator in DRAIN_COMPARATORS:
+                continue
             labels = {
                 **common,
                 "name": eta.name,
@@ -543,6 +557,137 @@ class SeriesPointFactory:
                 metric=metric_name,
                 labels=labels,
                 seconds=eta.seconds,
+            )
+
+    def time_to_drain_points(
+        self,
+        model_name: str,
+        etas: list[ThresholdEta],
+        selection: SelectionResult | None,
+    ) -> Iterable[TimeToDrainPoint]:
+        """Yield one ``<id>_forecast_time_to_drain_seconds`` per drain ETA.
+
+        Sibling of :meth:`threshold_eta_points` for the ``le_drain``
+        comparator. Different metric name (and the ``+Inf`` no-crossing
+        sentinel passes through to the exporter intact so the "queue is
+        not draining" alert can match it).
+
+        Unlike the threshold-ETA family we do *not* emit a ``comparator``
+        label: the metric name itself already carries the routing
+        ("drain"), and every row in this family would carry the same
+        value (``le_drain``) — a label that's constant across the family
+        is pure noise.
+        """
+        if not etas:
+            return
+        common = self._build_common_labels(model_name, selection)
+        metric_name = f"{self._metric_id}_forecast_time_to_drain_seconds"
+        for eta in etas:
+            if eta.comparator not in DRAIN_COMPARATORS:
+                continue
+            labels = {
+                **common,
+                "name": eta.name,
+            }
+            if eta.level is not None:
+                labels["level"] = str(eta.level)
+            yield TimeToDrainPoint(
+                metric=metric_name,
+                labels=labels,
+                seconds=eta.seconds,
+            )
+
+    def error_budget_points(
+        self,
+        model_name: str,
+        samples: list[BudgetSample],
+        selection: SelectionResult | None,
+    ) -> Iterable[ErrorBudgetPoint]:
+        """Yield SLO error-budget snapshot rows for one (model, series).
+
+        Each :class:`promforecast.slo.BudgetSample` fans out to up to
+        ``(2 + 1 + N_levels)`` rows:
+
+        * one ``<id>_forecast_error_budget_remaining_seconds{window}``
+          row (the static allowed-error budget),
+        * one ``<id>_forecast_error_budget_burn_rate{window}`` row
+          (the predicted consumption rate divided by the allowed rate),
+        * one ``<id>_forecast_error_budget_exhausted_in_seconds{window}``
+          row for the central forecast (no ``level`` label), plus
+        * one ``... _exhausted_in_seconds{window, level=<N>}`` row per
+          confidence level the forecast carried.
+
+        Mirrors the ETA family's per-id metric-name convention so
+        dashboards can join the underlying forecast against its derived
+        budget projection on ``id``.
+        """
+        if not samples:
+            return
+        common = self._build_common_labels(model_name, selection)
+        remaining_metric = f"{self._metric_id}_forecast_error_budget_remaining_seconds"
+        burn_metric = f"{self._metric_id}_forecast_error_budget_burn_rate"
+        exh_metric = f"{self._metric_id}_forecast_error_budget_exhausted_in_seconds"
+        for sample in samples:
+            window_label = format_window(sample.window_seconds)
+            base = {**common, "window": window_label}
+            yield ErrorBudgetPoint(
+                metric=remaining_metric,
+                labels=base,
+                value=sample.remaining_seconds,
+            )
+            yield ErrorBudgetPoint(
+                metric=burn_metric,
+                labels=base,
+                value=sample.burn_rate,
+            )
+            # Central exhausted-in: no ``level`` label so an alert on
+            # the central forecast doesn't need to filter for a missing
+            # level.
+            yield ErrorBudgetPoint(
+                metric=exh_metric,
+                labels=base,
+                value=sample.exhausted_in_point,
+            )
+            for level, exhausted_in in sample.exhausted_in_per_level.items():
+                yield ErrorBudgetPoint(
+                    metric=exh_metric,
+                    labels={**base, "level": str(level)},
+                    value=exhausted_in,
+                )
+
+    def recommended_maintenance_window_points(
+        self,
+        model_name: str,
+        windows: list[RecommendedWindow],
+        selection: SelectionResult | None,
+    ) -> Iterable[RecommendedMaintenanceWindowPoint]:
+        """Yield one ``forecast_recommended_maintenance_window`` row per ranked window.
+
+        ``rank``, ``start_timestamp_seconds`` and ``duration_seconds``
+        all live on the label set so a single Grafana panel can render
+        the ranked recommendations across every opted-in query. The
+        sample value is the window's predicted load (mean ``yhat``
+        across the window's rows); lower is better. ``rank=1`` is the
+        suggested window.
+        """
+        if not windows:
+            return
+        common = self._build_common_labels(model_name, selection)
+        # The operational families add ``id`` as a discriminator label;
+        # do the same here so the metric is queryable by id across
+        # groups. ``_build_common_labels`` does not include ``id`` (it
+        # lives on the metric name for the snapshot families) so we
+        # splice it in explicitly.
+        common_with_id = {**common, "id": self._metric_id}
+        for window in windows:
+            yield RecommendedMaintenanceWindowPoint(
+                labels={
+                    **common_with_id,
+                    "rank": str(window.rank),
+                    "start_timestamp_seconds": str(int(window.start_timestamp)),
+                    "duration_seconds": str(int(window.duration_seconds)),
+                },
+                predicted_load=window.predicted_load,
             )
 
     def will_breach_points(

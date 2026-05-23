@@ -40,6 +40,7 @@ __all__ = [
     "DeviationPoint",
     "DriftPoint",
     "EnsembleWeightPoint",
+    "ErrorBudgetPoint",
     "Exporter",
     "ForecastPoint",
     "GroupSnapshot",
@@ -47,7 +48,9 @@ __all__ = [
     "InvalidMetricNameError",
     "PreprocessStats",
     "QualityPoint",
+    "RecommendedMaintenanceWindowPoint",
     "ThresholdEtaPoint",
+    "TimeToDrainPoint",
     "WillBreachPoint",
     "validate_metric_name",
 ]
@@ -195,6 +198,59 @@ class ComponentDecompositionPoint:
 
 
 @dataclass(frozen=True)
+class TimeToDrainPoint:
+    """One ``<id>_forecast_time_to_drain_seconds`` sample.
+
+    Sibling of :class:`ThresholdEtaPoint` for the ``le_drain`` comparator.
+    The metric name is per-id (mirrors the ETA family) and the
+    no-crossing sentinel is ``+Inf`` rather than NaN — operators alert
+    on ``forecast_time_to_drain_seconds == +Inf`` to catch "queue is
+    not actually draining".
+    """
+
+    metric: str
+    labels: dict[str, str]
+    seconds: float
+
+
+@dataclass(frozen=True)
+class ErrorBudgetPoint:
+    """One row in the SLO error-budget family destined for /metrics.
+
+    Rendered through three per-id metric names:
+
+    * ``<id>_forecast_error_budget_remaining_seconds{window}``
+    * ``<id>_forecast_error_budget_burn_rate{window}``
+    * ``<id>_forecast_error_budget_exhausted_in_seconds{window[, level]}``
+
+    The metric field carries the full name including the ``<id>_`` prefix
+    so the exporter can bucket and render one ``GaugeMetricFamily`` per
+    name (matching the forecast / ETA / will-breach family shape).
+    """
+
+    metric: str
+    labels: dict[str, str]
+    value: float
+
+
+@dataclass(frozen=True)
+class RecommendedMaintenanceWindowPoint:
+    """One ``forecast_recommended_maintenance_window`` sample.
+
+    Global metric name (no per-id prefix) — the ``id`` and ``group`` are
+    discriminator labels so a single Grafana panel can render the
+    ranked windows across every query that opts in. The sample value is
+    the predicted load at the window (mean ``yhat`` across the window's
+    forecast rows); labels carry ``rank``, ``duration_seconds`` and
+    ``start_timestamp_seconds`` so dashboards can plot the window's
+    position on the timeline.
+    """
+
+    labels: dict[str, str]
+    predicted_load: float
+
+
+@dataclass(frozen=True)
 class WillBreachPoint:
     """One ``<id>_forecast_will_breach`` 0/1 sample.
 
@@ -317,6 +373,21 @@ class GroupSnapshot:
     # /metrics; thresholds that drop out of config disappear from the
     # exposition until they reappear.
     will_breach_points: list[WillBreachPoint] = field(default_factory=list)
+    # Queue burn-down / drain ETA: parallel ``<id>_forecast_time_to_drain_seconds``
+    # family for thresholds with comparator=``le_drain``. ``+Inf`` samples
+    # are kept so the "queue is not draining" alert can match them.
+    time_to_drain_points: list[TimeToDrainPoint] = field(default_factory=list)
+    # SLO error-budget snapshot rows (remaining, burn rate, exhausted_in).
+    # Snapshot-style — only the most recent run's samples belong on
+    # /metrics; queries that disappear from config disappear from the
+    # exposition until they reappear.
+    error_budget_points: list[ErrorBudgetPoint] = field(default_factory=list)
+    # Recommended maintenance windows (top-N lowest-load windows in the
+    # forecast horizon). Snapshot-style; the next refresh rotates the
+    # set as time moves forward and earlier windows leave the lookahead.
+    recommended_maintenance_window_points: list[RecommendedMaintenanceWindowPoint] = field(
+        default_factory=list
+    )
     # Parallel conditional forecast family. Same shape as ``points`` —
     # rendered through one ``GaugeMetricFamily`` per distinct metric name —
     # but the metric names carry the ``_forecast_conditional`` suffix
@@ -755,6 +826,9 @@ class _SnapshotCollector:
         yield from _contribution_families(groups)
         yield from _threshold_eta_families(groups)
         yield from _will_breach_families(groups)
+        yield from _time_to_drain_families(groups)
+        yield from _error_budget_families(groups)
+        yield from _recommended_window_families(groups)
         yield from _growth_rate_families(groups)
         yield from _calibration_families(groups)
         yield from _preprocess_families(groups)
@@ -1126,6 +1200,90 @@ def _will_breach_families(
             "label set; 0 otherwise.",
             value_fn=lambda p: p.value,
         )
+
+
+def _time_to_drain_families(
+    groups: list[GroupSnapshot],
+) -> Iterator[GaugeMetricFamily]:
+    """Render ``<id>_forecast_time_to_drain_seconds`` gauges, one family per id.
+
+    Sibling of :func:`_threshold_eta_families` for the ``le_drain``
+    comparator. Unlike the ETA family this *preserves* the
+    no-crossing sentinel (``+Inf``) because the operator-facing alert
+    is ``forecast_time_to_drain_seconds == +Inf for 30m`` — dropping
+    non-finite samples at render time would make that rule silently
+    never match. NaN values (degenerate inputs) are still dropped
+    because the alert can't act on them.
+    """
+    by_metric: dict[str, list[TimeToDrainPoint]] = {}
+    for snap in groups:
+        for point in snap.time_to_drain_points:
+            by_metric.setdefault(point.metric, []).append(point)
+    for metric_name, points in sorted(by_metric.items()):
+        yield from _emit_gauge_family(
+            points,
+            metric_name,
+            "Seconds from the forecast's start until the projected curve first "
+            "crosses ``value`` from above (queue drains). ``+Inf`` means no "
+            "crossing within the horizon — alert on ``... == +Inf for 30m`` to "
+            "catch 'queue is not draining'.",
+            value_fn=lambda p: p.seconds,
+            skip_fn=lambda p: math.isnan(p.seconds),
+        )
+
+
+def _error_budget_families(
+    groups: list[GroupSnapshot],
+) -> Iterator[GaugeMetricFamily]:
+    """Render the SLO error-budget family per-id.
+
+    Three sibling metric names are bucketed by name then emitted as
+    individual gauge families. The exhausted-in family carries an
+    explicit ``+Inf`` sample when the forecast says no errors — that
+    propagates the "no concern" answer through to alerts on
+    ``... > N`` instead of dropping the sample. NaN is still skipped
+    because alerts can't act on it.
+    """
+    by_metric: dict[str, list[ErrorBudgetPoint]] = {}
+    for snap in groups:
+        for point in snap.error_budget_points:
+            by_metric.setdefault(point.metric, []).append(point)
+    for metric_name, points in sorted(by_metric.items()):
+        yield from _emit_gauge_family(
+            points,
+            metric_name,
+            "SLO error-budget projection derived from the forecast. The "
+            "remaining-seconds family is the total allowed budget for the "
+            "window; the burn-rate family is the predicted rate divided by "
+            "the allowed rate; the exhausted-in family projects when the "
+            "budget would be consumed at the current trajectory.",
+            value_fn=lambda p: p.value,
+            skip_fn=lambda p: math.isnan(p.value),
+        )
+
+
+def _recommended_window_families(
+    groups: list[GroupSnapshot],
+) -> Iterator[GaugeMetricFamily]:
+    """Render ``forecast_recommended_maintenance_window`` gauges.
+
+    Single global family (no per-id prefix) — ``id`` is a label so a
+    Grafana panel can render the ranked recommendations across every
+    opted-in query. The sample value is the predicted load at the
+    window; lower is better. Labels carry ``rank``,
+    ``duration_seconds``, ``start_timestamp_seconds``.
+    """
+    points = [p for snap in groups for p in snap.recommended_maintenance_window_points]
+    yield from _emit_gauge_family(
+        points,
+        "forecast_recommended_maintenance_window",
+        "Predicted load (mean forecast value) for a recommended maintenance "
+        "window. Lower is better; ``rank=1`` is the suggested window. The "
+        "``start_timestamp_seconds`` and ``duration_seconds`` labels carry "
+        "the window's position on the forecast horizon.",
+        value_fn=lambda p: p.predicted_load,
+        skip_fn=lambda p: not math.isfinite(p.predicted_load),
+    )
 
 
 def _growth_rate_families(

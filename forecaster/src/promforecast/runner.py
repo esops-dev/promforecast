@@ -30,12 +30,14 @@ from . import decomposition as decomposition_mod
 from . import deviation as deviation_mod
 from . import discovery as discovery_mod
 from . import drift as drift_mod
+from . import maintenance as maintenance_mod
 from . import models as model_registry
 from . import point_factory as point_factory_mod
 from . import preprocess as preprocess_mod
 from . import quality as quality_mod
 from . import regressors as regressors_mod
 from . import seasonality as seasonality_mod
+from . import slo as slo_mod
 from . import telemetry as telemetry_mod
 from .accuracy import (
     AccuracyResult,
@@ -67,6 +69,7 @@ from .exporter import (
     DeviationPoint,
     DriftPoint,
     EnsembleWeightPoint,
+    ErrorBudgetPoint,
     Exporter,
     ForecastPoint,
     GroupSnapshot,
@@ -74,7 +77,9 @@ from .exporter import (
     InvalidMetricNameError,
     PreprocessStats,
     QualityPoint,
+    RecommendedMaintenanceWindowPoint,
     ThresholdEtaPoint,
+    TimeToDrainPoint,
     WillBreachPoint,
     validate_metric_name,
 )
@@ -157,6 +162,17 @@ class _FitResult:
     # derived from the ETAs above. Snapshot-style; folded straight into
     # the run context without monotonic merging.
     will_breach: list[WillBreachPoint] = field(default_factory=list)
+    # Drain-ETA family for ``le_drain`` thresholds. Sibling of
+    # ``threshold_etas`` — separate field rather than a re-used one so
+    # the exporter's per-family rendering can preserve ``+Inf`` samples
+    # (the "queue is not draining" alert needs them to round-trip).
+    time_to_drain: list[TimeToDrainPoint] = field(default_factory=list)
+    # SLO error-budget snapshot rows (remaining, burn rate, exhausted_in).
+    # Snapshot-style; folded straight into the run context.
+    error_budget: list[ErrorBudgetPoint] = field(default_factory=list)
+    # Recommended maintenance windows — top-N lowest-load windows in the
+    # forecast horizon for this (series, model). Snapshot-style.
+    recommended_windows: list[RecommendedMaintenanceWindowPoint] = field(default_factory=list)
     # Conditional forecast emission: snapshot + deviation + curve. All
     # three are produced together when ``emission.conditional: true`` is
     # on for the query. The curve flows into the optional remote_write
@@ -290,6 +306,15 @@ class _RunContext:
     growth_rates: list[GrowthRatePoint] = field(default_factory=list)
     # Will-breach predictive boolean gauges (per series/model/threshold/level).
     will_breach_points: list[WillBreachPoint] = field(default_factory=list)
+    # Drain-ETA points (queue burn-down). Snapshot-style; preserves
+    # ``+Inf`` samples for the "queue is not draining" alert.
+    time_to_drain_points: list[TimeToDrainPoint] = field(default_factory=list)
+    # SLO error-budget snapshot rows accumulated this run.
+    error_budget_points: list[ErrorBudgetPoint] = field(default_factory=list)
+    # Recommended maintenance windows accumulated this run.
+    recommended_maintenance_window_points: list[RecommendedMaintenanceWindowPoint] = field(
+        default_factory=list
+    )
     # Conditional forecast emission accumulators (snapshot rows +
     # per-(model, level) deviation gauges + per-step curve for the sink).
     conditional_points: list[ConditionalForecastPoint] = field(default_factory=list)
@@ -857,6 +882,11 @@ class Runner:
                     threshold_etas=ctx.threshold_etas,
                     growth_rates=ctx.growth_rates,
                     will_breach_points=ctx.will_breach_points,
+                    time_to_drain_points=ctx.time_to_drain_points,
+                    error_budget_points=ctx.error_budget_points,
+                    recommended_maintenance_window_points=(
+                        ctx.recommended_maintenance_window_points
+                    ),
                     conditional_points=ctx.conditional_points,
                     conditional_deviation_points=ctx.conditional_deviation_points,
                     component_points=ctx.component_points,
@@ -2081,8 +2111,21 @@ class Runner:
         """
         if forecast.empty:
             return
+        # Apply the conformal offsets once and reuse the calibrated frame
+        # for every consumer that reads ``yhat_upper_<level>`` /
+        # ``yhat_lower_<level>`` (threshold ETAs and the SLO budget
+        # projection). Without the cache a query with both ``thresholds:``
+        # and ``slo:`` pays the DataFrame ``.copy()`` twice per fit.
+        # ``_apply_offsets_to_threshold_eta_inputs`` short-circuits to the
+        # original frame when no calibration ran, so the common
+        # zero-offsets path stays zero-copy.
+        needs_calibrated_bands = bool(query.thresholds) or query.slo is not None
+        calibrated_df = (
+            _apply_offsets_to_threshold_eta_inputs(forecast, offsets, levels)
+            if needs_calibrated_bands
+            else forecast
+        )
         if query.thresholds:
-            calibrated_df = _apply_offsets_to_threshold_eta_inputs(forecast, offsets, levels)
             etas = capacity_mod.compute_threshold_etas(
                 forecast=calibrated_df,
                 thresholds=query.thresholds,
@@ -2091,6 +2134,15 @@ class Runner:
             if etas:
                 result.threshold_etas.extend(
                     factory.threshold_eta_points(model_name, etas, selection)
+                )
+                # The drain ETA family is the parallel emission for
+                # ``le_drain`` thresholds — ``threshold_eta_points``
+                # already filters them out so the two metric names
+                # don't collide. Routing happens in the factory so
+                # adding a future ``ge_fill`` (or similar) lands as
+                # one new dispatch line, not a fresh runner branch.
+                result.time_to_drain.extend(
+                    factory.time_to_drain_points(model_name, etas, selection)
                 )
                 # Derive the predictive will_breach gauge from the same
                 # ETA set so an alert on ``forecast_will_breach{...} == 1``
@@ -2112,6 +2164,32 @@ class Runner:
             )
             if rates:
                 result.growth_rates.extend(factory.growth_rate_points(model_name, rates, selection))
+        # SLO error budget projection. Off unless ``slo:`` is configured
+        # on the query; uses the leading forecast row as "now" so the
+        # burn rate / exhausted-in match what an operator reading the
+        # current /metrics scrape would compute by hand. Reads
+        # ``yhat_upper_N`` from the *calibrated* frame so the per-level
+        # ``exhausted_in`` agrees with the band an operator queries via
+        # ``yhat_upper`` at the same labelset.
+        if query.slo is not None:
+            budget_samples = slo_mod.compute_budget(
+                forecast=calibrated_df,
+                slo=query.slo,
+                levels=levels,
+            )
+            if budget_samples:
+                result.error_budget.extend(
+                    factory.error_budget_points(model_name, budget_samples, selection)
+                )
+        # Recommended maintenance windows. Sweeps the lookahead for the
+        # top-N lowest-mean-load windows of the configured duration.
+        rw_cfg = query.recommended_windows
+        if rw_cfg.enabled:
+            windows = maintenance_mod.recommend_windows(forecast=forecast, config=rw_cfg)
+            if windows:
+                result.recommended_windows.extend(
+                    factory.recommended_maintenance_window_points(model_name, windows, selection)
+                )
 
     def _emit_decomposition(
         self,
@@ -3342,6 +3420,9 @@ def _merge_fit_into_ctx(ctx: _RunContext, fit_result: _FitResult, query_id: str)
     ctx.threshold_etas.extend(fit_result.threshold_etas)
     ctx.growth_rates.extend(fit_result.growth_rates)
     ctx.will_breach_points.extend(fit_result.will_breach)
+    ctx.time_to_drain_points.extend(fit_result.time_to_drain)
+    ctx.error_budget_points.extend(fit_result.error_budget)
+    ctx.recommended_maintenance_window_points.extend(fit_result.recommended_windows)
     ctx.conditional_points.extend(fit_result.conditional_points)
     ctx.conditional_deviation_points.extend(fit_result.conditional_deviation_points)
     ctx.conditional_curve_points.extend(fit_result.conditional_curve)
@@ -3426,6 +3507,17 @@ def _inherit_prior_for_skipped_queries(  # noqa: PLR0912
     for wbpoint in prior.will_breach_points:
         if _query_id_from_metric(wbpoint.metric) not in run_query_ids:
             ctx.will_breach_points.append(wbpoint)
+    for drain_point in prior.time_to_drain_points:
+        if _query_id_from_metric(drain_point.metric) not in run_query_ids:
+            ctx.time_to_drain_points.append(drain_point)
+    for ebpoint in prior.error_budget_points:
+        if _query_id_from_metric(ebpoint.metric) not in run_query_ids:
+            ctx.error_budget_points.append(ebpoint)
+    # ``forecast_recommended_maintenance_window`` is a global metric
+    # name (no per-id prefix); use the ``id`` label to scope inheritance.
+    for rwpoint in prior.recommended_maintenance_window_points:
+        if rwpoint.labels.get("id") not in run_query_ids:
+            ctx.recommended_maintenance_window_points.append(rwpoint)
     for cfpoint in prior.conditional_points:
         if _query_id_from_metric(cfpoint.metric) not in run_query_ids:
             ctx.conditional_points.append(cfpoint)
@@ -3585,6 +3677,10 @@ def _format_band_window(window: timedelta) -> str:
 _FORECAST_METRIC_SUFFIXES: tuple[str, ...] = (
     "_forecast_contribution_ratio",
     "_forecast_time_to_threshold_seconds",
+    "_forecast_time_to_drain_seconds",
+    "_forecast_error_budget_remaining_seconds",
+    "_forecast_error_budget_exhausted_in_seconds",
+    "_forecast_error_budget_burn_rate",
     "_forecast_growth_rate",
     "_forecast_will_breach",
     "_forecast_conditional_lower",

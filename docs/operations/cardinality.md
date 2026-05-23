@@ -42,8 +42,11 @@ Notation:
 | `<id>_forecast_component`                   | `S × M × 4`                            | `emission.decompose: true` (trend/seasonal/level/residual) |
 | `forecast_drift_score`                      | `S × M`                                | `emission.drift.enabled: true` |
 | Threshold ETA / will_breach                 | `S × M × N_thresholds × (1 + L)`       | Only configured thresholds |
+| Drain ETA (`le_drain`)                      | `S × M × N_drain_thresholds × (1 + L)` | Charged separately from the standard ETA |
 | Growth rate                                 | `S × M × N_windows`                    | `emission.growth_rate.enabled: true` |
 | Conditional forecast families               | `S × M × (1 + 2L)`                     | `emission.conditional: true` (may add extra fit) |
+| SLO error budget                            | `S × M × N_windows × (3 + L)`          | `slo:` configured (3 sibling families × N_windows, plus level fan-out on exhausted_in) |
+| Recommended maintenance windows             | `S × M × count`                        | `recommended_windows.enabled: true` |
 | Operational + preprocessing families        | ~7 per group + ~6 per query            | Mostly always on |
 
 ## Working example

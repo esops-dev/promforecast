@@ -219,14 +219,75 @@ window — the alert query you wrote with `window="7d"` keeps meaning
 what it said. Configure shorter windows or extend `defaults.horizon`
 if you need them.
 
+## Queue burn-down / drain forecasting
+
+A queue (Kafka consumer lag, Sidekiq job backlog, alert backlog) that
+*should* drain over time is the inverse of capacity: instead of
+"when will this hit X from below?", you want "when will this hit
+zero from above?". Use the `le_drain` comparator on a threshold to
+opt into the dedicated drain ETA family:
+
+```yaml
+queries:
+  - id: kafka_consumer_lag
+    promql: sum by (topic) (kafka_consumergroup_lag{group="orders"})
+    thresholds:
+      - name: drained
+        value: 0
+        comparator: le_drain
+```
+
+Output (note the different metric name — `_forecast_time_to_drain_seconds`,
+not `_time_to_threshold_seconds`):
+
+```
+kafka_consumer_lag_forecast_time_to_drain_seconds{
+  name="drained", group="kafka", topic="orders"
+} 5400
+```
+
+`le_drain` is mechanically the same predicate as `lt` (value drops
+below threshold), but with three deliberate differences:
+
+1. **Different metric name.** Emits under
+   `<id>_forecast_time_to_drain_seconds`, parallel to the
+   threshold-ETA family. The two never collide on the same query.
+2. **`+Inf` instead of NaN on no-crossing.** When the forecast curve
+   never crosses the threshold from above within the horizon, the
+   sample reads `+Inf`. Operators alert with
+   `forecast_time_to_drain_seconds == +Inf for 30m` to catch "queue
+   is not actually draining" as a distinct condition from "draining
+   slowly". With NaN (the standard `lt` behaviour), the alert would
+   silently never match.
+3. **`yhat_upper` for the conservative band.** A larger predicted
+   queue drains later, so `yhat_upper` is the *latest* predicted
+   drain — the conservative answer when alerting on a stuck queue.
+   (`lt` uses `yhat_lower` for the earliest-crossing semantics that
+   capacity alerts want.)
+
+The shipped `examples/alerts/promforecast-rules.yaml` includes a
+`promforecast.queue.examples` group with two reference alerts:
+
+```promql
+# Queue is not actually draining
+kafka_consumer_lag_forecast_time_to_drain_seconds{name="drained"} == +Inf
+
+# Drain projected to take >4h (and is happening at all)
+kafka_consumer_lag_forecast_time_to_drain_seconds{name="drained"} > 4 * 60 * 60
+and
+kafka_consumer_lag_forecast_time_to_drain_seconds{name="drained"} != +Inf
+```
+
 ## Cardinality
 
-Both new families count against the global `safety.max_total_series`
-cap; the cardinality estimator in `promforecast validate` includes
-them:
+All the capacity-style families count against the global
+`safety.max_total_series` cap; the cardinality estimator in
+`promforecast validate` includes them:
 
 - Threshold ETA: `N_series × N_models × N_thresholds × (1 + N_levels)`
-  per query that configures thresholds.
+  per query that configures thresholds (excluding `le_drain`).
+- Drain ETA: same shape, charged separately. Only `le_drain` thresholds
+  count.
 - Will-breach: `N_series × N_models × N_thresholds_with_alert × (1 + N_levels)`
   per query — only thresholds with `alert_within` + `severity` count.
 - Growth rate: `N_series × N_models × N_windows` per query that opts in.

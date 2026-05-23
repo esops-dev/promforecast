@@ -939,3 +939,155 @@ groups:
     assert "AutoARIMADamped" in names
     ets = next(s for s in cfg.defaults.models if s.name == "AutoETSDamped")
     assert ets.params == {"damping_parameter": 0.95}
+
+
+def test_load_rejects_le_drain_with_alert_within(tmp_path: Path) -> None:
+    """``alert_within`` + ``le_drain`` is rejected — will_breach would invert.
+
+    The will_breach gauge fires when the ETA is small; for a drain threshold
+    that means "queue will drain soon" — the opposite of a predictive
+    breach. The combination must fail at load time so operators don't
+    silently ship the inverted alert.
+    """
+    path = _write(
+        tmp_path,
+        """
+apiVersion: promforecast.io/v1
+datasource:
+  url: http://vm:8428/
+groups:
+  - name: g
+    queries:
+      - id: kafka_consumer_lag
+        promql: up
+        thresholds:
+          - name: drained
+            value: 0
+            comparator: le_drain
+            alert_within: 4h
+            severity: warning
+""",
+    )
+    with pytest.raises(ValueError, match="alert_within \\+ severity are not supported on le_drain"):
+        config_module.load(path)
+
+
+def test_load_accepts_slo_block(tmp_path: Path) -> None:
+    """A query with ``slo:`` and multiple windows loads cleanly."""
+    path = _write(
+        tmp_path,
+        """
+apiVersion: promforecast.io/v1
+datasource:
+  url: http://vm:8428/
+groups:
+  - name: g
+    queries:
+      - id: http_error_ratio
+        promql: up
+        slo:
+          objective: 99.9
+          windows: [5m, 1h, 30d]
+""",
+    )
+    cfg = config_module.load(path)
+    slo = cfg.groups[0].queries[0].slo
+    assert slo is not None
+    assert slo.objective == 99.9
+    assert slo.windows == [timedelta(minutes=5), timedelta(hours=1), timedelta(days=30)]
+
+
+def test_load_rejects_slo_objective_at_bounds(tmp_path: Path) -> None:
+    """``objective`` must be strictly inside ``(0, 100)`` — pydantic enforces."""
+    path = _write(
+        tmp_path,
+        """
+apiVersion: promforecast.io/v1
+datasource:
+  url: http://vm:8428/
+groups:
+  - name: g
+    queries:
+      - id: m
+        promql: up
+        slo:
+          objective: 100
+""",
+    )
+    with pytest.raises(ValueError, match="objective"):
+        config_module.load(path)
+
+
+def test_load_rejects_slo_empty_windows(tmp_path: Path) -> None:
+    """An explicitly empty ``windows: []`` must fail (default is non-empty)."""
+    path = _write(
+        tmp_path,
+        """
+apiVersion: promforecast.io/v1
+datasource:
+  url: http://vm:8428/
+groups:
+  - name: g
+    queries:
+      - id: m
+        promql: up
+        slo:
+          objective: 99.9
+          windows: []
+""",
+    )
+    with pytest.raises(ValueError, match="at least one window is required"):
+        config_module.load(path)
+
+
+def test_load_accepts_recommended_windows_block(tmp_path: Path) -> None:
+    """A query with ``recommended_windows.enabled: true`` round-trips cleanly."""
+    path = _write(
+        tmp_path,
+        """
+apiVersion: promforecast.io/v1
+datasource:
+  url: http://vm:8428/
+groups:
+  - name: g
+    queries:
+      - id: node_cpu_busy_pct
+        promql: up
+        recommended_windows:
+          enabled: true
+          duration: 15m
+          lookahead: 24h
+          count: 5
+""",
+    )
+    cfg = config_module.load(path)
+    rw = cfg.groups[0].queries[0].recommended_windows
+    assert rw.enabled is True
+    assert rw.duration == timedelta(minutes=15)
+    assert rw.lookahead == timedelta(hours=24)
+    assert rw.count == 5
+
+
+def test_load_rejects_recommended_windows_duration_larger_than_lookahead(
+    tmp_path: Path,
+) -> None:
+    """A window longer than the lookahead can never be recommended — reject."""
+    path = _write(
+        tmp_path,
+        """
+apiVersion: promforecast.io/v1
+datasource:
+  url: http://vm:8428/
+groups:
+  - name: g
+    queries:
+      - id: m
+        promql: up
+        recommended_windows:
+          enabled: true
+          duration: 2h
+          lookahead: 1h
+""",
+    )
+    with pytest.raises(ValueError, match="must be <= lookahead"):
+        config_module.load(path)

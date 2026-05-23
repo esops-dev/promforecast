@@ -80,6 +80,12 @@ class CardinalityEstimate:
     # Empirical band coverage: per-(series, model, level, window) rolling
     # gauge for every query that opts into ``emission.band_coverage``.
     band_coverage_lines: int
+    # SLO error-budget snapshot rows (remaining + burn_rate + exhausted_in)
+    # per (query, window). Only counted for queries that opt into ``slo:``.
+    slo_lines: int
+    # Recommended maintenance window rows — bounded by ``count`` per
+    # opted-in query.
+    recommended_window_lines: int
     operational_lines: int
 
     @property
@@ -101,6 +107,8 @@ class CardinalityEstimate:
             + self.cold_start_lines
             + self.drift_lines
             + self.band_coverage_lines
+            + self.slo_lines
+            + self.recommended_window_lines
             + self.operational_lines
         )
 
@@ -171,6 +179,8 @@ def run_validate(
     write(f"  cold start lines   {estimate.cold_start_lines:>8}")
     write(f"  drift lines        {estimate.drift_lines:>8}")
     write(f"  band coverage      {estimate.band_coverage_lines:>8}")
+    write(f"  slo lines          {estimate.slo_lines:>8}")
+    write(f"  recommended wins   {estimate.recommended_window_lines:>8}")
     write(f"  operational lines  {estimate.operational_lines:>8}")
     write(f"  total              {estimate.total:>8}")
     rc = _handle_cardinality_overshoot(
@@ -422,6 +432,29 @@ def _estimate_cardinality(cfg: Config) -> CardinalityEstimate:  # noqa: PLR0912,
             n_windows = max(1, len(q.emission.band_coverage.windows))
             band_coverage_lines += series_cap * emitted_models * n_levels * n_windows
 
+    # SLO error-budget projections. Three sibling metrics — remaining,
+    # burn_rate, exhausted_in — per (series, model, window). The
+    # exhausted_in row has an additional fan-out by level (central row +
+    # one per level), so we charge ``2 + 1 + N_levels = 3 + N_levels``
+    # rows per (series, model, window). Bounded; only counted for
+    # queries that opt into ``slo:``.
+    slo_lines = 0
+    for group in cfg.groups:
+        for q in group.queries:
+            if q.slo is None:
+                continue
+            n_windows = max(1, len(q.slo.windows))
+            slo_lines += series_cap * emitted_models * n_windows * (3 + n_levels)
+
+    # Recommended maintenance windows — ``count`` rows per (series,
+    # model) for queries that opt in. Bounded by construction.
+    recommended_window_lines = 0
+    for group in cfg.groups:
+        for q in group.queries:
+            if not q.recommended_windows.enabled:
+                continue
+            recommended_window_lines += series_cap * emitted_models * q.recommended_windows.count
+
     # Operational: 7 gauges + N reasons per group; we ballpark 7 per group.
     # The runner also emits per-(group, query) rows of
     # ``forecast_query_run_duration_seconds`` and
@@ -451,6 +484,8 @@ def _estimate_cardinality(cfg: Config) -> CardinalityEstimate:  # noqa: PLR0912,
         cold_start_lines=cold_start_lines,
         drift_lines=drift_lines,
         band_coverage_lines=band_coverage_lines,
+        slo_lines=slo_lines,
+        recommended_window_lines=recommended_window_lines,
         operational_lines=operational_lines,
     )
 

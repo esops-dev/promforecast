@@ -25,6 +25,14 @@ _GOOD_CONFIG = """
 apiVersion: promforecast.io/v1
 datasource:
   url: http://vm:8428/
+safety:
+  # Default emission set (accuracy + deviation + quality + drift +
+  # band_coverage at default windows) on two 500-series queries
+  # projects ~21k lines — comfortably over the 5000-default cap. Bump
+  # the cap so the strict-mode happy path is exercised without
+  # disabling every default. Configs that genuinely fit under the
+  # default cap are exercised separately.
+  max_total_series: 100000
 defaults:
   models: [SeasonalNaive]
   confidence_levels: [80, 95]

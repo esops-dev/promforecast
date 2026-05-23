@@ -19,10 +19,13 @@ from promforecast.config import (
     DefaultsConfig,
     GroupConfig,
     GrowthRateEmissionConfig,
+    ModelSpec,
     QueryConfig,
     QueryEmissionConfig,
+    RecommendedWindowsConfig,
     SafetyConfig,
     ServerConfig,
+    SLOConfig,
     ThresholdConfig,
 )
 from promforecast.exporter import Exporter
@@ -318,3 +321,271 @@ async def test_runner_omits_capacity_families_when_unconfigured(
     body = exporter.render().decode()
     assert "quiet_forecast_time_to_threshold_seconds" not in body
     assert "quiet_forecast_growth_rate" not in body
+    assert "quiet_forecast_time_to_drain_seconds" not in body
+    assert "quiet_forecast_error_budget" not in body
+    assert "forecast_recommended_maintenance_window" not in body
+
+
+class _DrainForecastModel:
+    """Emits a strictly-decreasing forecast so a drain ETA is well-defined."""
+
+    def __init__(self, season_length: int = 288) -> None:
+        self.name = "DrainModel"
+
+    def fit_predict(
+        self,
+        df: pd.DataFrame,
+        horizon: int,
+        freq: str,
+        levels: list[int],
+        regressors: pd.DataFrame | None = None,
+    ) -> pd.DataFrame:
+        idx = pd.date_range(df["ds"].iloc[-1], periods=horizon + 1, freq=freq)[1:]
+        # Start at 100, drop by 5/step so a 24-step horizon crosses 0 around
+        # step 20 — well within the horizon.
+        values = [100.0 - 5.0 * i for i in range(horizon)]
+        out = pd.DataFrame({"unique_id": ["s"] * horizon, "ds": idx, "yhat": values})
+        for level in levels:
+            out[f"yhat_lower_{level}"] = [v - 5.0 for v in values]
+            out[f"yhat_upper_{level}"] = [v + 5.0 for v in values]
+        return out
+
+
+@pytest.mark.asyncio
+async def test_runner_emits_drain_eta_family(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``le_drain`` thresholds materialise the drain-ETA family on /metrics."""
+    from promforecast import models as model_registry  # noqa: PLC0415
+
+    monkeypatch.setattr(model_registry, "build", lambda *a, **kw: _DrainForecastModel())
+
+    cfg = _config_with_query(
+        QueryConfig(
+            id="kafka_consumer_lag",
+            promql="up",
+            thresholds=[
+                ThresholdConfig(name="drained", value=0.0, comparator="le_drain"),
+            ],
+        )
+    )
+    cfg.defaults.models = [ModelSpec(name="DrainModel")]
+    source = _FakeSource({"up": [_frame(20)]})
+    runner = Runner(config=cfg, source=source, exporter=(exporter := Exporter()))
+
+    await runner.run_group(cfg.groups[0])
+
+    body = exporter.render().decode()
+    assert "kafka_consumer_lag_forecast_time_to_drain_seconds" in body
+    # The standard ETA metric must NOT appear — le_drain is routed to the
+    # drain-only family. A regression that emits both would create a
+    # confusing parallel ``..._time_to_threshold_seconds`` sample.
+    assert "kafka_consumer_lag_forecast_time_to_threshold_seconds" not in body
+
+
+@pytest.mark.asyncio
+async def test_runner_drain_eta_emits_plus_inf_when_not_draining(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A queue that never crosses 0 must emit ``+Inf`` (so the alert can match)."""
+    from promforecast import models as model_registry  # noqa: PLC0415
+
+    class _RisingModel:
+        name = "RisingModel"
+
+        def fit_predict(
+            self,
+            df: pd.DataFrame,
+            horizon: int,
+            freq: str,
+            levels: list[int],
+            regressors: pd.DataFrame | None = None,
+        ) -> pd.DataFrame:
+            idx = pd.date_range(df["ds"].iloc[-1], periods=horizon + 1, freq=freq)[1:]
+            values = [100.0 + i for i in range(horizon)]
+            out = pd.DataFrame({"unique_id": ["s"] * horizon, "ds": idx, "yhat": values})
+            for level in levels:
+                out[f"yhat_lower_{level}"] = [v - 5.0 for v in values]
+                out[f"yhat_upper_{level}"] = [v + 5.0 for v in values]
+            return out
+
+    monkeypatch.setattr(model_registry, "build", lambda *a, **kw: _RisingModel())
+
+    cfg = _config_with_query(
+        QueryConfig(
+            id="growing_queue",
+            promql="up",
+            thresholds=[ThresholdConfig(name="drained", value=0.0, comparator="le_drain")],
+        )
+    )
+    cfg.defaults.models = [ModelSpec(name="RisingModel")]
+    source = _FakeSource({"up": [_frame(20)]})
+    runner = Runner(config=cfg, source=source, exporter=(exporter := Exporter()))
+
+    await runner.run_group(cfg.groups[0])
+
+    body = exporter.render().decode()
+    # The exporter renders +Inf as "+Inf" in Prometheus exposition format.
+    inf_lines = [
+        line
+        for line in body.splitlines()
+        if line.startswith("growing_queue_forecast_time_to_drain_seconds{")
+        and 'level="80"' not in line
+    ]
+    assert inf_lines
+    assert "+Inf" in inf_lines[0]
+
+
+@pytest.mark.asyncio
+async def test_runner_emits_slo_error_budget_family(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A query with ``slo:`` emits the three error-budget metric families."""
+    from promforecast import models as model_registry  # noqa: PLC0415
+
+    monkeypatch.setattr(
+        model_registry,
+        "build",
+        lambda *a, **kw: _RampForecastModel(start=0.001, per_step=0.0),
+    )
+
+    cfg = _config_with_query(
+        QueryConfig(
+            id="http_error_ratio",
+            promql="up",
+            slo=SLOConfig(objective=99.9, windows=[timedelta(days=30)]),
+        )
+    )
+    source = _FakeSource({"up": [_frame(20)]})
+    runner = Runner(config=cfg, source=source, exporter=(exporter := Exporter()))
+
+    await runner.run_group(cfg.groups[0])
+
+    body = exporter.render().decode()
+    assert "http_error_ratio_forecast_error_budget_remaining_seconds" in body
+    assert "http_error_ratio_forecast_error_budget_burn_rate" in body
+    assert "http_error_ratio_forecast_error_budget_exhausted_in_seconds" in body
+    assert 'window="30d"' in body
+
+
+@pytest.mark.asyncio
+async def test_runner_inherits_new_emission_families_on_skipped_query(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Per-query refresh: SLO + drain + recommended-window rows for a skipped
+    query must survive the next partial tick, mirroring the behaviour of
+    the existing forecast / capacity families.
+
+    Without inheritance plumbing the snapshot would drop every other
+    query's last-known SLO / drain / recommendation rows the next time
+    ``run_group`` runs a subset of the group's queries.
+    """
+    from promforecast import models as model_registry  # noqa: PLC0415
+
+    monkeypatch.setattr(
+        model_registry,
+        "build",
+        lambda *a, **kw: _RampForecastModel(start=0.001, per_step=0.0),
+    )
+
+    cfg = Config(
+        datasource=DatasourceConfig(url="http://x"),
+        server=ServerConfig(),
+        safety=SafetyConfig(),
+        defaults=DefaultsConfig(
+            min_points=5,
+            models=[ModelSpec(name="RampModel")],
+            confidence_levels=[80],
+            horizon=timedelta(hours=2),
+            step=timedelta(minutes=5),
+            accuracy=AccuracyConfig(evaluate=False),
+        ),
+        groups=[
+            GroupConfig(
+                name="g",
+                queries=[
+                    QueryConfig(
+                        id="active_query",
+                        promql="qa",
+                    ),
+                    QueryConfig(
+                        id="skipped_query",
+                        promql="qb",
+                        slo=SLOConfig(objective=99.9, windows=[timedelta(days=30)]),
+                        recommended_windows=RecommendedWindowsConfig(
+                            enabled=True,
+                            duration=timedelta(minutes=10),
+                            lookahead=timedelta(hours=1),
+                            count=2,
+                        ),
+                        thresholds=[
+                            ThresholdConfig(
+                                name="drained",
+                                value=-1.0,
+                                comparator="le_drain",
+                            ),
+                        ],
+                    ),
+                ],
+            )
+        ],
+    )
+    source = _FakeSource({"qa": [_frame(20)], "qb": [_frame(20)]})
+    runner = Runner(config=cfg, source=source, exporter=(exporter := Exporter()))
+
+    await runner.run_group(cfg.groups[0])
+    initial = exporter.render().decode()
+    # On the initial full run all three new families must be present
+    # for the opted-in query.
+    assert "skipped_query_forecast_error_budget_remaining_seconds" in initial
+    assert "skipped_query_forecast_time_to_drain_seconds" in initial
+    assert 'id="skipped_query"' in initial
+
+    # Partial run touches only ``active_query``. The skipped query's
+    # SLO / drain / recommendation rows must survive.
+    await runner.run_group(cfg.groups[0], queries=[cfg.groups[0].queries[0]])
+    partial = exporter.render().decode()
+    assert "skipped_query_forecast_error_budget_remaining_seconds" in partial
+    assert "skipped_query_forecast_time_to_drain_seconds" in partial
+    # Recommended windows are a global metric family — verify the
+    # ``id="skipped_query"`` row survives.
+    rec_lines = [
+        line
+        for line in partial.splitlines()
+        if line.startswith("forecast_recommended_maintenance_window{")
+        and 'id="skipped_query"' in line
+    ]
+    assert rec_lines
+
+
+@pytest.mark.asyncio
+async def test_runner_emits_recommended_maintenance_window_family(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A query with ``recommended_windows.enabled`` emits the global family."""
+    from promforecast import models as model_registry  # noqa: PLC0415
+
+    monkeypatch.setattr(model_registry, "build", lambda *a, **kw: _RampForecastModel())
+
+    cfg = _config_with_query(
+        QueryConfig(
+            id="cpu_busy",
+            promql="up",
+            recommended_windows=RecommendedWindowsConfig(
+                enabled=True,
+                duration=timedelta(minutes=10),
+                lookahead=timedelta(hours=1),
+                count=2,
+            ),
+        )
+    )
+    source = _FakeSource({"up": [_frame(20)]})
+    runner = Runner(config=cfg, source=source, exporter=(exporter := Exporter()))
+
+    await runner.run_group(cfg.groups[0])
+
+    body = exporter.render().decode()
+    assert "forecast_recommended_maintenance_window" in body
+    # The id is a label here, not in the metric name (unlike the
+    # capacity ETA families).
+    assert 'id="cpu_busy"' in body
+    assert 'rank="1"' in body
+    assert 'rank="2"' in body

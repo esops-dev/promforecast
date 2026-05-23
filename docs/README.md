@@ -22,7 +22,9 @@ The docs follow the [Diataxis](https://diataxis.fr/) framework:
 - [Preprocessing](preprocessing.md) — gap imputation and outlier scrubbing
 - [Change-points](change-points.md) — input-side break detection and lookback adaptation
 - [Conformal calibration](conformal.md) — empirical-coverage band correction
-- [Capacity planning](capacity.md) — damped trend, time-to-threshold ETAs, growth rate, will-breach predictive boolean
+- [Capacity planning](capacity.md) — damped trend, time-to-threshold ETAs, growth rate, will-breach predictive boolean, queue burn-down (drain) forecasting
+- [SLO error-budget forecasting](slo.md) — burn rate, exhaustion projection, multi-window alerting
+- [Maintenance window recommendations](operations/maintenance-windows.md) — top-N lowest-load windows for scheduling reboots, rollouts, and cert rotations
 - [Conditional forecasts](conditional-forecasts.md) — baseline given the current regressor state, for "unusual *for current conditions*" alerts
 - [Explainability (decomposition)](explainability.md) — trend / seasonal / level / residual split of the forecast curve
 - [Forecast drift](drift.md) — prediction-vs-prediction shift telemetry

@@ -239,6 +239,59 @@ FIXTURE: dict[str, list[dict[str, str]]] = {
         for sev in ("warning", "critical")
         for lvl in LEVELS
     ],
+    "kafka_consumer_lag_forecast_time_to_drain_seconds": [
+        _with(
+            _SNAPSHOT_OP_LABELS,
+            id="kafka_consumer_lag",
+            group="kafka",
+            model="AutoARIMA",
+            topic="orders",
+            name="drained",
+        ),
+    ],
+    "http_request_error_ratio_forecast_error_budget_exhausted_in_seconds": [
+        _with(
+            _SNAPSHOT_OP_LABELS,
+            id="http_request_error_ratio",
+            group="http_slo",
+            model="AutoARIMA",
+            service="checkout",
+            window="30d",
+        ),
+    ],
+    "http_request_error_ratio_forecast_error_budget_burn_rate": [
+        _with(
+            _SNAPSHOT_OP_LABELS,
+            id="http_request_error_ratio",
+            group="http_slo",
+            model="AutoARIMA",
+            service="checkout",
+            window="30d",
+        ),
+    ],
+    "http_request_error_ratio_forecast_error_budget_remaining_seconds": [
+        _with(
+            _SNAPSHOT_OP_LABELS,
+            id="http_request_error_ratio",
+            group="http_slo",
+            model="AutoARIMA",
+            service="checkout",
+            window="30d",
+        ),
+    ],
+    "forecast_recommended_maintenance_window": [
+        _with(
+            _SNAPSHOT_OP_LABELS,
+            id="node_cpu_busy_pct",
+            group="node_capacity",
+            model="AutoARIMA",
+            instance="node-exporter:9100",
+            rank=str(r),
+            duration_seconds="1800",
+            start_timestamp_seconds="1700000000",
+        )
+        for r in (1, 2, 3)
+    ],
 }
 
 # ---------------------------------------------------------------------------

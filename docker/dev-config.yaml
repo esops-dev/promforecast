@@ -114,6 +114,15 @@ groups:
           node_memory_MemTotal_bytes - node_memory_MemAvailable_bytes
       - id: node_load1
         promql: node_load1
+        # Exercises the maintenance-window recommender against a real
+        # series in dev. With short lookback / step / horizon the
+        # recommended windows churn each refresh but the family
+        # populates from the first run.
+        recommended_windows:
+          enabled: true
+          duration: 5m
+          lookahead: 1h
+          count: 3
       - id: node_load5
         promql: node_load5
 
@@ -194,6 +203,51 @@ groups:
           )
         season_length: 10
         data_profile: intermittent
+
+      # Error ratio with SLO error-budget forecasting. Exercises the
+      # ``slo:`` config end-to-end — the three derived families
+      # (remaining / burn_rate / exhausted_in) populate per (series,
+      # window) in dev. Multiple windows so the multi-window pattern
+      # has data to show.
+      - id: http_error_ratio
+        promql: |
+          (
+            sum by (endpoint) (
+              rate(http_requests_total{status=~"5..",endpoint=~"/api/.*|/healthz"}[2m])
+            )
+            /
+            clamp_min(
+              sum by (endpoint) (
+                rate(http_requests_total{endpoint=~"/api/.*|/healthz"}[2m])
+              ),
+              0.001
+            )
+          )
+        season_length: 10
+        slo:
+          objective: 99.5
+          windows: [5m, 1h, 30d]
+        # Recommend the lowest-load 5-minute windows for scheduling
+        # brief downtime. The loadgen is sinusoidal, so the recommender
+        # has a clear seasonality to mine.
+        recommended_windows:
+          enabled: true
+          duration: 5m
+          lookahead: 1h
+          count: 3
+
+      # Synthetic backlog / drain demo. The forecaster sees a queue
+      # that decays with the inverse of request rate; the ``le_drain``
+      # threshold produces the ``..._forecast_time_to_drain_seconds``
+      # family — with +Inf samples when the queue is not draining.
+      - id: http_backlog_estimate
+        promql: |
+          max by (endpoint) (http_requests_in_flight)
+        season_length: 10
+        thresholds:
+          - name: drained
+            value: 0
+            comparator: le_drain
       # p95 latency derived from the histogram. Forecasting tail latency
       # is one of the more interesting demos because it's both noisy and
       # tied to load.
