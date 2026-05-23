@@ -1,0 +1,277 @@
+{
+  "title": "promforecast — Is it working?",
+  "uid": "promforecast-is-it-working",
+  "description": "Single-screen answer to 'are the forecasts tracking actuals?'. Scoreboard at the top (quality, coverage, freshness, failures), signature actual-vs-forecast-band panels in the middle, tracking error and quality trend at the bottom. For deep-dive, use the 'Demo tour' dashboard.",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "tags": ["promforecast", "overview", "health"],
+  "timezone": "",
+  "time": { "from": "now-1h", "to": "now+30m" },
+  "refresh": "30s",
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": { "text": "VictoriaMetrics", "value": "victoriametrics" }
+      },
+      {
+        "name": "signature_endpoint",
+        "label": "HTTP signature endpoint",
+        "type": "query",
+        "datasource": { "type": "prometheus", "uid": "${datasource}" },
+        "query": "label_values(http_requests_rate_forecast, endpoint)",
+        "refresh": 2,
+        "includeAll": false,
+        "multi": false,
+        "current": { "text": "/api/users", "value": "/api/users" }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "type": "stat",
+      "id": 1,
+      "title": "Quality score (avg per group)",
+      "description": "Mean forecast_quality_score across the group. Red < 0.3 = don't trust. Green > 0.6 = reliable. The forecaster scores series 0..1 combining backtest MAPE/MASE, confidence band width, and data coverage.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 5, "w": 8, "x": 0, "y": 0 },
+      "targets": [
+        { "refId": "A", "expr": "avg by (group) (forecast_quality_score)", "legendFormat": "{{group}}" }
+      ],
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "orientation": "vertical",
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "value_and_name"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "min": 0,
+          "max": 1,
+          "decimals": 2,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "yellow", "value": 0.3 },
+              { "color": "green", "value": 0.6 }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "stat",
+      "id": 2,
+      "title": "Trustworthy series (q > 0.5)",
+      "description": "How many series score above 0.5, per group. Hover the count to see the total. A low ratio means several series are inherently hard to forecast (sparse, near-zero, or highly variable) and the forecaster is correctly flagging them.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 5, "w": 8, "x": 8, "y": 0 },
+      "targets": [
+        { "refId": "A", "expr": "count by (group) (forecast_quality_score > 0.5)", "legendFormat": "{{group}} (good)" }
+      ],
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "orientation": "vertical",
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value_and_name"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "yellow", "value": 1 },
+              { "color": "green", "value": 3 }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "stat",
+      "id": 3,
+      "title": "Last successful run (per group)",
+      "description": "Time since the most recent successful refit. Should stay under refresh_interval (5m in dev). Yellow >2m, red >10m suggests something is stuck.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 5, "w": 4, "x": 16, "y": 0 },
+      "targets": [
+        { "refId": "A", "expr": "time() - forecast_last_run_timestamp_seconds", "legendFormat": "{{group}}" }
+      ],
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "orientation": "vertical",
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "value_and_name"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 120 },
+              { "color": "red", "value": 600 }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "stat",
+      "id": 4,
+      "title": "Failures (last 1h)",
+      "description": "Sum of forecast_failures_total across all groups in the last hour. Zero is the happy path.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 5, "w": 4, "x": 20, "y": 0 },
+      "targets": [
+        { "refId": "A", "expr": "sum(increase(forecast_failures_total[1h])) or vector(0)", "legendFormat": "total" }
+      ],
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "orientation": "horizontal",
+        "colorMode": "background",
+        "graphMode": "area",
+        "textMode": "value"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 0.5 },
+              { "color": "red", "value": 5 }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "timeseries",
+      "id": 10,
+      "title": "Signature: HTTP request rate — actual vs forecast band",
+      "description": "One endpoint ($signature_endpoint). Solid green line = actual rate (stops at `now`). Shaded blue band = 95% confidence interval from the remote_write sink. Left of `now`: older fits' forward curves now in the past — visually check 'did the forecast track what happened'. Right of `now`: live forecast, where the model thinks the rate is heading.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 11, "w": 12, "x": 0, "y": 5 },
+      "targets": [
+        { "refId": "A", "expr": "sum(rate(http_requests_total{endpoint=\"$signature_endpoint\"}[2m]))", "legendFormat": "actual" },
+        { "refId": "B", "expr": "min(http_requests_rate_forecast_lower{endpoint=\"$signature_endpoint\",level=\"95\"})", "legendFormat": "lower 95%" },
+        { "refId": "C", "expr": "max(http_requests_rate_forecast_upper{endpoint=\"$signature_endpoint\",level=\"95\"})", "legendFormat": "upper 95%" },
+        { "refId": "D", "expr": "avg(http_requests_rate_forecast{endpoint=\"$signature_endpoint\"})", "legendFormat": "forecast (central)" }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "reqps", "custom": { "lineWidth": 2, "fillOpacity": 0, "showPoints": "never" } },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "actual" },
+            "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "green" } }, { "id": "custom.lineWidth", "value": 3 } ] },
+          { "matcher": { "id": "byName", "options": "forecast (central)" },
+            "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "blue" } }, { "id": "custom.lineWidth", "value": 1 }, { "id": "custom.lineStyle", "value": { "fill": "dash", "dash": [6, 4] } } ] },
+          { "matcher": { "id": "byName", "options": "upper 95%" },
+            "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "blue" } }, { "id": "custom.lineWidth", "value": 0 }, { "id": "custom.fillOpacity", "value": 15 }, { "id": "custom.fillBelowTo", "value": "lower 95%" } ] },
+          { "matcher": { "id": "byName", "options": "lower 95%" },
+            "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "blue" } }, { "id": "custom.lineWidth", "value": 0 } ] }
+        ]
+      }
+    },
+    {
+      "type": "timeseries",
+      "id": 11,
+      "title": "Signature: Host CPU — actual vs forecast band",
+      "description": "Whole-host CPU busy %. Same treatment as the HTTP panel — green line should sit inside the blue shaded band, and the right of `now` shows where the model thinks CPU is heading.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 11, "w": 12, "x": 12, "y": 5 },
+      "targets": [
+        { "refId": "A", "expr": "avg(100 - (avg by (instance) (rate(node_cpu_seconds_total{mode=\"idle\"}[2m])) * 100))", "legendFormat": "actual" },
+        { "refId": "B", "expr": "avg(node_cpu_busy_pct_forecast_lower{level=\"95\"})", "legendFormat": "lower 95%" },
+        { "refId": "C", "expr": "avg(node_cpu_busy_pct_forecast_upper{level=\"95\"})", "legendFormat": "upper 95%" },
+        { "refId": "D", "expr": "avg(node_cpu_busy_pct_forecast)", "legendFormat": "forecast (central)" }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "percent", "custom": { "lineWidth": 2, "fillOpacity": 0, "showPoints": "never" } },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "actual" },
+            "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "green" } }, { "id": "custom.lineWidth", "value": 3 } ] },
+          { "matcher": { "id": "byName", "options": "forecast (central)" },
+            "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "blue" } }, { "id": "custom.lineWidth", "value": 1 }, { "id": "custom.lineStyle", "value": { "fill": "dash", "dash": [6, 4] } } ] },
+          { "matcher": { "id": "byName", "options": "upper 95%" },
+            "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "blue" } }, { "id": "custom.lineWidth", "value": 0 }, { "id": "custom.fillOpacity", "value": 15 }, { "id": "custom.fillBelowTo", "value": "lower 95%" } ] },
+          { "matcher": { "id": "byName", "options": "lower 95%" },
+            "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "blue" } }, { "id": "custom.lineWidth", "value": 0 } ] }
+        ]
+      }
+    },
+    {
+      "type": "timeseries",
+      "id": 20,
+      "title": "Signature: HTTP p95 latency — actual vs forecast band",
+      "description": "Tail latency for $signature_endpoint. Same treatment as the other Signature panels — green line = actual p95 from `histogram_quantile`, blue shaded band = forecast 95% confidence interval projected forward, dashed blue = central forecast. p95 latency is one of the harder signals to forecast (log-normal tails), so wider bands are expected and honest.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 11, "w": 12, "x": 0, "y": 16 },
+      "targets": [
+        { "refId": "A", "expr": "histogram_quantile(0.95, sum by (le) (rate(http_request_duration_seconds_bucket{endpoint=\"$signature_endpoint\"}[2m])))", "legendFormat": "actual" },
+        { "refId": "B", "expr": "min(http_request_p95_seconds_forecast_lower{endpoint=\"$signature_endpoint\",level=\"95\"})", "legendFormat": "lower 95%" },
+        { "refId": "C", "expr": "max(http_request_p95_seconds_forecast_upper{endpoint=\"$signature_endpoint\",level=\"95\"})", "legendFormat": "upper 95%" },
+        { "refId": "D", "expr": "avg(http_request_p95_seconds_forecast{endpoint=\"$signature_endpoint\"})", "legendFormat": "forecast (central)" }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "s", "custom": { "lineWidth": 2, "fillOpacity": 0, "showPoints": "never" } },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "actual" },
+            "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "green" } }, { "id": "custom.lineWidth", "value": 3 } ] },
+          { "matcher": { "id": "byName", "options": "forecast (central)" },
+            "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "blue" } }, { "id": "custom.lineWidth", "value": 1 }, { "id": "custom.lineStyle", "value": { "fill": "dash", "dash": [6, 4] } } ] },
+          { "matcher": { "id": "byName", "options": "upper 95%" },
+            "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "blue" } }, { "id": "custom.lineWidth", "value": 0 }, { "id": "custom.fillOpacity", "value": 15 }, { "id": "custom.fillBelowTo", "value": "lower 95%" } ] },
+          { "matcher": { "id": "byName", "options": "lower 95%" },
+            "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "blue" } }, { "id": "custom.lineWidth", "value": 0 } ] }
+        ]
+      }
+    },
+    {
+      "type": "timeseries",
+      "id": 21,
+      "title": "Signature: HTTP error rate (5xx) — actual vs forecast band",
+      "description": "Aggregate error rate across all /api/* endpoints (errors are sparse per endpoint, so the fleet-aggregate view is the meaningful one). Green = actual 5xx rate, blue shaded band = forecast 95% interval. The error rate is the sparsest signal in the demo stack — bands are wide on purpose because the underlying signal is genuinely unpredictable at low rates.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 11, "w": 12, "x": 12, "y": 16 },
+      "targets": [
+        { "refId": "A", "expr": "sum(rate(http_requests_total{status=~\"5..\"}[2m]))", "legendFormat": "actual" },
+        { "refId": "B", "expr": "min(http_errors_rate_forecast_lower{level=\"95\"})", "legendFormat": "lower 95%" },
+        { "refId": "C", "expr": "max(http_errors_rate_forecast_upper{level=\"95\"})", "legendFormat": "upper 95%" },
+        { "refId": "D", "expr": "avg(http_errors_rate_forecast)", "legendFormat": "forecast (central)" }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "reqps", "custom": { "lineWidth": 2, "fillOpacity": 0, "showPoints": "never" } },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "actual" },
+            "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "green" } }, { "id": "custom.lineWidth", "value": 3 } ] },
+          { "matcher": { "id": "byName", "options": "forecast (central)" },
+            "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "blue" } }, { "id": "custom.lineWidth", "value": 1 }, { "id": "custom.lineStyle", "value": { "fill": "dash", "dash": [6, 4] } } ] },
+          { "matcher": { "id": "byName", "options": "upper 95%" },
+            "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "blue" } }, { "id": "custom.lineWidth", "value": 0 }, { "id": "custom.fillOpacity", "value": 15 }, { "id": "custom.fillBelowTo", "value": "lower 95%" } ] },
+          { "matcher": { "id": "byName", "options": "lower 95%" },
+            "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "blue" } }, { "id": "custom.lineWidth", "value": 0 } ] }
+        ]
+      }
+    }
+  ]
+}

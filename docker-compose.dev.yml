@@ -5,7 +5,14 @@
 #   forecaster       :9091  (/metrics, /healthz, /-/reload)
 #   Redis            :6379  (query-cache backend; HA isn't wired in compose
 #                            since leader election needs a kube API server)
-#   Grafana          :3000  (admin / admin)
+#   Grafana          :3000  (admin / admin) — "load" profile only
+#
+# Two profiles:
+#   default (`make dev-up`)      — VM, Prometheus, Redis, node-exporter,
+#                                  forecaster. Minimum for forecaster
+#                                  development.
+#   load    (`make dev-up-load`) — adds http-demo, http-demo-loadgen,
+#                                  Grafana. Full demo experience.
 
 name: promforecast-dev
 
@@ -27,6 +34,39 @@ services:
       interval: 5s
       timeout: 3s
       retries: 20
+    restart: unless-stopped
+
+  http-demo:
+    # Tiny FastAPI app with a handful of endpoints + /metrics. Driven by
+    # the loadgen below so the forecaster has http_* time series to fit on.
+    # Behind the "load" profile so `make dev-up` (minimum dev stack)
+    # doesn't start it; `make dev-up-load` does.
+    profiles: ["load"]
+    build:
+      context: ./docker/http-demo
+      dockerfile: Dockerfile.app
+    image: promforecast-http-demo:dev
+    container_name: pf-http-demo
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+
+  http-demo-loadgen:
+    # ~20-30 req/min with a slow sinusoidal modulation so the rate has shape.
+    # Same profile as http-demo since one without the other is useless.
+    profiles: ["load"]
+    build:
+      context: ./docker/http-demo
+      dockerfile: Dockerfile.loadgen
+    image: promforecast-http-demo-loadgen:dev
+    container_name: pf-http-demo-loadgen
+    environment:
+      TARGET: http://http-demo:8000
+      BASE_RPM: "25"
+      AMPLITUDE_RPM: "15"
+      PERIOD_SECONDS: "600"
+    depends_on:
+      - http-demo
     restart: unless-stopped
 
   node-exporter:
@@ -103,6 +143,10 @@ services:
     restart: unless-stopped
 
   grafana:
+    # Grafana is in the "load" profile because the bundled dashboards are
+    # tied to the http-demo data; a minimum `make dev-up` for forecaster
+    # development doesn't need it. `make dev-up-load` brings it up.
+    profiles: ["load"]
     image: grafana/grafana:13.0.1
     container_name: pf-grafana
     environment:

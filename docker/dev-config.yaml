@@ -20,16 +20,36 @@ query_cache:
   ttl: 30s
   redis_address: redis:6379
 
+# Push the *full* forecast curve (every step from t+1 to t+horizon) into VM
+# with future timestamps after each fit. Without this the /metrics exporter
+# only emits one gauge per series — the horizon point — which appears as a
+# 5-min-wide staircase in Grafana. With remote_write on, dashboards plot a
+# smooth curve overlapping the actual signal, and `offset <horizon>` is no
+# longer needed on the dashboard side.
+#
+# VM accepts future timestamps because docker-compose.dev.yml starts it with
+# --futureRetention=2d.
+sink:
+  remote_write:
+    enabled: true
+    url: http://victoriametrics:8428/api/v1/import/prometheus
+
 server:
   listen: ":9091"
-  refresh_interval: 1m
+  # 5m gives AutoARIMA + backtest fits time to finish before the next tick.
+  # Earlier 1m caused the per-group lock to back up runs to ~10 min effective
+  # cadence on http_demo and node_storage.
+  refresh_interval: 5m
 
 # Tight caps to exercise overflow handling end-to-end in dev.
 safety:
   max_series_per_query: 50
   max_total_series: 500
   series_overflow: drop_lowest_priority
-  fit_timeout: 60s
+  # 120s suits AutoARIMA on the bursty disk-I/O and per-endpoint HTTP series
+  # in this stack. With 60s we saw recurring fit_timeout / backtest_failed
+  # events.
+  fit_timeout: 120s
   query_timeout: 30s
 
 defaults:
@@ -84,3 +104,89 @@ groups:
       - id: node_memory_used_bytes
         promql: |
           node_memory_MemTotal_bytes - node_memory_MemAvailable_bytes
+      - id: node_load1
+        promql: node_load1
+      - id: node_load5
+        promql: node_load5
+
+  - name: node_storage
+    priority: 8
+    preprocess:
+      gaps:
+        strategy: forward_fill
+        max_gap: 10m
+    queries:
+      # Filesystem fill: predict where used % is heading. The capacity
+      # dashboard uses this to surface "disk will be full in N hours".
+      - id: node_filesystem_used_pct
+        promql: |
+          100 * (1 - node_filesystem_avail_bytes{fstype!~"tmpfs|overlay|squashfs|ramfs"}
+                / node_filesystem_size_bytes{fstype!~"tmpfs|overlay|squashfs|ramfs"})
+      - id: node_disk_read_bytes_rate
+        promql: rate(node_disk_read_bytes_total[2m])
+      - id: node_disk_written_bytes_rate
+        promql: rate(node_disk_written_bytes_total[2m])
+
+  - name: node_network
+    priority: 6
+    preprocess:
+      gaps:
+        strategy: forward_fill
+        max_gap: 10m
+    queries:
+      - id: node_network_receive_bytes_rate
+        promql: |
+          rate(node_network_receive_bytes_total{device!~"lo|docker.*|veth.*|br-.*"}[2m])
+      - id: node_network_transmit_bytes_rate
+        promql: |
+          rate(node_network_transmit_bytes_total{device!~"lo|docker.*|veth.*|br-.*"}[2m])
+
+  - name: http_demo
+    priority: 9
+    preprocess:
+      gaps:
+        strategy: forward_fill
+        max_gap: 10m
+    # Loadgen modulates request rate on a 10-min sine (PERIOD_SECONDS=600 in
+    # docker/http-demo/loadgen.py). Override season_length so SeasonalNaive
+    # locks onto that cycle instead of the generic 15-step default.
+    #
+    # The endpoint filter (/api/.*|/healthz) keeps the forecast scope to
+    # endpoints the loadgen actually targets. Self-scrapes (/metrics) and
+    # incidental browser hits (/, /favicon.ico) would otherwise produce
+    # near-zero series that pathologically score q=0 under MAPE.
+    queries:
+      - id: http_requests_rate
+        promql: |
+          sum by (endpoint) (
+            rate(http_requests_total{endpoint=~"/api/.*|/healthz"}[2m])
+          )
+        season_length: 10
+      # Error rate. flaky returns 500 only ~7% of calls so this is a
+      # genuinely intermittent signal — score it with MASE (via
+      # data_profile: intermittent) instead of MAPE, which blows up on
+      # near-zero actuals.
+      - id: http_errors_rate
+        promql: |
+          sum by (endpoint) (
+            rate(http_requests_total{status=~"5..",endpoint=~"/api/.*|/healthz"}[2m])
+          )
+        season_length: 10
+        data_profile: intermittent
+      # p95 latency derived from the histogram. Forecasting tail latency
+      # is one of the more interesting demos because it's both noisy and
+      # tied to load.
+      - id: http_request_p95_seconds
+        promql: |
+          histogram_quantile(
+            0.95,
+            sum by (endpoint, le) (
+              rate(http_request_duration_seconds_bucket{endpoint=~"/api/.*|/healthz"}[2m])
+            )
+          )
+        season_length: 10
+      # In-flight concurrency. Gauge, not derived from a counter, so this
+      # is a different shape of series.
+      - id: http_in_flight
+        promql: max by (job) (http_requests_in_flight)
+        season_length: 10

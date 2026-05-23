@@ -82,12 +82,16 @@ sys.exit(f'alert drift: chart {sorted(ch-ex) or \"-\"}, example {sorted(ex-ch) o
 # ---------- Local dev ----------
 
 .PHONY: dev-up
-dev-up: ## Start VictoriaMetrics + node-exporter + Prometheus + Redis + forecaster locally.
+dev-up: ## Start the minimum dev stack: VM, Prometheus, Redis, node-exporter, forecaster.
 	docker compose -f docker-compose.dev.yml up -d --build
 
+.PHONY: dev-up-load
+dev-up-load: ## Start the full demo stack: minimum + http-demo + loadgen + Grafana.
+	docker compose -f docker-compose.dev.yml --profile load up -d --build
+
 .PHONY: dev-down
-dev-down: ## Stop the local dev stack.
-	docker compose -f docker-compose.dev.yml down -v
+dev-down: ## Stop the local dev stack (any profile).
+	docker compose -f docker-compose.dev.yml --profile load down -v
 
 .PHONY: dev-validate
 dev-validate: ## Sanity-check the running dev stack: forecaster fits and exposes all metric families.
@@ -111,7 +115,11 @@ exit('!! forecast_query_cache_events_total{kind=\"miss\"} is zero -- the cache i
 r=json.loads(u.urlopen('http://localhost:9090/api/v1/query?query=forecast_accuracy_mape').read())['data']['result']; \
 print(f'  forecast_accuracy_mape: {len(r)} series'); \
 exit('!! Prometheus has 0 series - check the prometheus scrape config and forecaster reachability') if not r else None"
-	@echo ">> dashboards reachable in Grafana at http://localhost:3000 (admin / admin)"
+	@if docker compose -f docker-compose.dev.yml ps --status running --services 2>/dev/null | grep -qx grafana; then \
+	  echo ">> dashboards reachable in Grafana at http://localhost:3000 (admin / admin)"; \
+	else \
+	  echo ">> Grafana not running (minimum dev stack). Run 'make dev-up-load' to start the demo stack with Grafana + http-demo + loadgen."; \
+	fi
 
 .PHONY: load-test
 load-test: ## Synthetic high-cardinality run for safety-control validation.

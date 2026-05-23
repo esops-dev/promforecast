@@ -1,0 +1,333 @@
+{
+  "title": "promforecast — Demo tour (HTTP + host)",
+  "uid": "promforecast-demo-tour",
+  "description": "Local-dev tour dashboard. Plots raw HTTP and host metrics next to the forecaster's predictions. The forecaster runs in snapshot mode (no remote_write sink yet), so each panel overlays `actual now` with `forecast(offset = horizon)` so the predicted value made 30 minutes ago aligns on the X axis with what actually happened. Quality / accuracy / deviation panels show how well the model is doing.",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "tags": ["promforecast", "demo", "http", "node"],
+  "timezone": "",
+  "time": { "from": "now-2h", "to": "now+30m" },
+  "refresh": "30s",
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": { "text": "VictoriaMetrics", "value": "victoriametrics" }
+      },
+      {
+        "name": "endpoint",
+        "type": "query",
+        "datasource": { "type": "prometheus", "uid": "${datasource}" },
+        "query": "label_values(http_requests_rate_forecast, endpoint)",
+        "refresh": 2,
+        "includeAll": true,
+        "multi": true,
+        "current": { "text": "All", "value": "$__all" }
+      },
+      {
+        "name": "model",
+        "type": "query",
+        "datasource": { "type": "prometheus", "uid": "${datasource}" },
+        "query": "label_values(http_requests_rate_forecast, model)",
+        "refresh": 2,
+        "includeAll": false,
+        "multi": false,
+        "current": { "text": "AutoARIMA", "value": "AutoARIMA" }
+      }
+    ]
+  },
+  "annotations": {
+    "list": [
+      {
+        "name": "Outside 95% band",
+        "datasource": { "type": "prometheus", "uid": "${datasource}" },
+        "enable": true,
+        "iconColor": "red",
+        "expr": "forecast_deviation_outside_band{level=\"95\"} == 1",
+        "titleFormat": "Outside 95% band",
+        "tagKeys": "id,group,model,endpoint,instance,device"
+      }
+    ]
+  },
+  "panels": [
+    { "type": "row", "id": 100, "title": "HTTP — actual vs predicted (offset = horizon)", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 }, "collapsed": false },
+
+    {
+      "type": "timeseries",
+      "id": 1,
+      "title": "Request rate per endpoint — actual vs +30m forecast",
+      "description": "Solid lines: live rate(http_requests_total). Dashed lines: forecast value emitted 30m ago (). When they track, the model is calibrated.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 1 },
+      "targets": [
+        { "refId": "A", "expr": "sum by (endpoint) (rate(http_requests_total{endpoint=~\"$endpoint\"}[2m]))", "legendFormat": "actual {{endpoint}}" },
+        { "refId": "B", "expr": "http_requests_rate_forecast{endpoint=~\"$endpoint\",model=\"$model\"} ", "legendFormat": "forecast {{endpoint}}" }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "reqps", "custom": { "lineWidth": 2, "fillOpacity": 5 } },
+        "overrides": [
+          { "matcher": { "id": "byRegexp", "options": "^forecast .*$" }, "properties": [ { "id": "custom.lineStyle", "value": { "fill": "dash", "dash": [8, 4] } } ] }
+        ]
+      }
+    },
+
+    {
+      "type": "timeseries",
+      "id": 2,
+      "title": "p95 latency per endpoint — actual vs +30m forecast",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 1 },
+      "targets": [
+        { "refId": "A", "expr": "histogram_quantile(0.95, sum by (endpoint, le) (rate(http_request_duration_seconds_bucket{endpoint=~\"$endpoint\"}[2m])))", "legendFormat": "actual p95 {{endpoint}}" },
+        { "refId": "B", "expr": "http_request_p95_seconds_forecast{endpoint=~\"$endpoint\",model=\"$model\"} ", "legendFormat": "forecast p95 {{endpoint}}" }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "s", "custom": { "lineWidth": 2, "fillOpacity": 0 } },
+        "overrides": [
+          { "matcher": { "id": "byRegexp", "options": "^forecast .*$" }, "properties": [ { "id": "custom.lineStyle", "value": { "fill": "dash", "dash": [8, 4] } } ] }
+        ]
+      }
+    },
+
+    {
+      "type": "timeseries",
+      "id": 3,
+      "title": "Request rate — forecast band (95%)",
+      "description": "Forecast lower/upper bounds at the 95% confidence level. When the live rate exits this band you'll see the red annotation above.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 9 },
+      "targets": [
+        { "refId": "A", "expr": "sum by (endpoint) (rate(http_requests_total{endpoint=~\"$endpoint\"}[2m]))", "legendFormat": "actual {{endpoint}}" },
+        { "refId": "B", "expr": "http_requests_rate_forecast_lower{endpoint=~\"$endpoint\",model=\"$model\",level=\"95\"} ", "legendFormat": "lower {{endpoint}}" },
+        { "refId": "C", "expr": "http_requests_rate_forecast_upper{endpoint=~\"$endpoint\",model=\"$model\",level=\"95\"} ", "legendFormat": "upper {{endpoint}}" }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "reqps", "custom": { "lineWidth": 1, "fillOpacity": 10 } },
+        "overrides": [
+          { "matcher": { "id": "byRegexp", "options": "^lower .*$" }, "properties": [ { "id": "custom.lineStyle", "value": { "fill": "dot" } }, { "id": "color", "value": { "mode": "fixed", "fixedColor": "orange" } } ] },
+          { "matcher": { "id": "byRegexp", "options": "^upper .*$" }, "properties": [ { "id": "custom.lineStyle", "value": { "fill": "dot" } }, { "id": "color", "value": { "mode": "fixed", "fixedColor": "orange" } } ] }
+        ]
+      }
+    },
+
+    {
+      "type": "timeseries",
+      "id": 4,
+      "title": "Errors (5xx) per endpoint — actual vs forecast",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 9 },
+      "targets": [
+        { "refId": "A", "expr": "sum by (endpoint) (rate(http_requests_total{endpoint=~\"$endpoint\",status=~\"5..\"}[2m]))", "legendFormat": "actual {{endpoint}}" },
+        { "refId": "B", "expr": "http_errors_rate_forecast{endpoint=~\"$endpoint\",model=\"$model\"} ", "legendFormat": "forecast {{endpoint}}" }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "reqps" },
+        "overrides": [
+          { "matcher": { "id": "byRegexp", "options": "^forecast .*$" }, "properties": [ { "id": "custom.lineStyle", "value": { "fill": "dash", "dash": [8, 4] } } ] }
+        ]
+      }
+    },
+
+    { "type": "row", "id": 200, "title": "Host — CPU, memory, load, disk, network", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 17 }, "collapsed": false },
+
+    {
+      "type": "timeseries",
+      "id": 10,
+      "title": "CPU busy % — actual vs forecast",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 7, "w": 8, "x": 0, "y": 18 },
+      "targets": [
+        { "refId": "A", "expr": "100 - (avg by (instance) (rate(node_cpu_seconds_total{mode=\"idle\"}[2m])) * 100)", "legendFormat": "actual {{instance}}" },
+        { "refId": "B", "expr": "node_cpu_busy_pct_forecast{model=\"$model\"} ", "legendFormat": "forecast {{instance}}" }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "percent" },
+        "overrides": [ { "matcher": { "id": "byRegexp", "options": "^forecast .*$" }, "properties": [ { "id": "custom.lineStyle", "value": { "fill": "dash", "dash": [8, 4] } } ] } ]
+      }
+    },
+
+    {
+      "type": "timeseries",
+      "id": 11,
+      "title": "Memory used — actual vs forecast",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 7, "w": 8, "x": 8, "y": 18 },
+      "targets": [
+        { "refId": "A", "expr": "node_memory_MemTotal_bytes - node_memory_MemAvailable_bytes", "legendFormat": "actual {{instance}}" },
+        { "refId": "B", "expr": "node_memory_used_bytes_forecast{model=\"$model\"} ", "legendFormat": "forecast {{instance}}" }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "bytes" },
+        "overrides": [ { "matcher": { "id": "byRegexp", "options": "^forecast .*$" }, "properties": [ { "id": "custom.lineStyle", "value": { "fill": "dash", "dash": [8, 4] } } ] } ]
+      }
+    },
+
+    {
+      "type": "timeseries",
+      "id": 12,
+      "title": "Load avg (1m, 5m) — actual vs forecast",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 7, "w": 8, "x": 16, "y": 18 },
+      "targets": [
+        { "refId": "A", "expr": "node_load1", "legendFormat": "actual load1 {{instance}}" },
+        { "refId": "B", "expr": "node_load1_forecast{model=\"$model\"} ", "legendFormat": "forecast load1 {{instance}}" },
+        { "refId": "C", "expr": "node_load5", "legendFormat": "actual load5 {{instance}}" },
+        { "refId": "D", "expr": "node_load5_forecast{model=\"$model\"} ", "legendFormat": "forecast load5 {{instance}}" }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "none" },
+        "overrides": [ { "matcher": { "id": "byRegexp", "options": "^forecast .*$" }, "properties": [ { "id": "custom.lineStyle", "value": { "fill": "dash", "dash": [8, 4] } } ] } ]
+      }
+    },
+
+    {
+      "type": "timeseries",
+      "id": 13,
+      "title": "Filesystem used % — actual vs forecast",
+      "description": "Per-mountpoint. If forecast line rises, the capacity-planning alerts will fire before you run out of disk.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 25 },
+      "targets": [
+        { "refId": "A", "expr": "100 * (1 - node_filesystem_avail_bytes{fstype!~\"tmpfs|overlay|squashfs|ramfs\"} / node_filesystem_size_bytes{fstype!~\"tmpfs|overlay|squashfs|ramfs\"})", "legendFormat": "actual {{mountpoint}}" },
+        { "refId": "B", "expr": "node_filesystem_used_pct_forecast{model=\"$model\"} ", "legendFormat": "forecast {{mountpoint}}" }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "percent" },
+        "overrides": [ { "matcher": { "id": "byRegexp", "options": "^forecast .*$" }, "properties": [ { "id": "custom.lineStyle", "value": { "fill": "dash", "dash": [8, 4] } } ] } ]
+      }
+    },
+
+    {
+      "type": "timeseries",
+      "id": 14,
+      "title": "Disk I/O — read & write bytes/s — actual vs forecast",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 25 },
+      "targets": [
+        { "refId": "A", "expr": "rate(node_disk_read_bytes_total[2m])", "legendFormat": "actual read {{device}}" },
+        { "refId": "B", "expr": "node_disk_read_bytes_rate_forecast{model=\"$model\"} ", "legendFormat": "forecast read {{device}}" },
+        { "refId": "C", "expr": "rate(node_disk_written_bytes_total[2m])", "legendFormat": "actual write {{device}}" },
+        { "refId": "D", "expr": "node_disk_written_bytes_rate_forecast{model=\"$model\"} ", "legendFormat": "forecast write {{device}}" }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "Bps" },
+        "overrides": [ { "matcher": { "id": "byRegexp", "options": "^forecast .*$" }, "properties": [ { "id": "custom.lineStyle", "value": { "fill": "dash", "dash": [8, 4] } } ] } ]
+      }
+    },
+
+    {
+      "type": "timeseries",
+      "id": 15,
+      "title": "Network — rx & tx bytes/s — actual vs forecast",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 7, "w": 24, "x": 0, "y": 32 },
+      "targets": [
+        { "refId": "A", "expr": "rate(node_network_receive_bytes_total{device!~\"lo|docker.*|veth.*|br-.*\"}[2m])", "legendFormat": "actual rx {{device}}" },
+        { "refId": "B", "expr": "node_network_receive_bytes_rate_forecast{model=\"$model\"} ", "legendFormat": "forecast rx {{device}}" },
+        { "refId": "C", "expr": "rate(node_network_transmit_bytes_total{device!~\"lo|docker.*|veth.*|br-.*\"}[2m])", "legendFormat": "actual tx {{device}}" },
+        { "refId": "D", "expr": "node_network_transmit_bytes_rate_forecast{model=\"$model\"} ", "legendFormat": "forecast tx {{device}}" }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "Bps" },
+        "overrides": [ { "matcher": { "id": "byRegexp", "options": "^forecast .*$" }, "properties": [ { "id": "custom.lineStyle", "value": { "fill": "dash", "dash": [8, 4] } } ] } ]
+      }
+    },
+
+    { "type": "row", "id": 300, "title": "Forecast quality, accuracy & deviation", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 39 }, "collapsed": false },
+
+    {
+      "type": "timeseries",
+      "id": 20,
+      "title": "Quality score by group / id (0..1)",
+      "description": "Composite reliability score per series. Combines backtest MAPE, band width vs actual, and data coverage. Low score = don't trust this forecast.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 40 },
+      "targets": [
+        { "refId": "A", "expr": "forecast_quality_score{model=\"$model\"}", "legendFormat": "{{group}} / {{id}}" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "none", "min": 0, "max": 1 } }
+    },
+
+    {
+      "type": "timeseries",
+      "id": 21,
+      "title": "Backtest MAPE per horizon (%)",
+      "description": "Mean absolute percentage error from the rolling backtest. Lower is better. Dev config evaluates at horizons 3m / 5m / 15m.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 40 },
+      "targets": [
+        { "refId": "A", "expr": "forecast_accuracy_mape{model=\"$model\"}", "legendFormat": "{{group}} / {{id}} ({{horizon}})" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "percent" } }
+    },
+
+    {
+      "type": "timeseries",
+      "id": 22,
+      "title": "Deviation ratio: (actual - yhat) / band-width",
+      "description": "0 means actual is on the forecast central line; ±1 means actual is at the edge of the band; |ratio| > 1 means outside the band.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 48 },
+      "targets": [
+        { "refId": "A", "expr": "forecast_deviation_ratio{model=\"$model\",level=\"95\"}", "legendFormat": "{{group}} / {{id}}" }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "none" },
+        "overrides": []
+      }
+    },
+
+    {
+      "type": "stat",
+      "id": 23,
+      "title": "Series count by group",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 48 },
+      "targets": [
+        { "refId": "A", "expr": "forecast_series_count", "legendFormat": "{{group}}" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short" } }
+    },
+
+    {
+      "type": "stat",
+      "id": 24,
+      "title": "Last successful run (per group)",
+      "description": "time() - forecast_last_run_timestamp_seconds. Should stay under refresh_interval (1m in dev).",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 48 },
+      "targets": [
+        { "refId": "A", "expr": "time() - forecast_last_run_timestamp_seconds", "legendFormat": "{{group}}" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 120 },
+              { "color": "red", "value": 600 }
+            ]
+          }
+        }
+      }
+    },
+
+    {
+      "type": "timeseries",
+      "id": 25,
+      "title": "Run duration & failures (per group)",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 4, "w": 12, "x": 12, "y": 52 },
+      "targets": [
+        { "refId": "A", "expr": "forecast_run_duration_seconds", "legendFormat": "duration {{group}}" },
+        { "refId": "B", "expr": "rate(forecast_failures_total[5m])", "legendFormat": "failures/s {{group}} ({{reason}})" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "s" } }
+    }
+  ]
+}
