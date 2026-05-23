@@ -114,6 +114,26 @@ def _discover() -> dict[str, type[ForecastModel]]:
                 f"{discovered[name].__module__}.{discovered[name].__qualname__} "
                 f"and {obj.__module__}.{obj.__qualname__} both registered"
             )
+        # Plug-ins discovered through this code path that pre-date the
+        # ``uses_regressors`` marker default to the safe "refit" branch
+        # of the conditional-emission path. Flag the missing attribute
+        # at registry-build time so operators see *which* plug-in is
+        # paying the doubled-fit cost; the conditional emission still
+        # works, it just doesn't benefit from the short-circuit.
+        if not hasattr(obj, "uses_regressors"):
+            logger.info(
+                "model_missing_uses_regressors_attribute",
+                entry_point=ep.name,
+                value=ep.value,
+                model_name=name,
+                hint=(
+                    "set 'uses_regressors = False' on the class if the "
+                    "model ignores the regressors parameter so the "
+                    "conditional-emission path can short-circuit the refit; "
+                    "leave it True (or unset, the safe default) when the "
+                    "model genuinely consumes regressors"
+                ),
+            )
         discovered[name] = obj
     return discovered
 
@@ -154,6 +174,28 @@ def available() -> list[str]:
     extensions, error messages) without leaking the concrete class types.
     """
     return sorted(_registry().keys())
+
+
+def uses_regressors(name: str) -> bool:
+    """Whether the model registered under ``name`` consumes the regressors arg.
+
+    Read off the class-level ``uses_regressors`` attribute (see
+    :class:`ForecastModel`). Defaults to ``False`` for plug-ins that
+    predate the marker — the conditional emission path will still
+    *refit* such plug-ins, so the safe default is "regressors-aware so we
+    don't skip the refit by mistake"; we invert: a missing marker means
+    "treat as unknown -> refit to be safe".
+
+    Returns ``True`` when the model is unknown to the registry — the
+    runner's conditional path uses this signal to decide whether to skip
+    a refit, and missing entries should not be silently dropped from the
+    refit pass.
+    """
+    registry = _registry()
+    cls = registry.get(name)
+    if cls is None:
+        return True
+    return bool(getattr(cls, "uses_regressors", True))
 
 
 def build(
@@ -204,4 +246,5 @@ __all__ = [
     "available",
     "build",
     "refresh",
+    "uses_regressors",
 ]

@@ -27,3 +27,16 @@ groups:
       - id: persistentvolumeclaim_used_bytes
         promql: |
           sum by (namespace, persistentvolumeclaim) (kubelet_volume_stats_used_bytes)
+
+      # Queue burn-down example. The le_drain comparator changes the
+      # ETA family in two ways: the metric name becomes
+      # ``..._forecast_time_to_drain_seconds`` (parallel to the
+      # standard ETA), and the no-crossing sentinel is +Inf rather
+      # than NaN so the "queue is not draining" alert can match it.
+      - id: kafka_consumer_lag
+        promql: |
+          sum by (consumergroup, topic) (kafka_consumergroup_lag)
+        thresholds:
+          - name: drained
+            value: 0
+            comparator: le_drain

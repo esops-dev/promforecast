@@ -46,6 +46,28 @@ groups:
         promql: |
           sum by (service) (rate(http_requests_total{status=~"5.."}[5m]))
 
+      # Error ratio with SLO error-budget forecasting. The forecast is
+      # the predicted error rate; the slo block turns it into burn rate
+      # and exhaustion ETAs. Pair short and long windows for
+      # multi-window/multi-burn-rate alerting per the SRE workbook.
+      - id: http_request_error_ratio
+        promql: |
+          sum by (service) (rate(http_requests_total{status=~"5.."}[5m]))
+            /
+          sum by (service) (rate(http_requests_total[5m]))
+        slo:
+          objective: 99.9
+          windows: [5m, 1h, 30d]
+        # Suggest the lowest-load 15-minute windows for scheduling
+        # certificate rotations or other brief downtime; rate of
+        # requests is a reasonable proxy for impact when the dominant
+        # cost is request count.
+        recommended_windows:
+          enabled: true
+          duration: 15m
+          lookahead: 48h
+          count: 3
+
       - id: http_request_p95_seconds
         promql: |
           histogram_quantile(0.95,

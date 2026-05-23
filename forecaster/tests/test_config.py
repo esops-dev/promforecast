@@ -680,6 +680,102 @@ groups:
         config_module.load(path)
 
 
+def test_load_accepts_threshold_with_alert_within_and_severity(tmp_path: Path) -> None:
+    """A threshold with ``alert_within`` + ``severity`` round-trips through the loader."""
+    path = _write(
+        tmp_path,
+        """
+apiVersion: promforecast.io/v1
+datasource:
+  url: http://vm:8428/
+groups:
+  - name: g
+    queries:
+      - id: disk_used_pct
+        promql: up
+        thresholds:
+          - name: warn
+            value: 80
+            alert_within: 6h
+            severity: warning
+""",
+    )
+    cfg = config_module.load(path)
+    threshold = cfg.groups[0].queries[0].thresholds[0]
+    assert threshold.alert_within == timedelta(hours=6)
+    assert threshold.severity == "warning"
+
+
+def test_load_rejects_threshold_with_severity_but_no_alert_within(tmp_path: Path) -> None:
+    """``severity`` without ``alert_within`` is the half-configured-shape error."""
+    path = _write(
+        tmp_path,
+        """
+apiVersion: promforecast.io/v1
+datasource:
+  url: http://vm:8428/
+groups:
+  - name: g
+    queries:
+      - id: m
+        promql: up
+        thresholds:
+          - name: warn
+            value: 80
+            severity: warning
+""",
+    )
+    with pytest.raises(ValueError, match="alert_within and severity must be set together"):
+        config_module.load(path)
+
+
+def test_load_rejects_threshold_with_alert_within_but_no_severity(tmp_path: Path) -> None:
+    """``alert_within`` without ``severity`` is the inverse half-configured error."""
+    path = _write(
+        tmp_path,
+        """
+apiVersion: promforecast.io/v1
+datasource:
+  url: http://vm:8428/
+groups:
+  - name: g
+    queries:
+      - id: m
+        promql: up
+        thresholds:
+          - name: warn
+            value: 80
+            alert_within: 6h
+""",
+    )
+    with pytest.raises(ValueError, match="alert_within and severity must be set together"):
+        config_module.load(path)
+
+
+def test_load_rejects_zero_alert_within(tmp_path: Path) -> None:
+    """``alert_within: 0s`` is rejected — every finite ETA satisfies < 0 is False."""
+    path = _write(
+        tmp_path,
+        """
+apiVersion: promforecast.io/v1
+datasource:
+  url: http://vm:8428/
+groups:
+  - name: g
+    queries:
+      - id: m
+        promql: up
+        thresholds:
+          - name: warn
+            value: 80
+            alert_within: 0s
+            severity: warning
+""",
+    )
+    with pytest.raises(ValueError, match="alert_within must be a positive duration"):
+        config_module.load(path)
+
+
 def test_load_rejects_growth_rate_enabled_without_windows(tmp_path: Path) -> None:
     """``growth_rate.enabled: true`` with empty windows must fail at load time."""
     path = _write(
@@ -843,3 +939,155 @@ groups:
     assert "AutoARIMADamped" in names
     ets = next(s for s in cfg.defaults.models if s.name == "AutoETSDamped")
     assert ets.params == {"damping_parameter": 0.95}
+
+
+def test_load_rejects_le_drain_with_alert_within(tmp_path: Path) -> None:
+    """``alert_within`` + ``le_drain`` is rejected — will_breach would invert.
+
+    The will_breach gauge fires when the ETA is small; for a drain threshold
+    that means "queue will drain soon" — the opposite of a predictive
+    breach. The combination must fail at load time so operators don't
+    silently ship the inverted alert.
+    """
+    path = _write(
+        tmp_path,
+        """
+apiVersion: promforecast.io/v1
+datasource:
+  url: http://vm:8428/
+groups:
+  - name: g
+    queries:
+      - id: kafka_consumer_lag
+        promql: up
+        thresholds:
+          - name: drained
+            value: 0
+            comparator: le_drain
+            alert_within: 4h
+            severity: warning
+""",
+    )
+    with pytest.raises(ValueError, match="alert_within \\+ severity are not supported on le_drain"):
+        config_module.load(path)
+
+
+def test_load_accepts_slo_block(tmp_path: Path) -> None:
+    """A query with ``slo:`` and multiple windows loads cleanly."""
+    path = _write(
+        tmp_path,
+        """
+apiVersion: promforecast.io/v1
+datasource:
+  url: http://vm:8428/
+groups:
+  - name: g
+    queries:
+      - id: http_error_ratio
+        promql: up
+        slo:
+          objective: 99.9
+          windows: [5m, 1h, 30d]
+""",
+    )
+    cfg = config_module.load(path)
+    slo = cfg.groups[0].queries[0].slo
+    assert slo is not None
+    assert slo.objective == 99.9
+    assert slo.windows == [timedelta(minutes=5), timedelta(hours=1), timedelta(days=30)]
+
+
+def test_load_rejects_slo_objective_at_bounds(tmp_path: Path) -> None:
+    """``objective`` must be strictly inside ``(0, 100)`` — pydantic enforces."""
+    path = _write(
+        tmp_path,
+        """
+apiVersion: promforecast.io/v1
+datasource:
+  url: http://vm:8428/
+groups:
+  - name: g
+    queries:
+      - id: m
+        promql: up
+        slo:
+          objective: 100
+""",
+    )
+    with pytest.raises(ValueError, match="objective"):
+        config_module.load(path)
+
+
+def test_load_rejects_slo_empty_windows(tmp_path: Path) -> None:
+    """An explicitly empty ``windows: []`` must fail (default is non-empty)."""
+    path = _write(
+        tmp_path,
+        """
+apiVersion: promforecast.io/v1
+datasource:
+  url: http://vm:8428/
+groups:
+  - name: g
+    queries:
+      - id: m
+        promql: up
+        slo:
+          objective: 99.9
+          windows: []
+""",
+    )
+    with pytest.raises(ValueError, match="at least one window is required"):
+        config_module.load(path)
+
+
+def test_load_accepts_recommended_windows_block(tmp_path: Path) -> None:
+    """A query with ``recommended_windows.enabled: true`` round-trips cleanly."""
+    path = _write(
+        tmp_path,
+        """
+apiVersion: promforecast.io/v1
+datasource:
+  url: http://vm:8428/
+groups:
+  - name: g
+    queries:
+      - id: node_cpu_busy_pct
+        promql: up
+        recommended_windows:
+          enabled: true
+          duration: 15m
+          lookahead: 24h
+          count: 5
+""",
+    )
+    cfg = config_module.load(path)
+    rw = cfg.groups[0].queries[0].recommended_windows
+    assert rw.enabled is True
+    assert rw.duration == timedelta(minutes=15)
+    assert rw.lookahead == timedelta(hours=24)
+    assert rw.count == 5
+
+
+def test_load_rejects_recommended_windows_duration_larger_than_lookahead(
+    tmp_path: Path,
+) -> None:
+    """A window longer than the lookahead can never be recommended — reject."""
+    path = _write(
+        tmp_path,
+        """
+apiVersion: promforecast.io/v1
+datasource:
+  url: http://vm:8428/
+groups:
+  - name: g
+    queries:
+      - id: m
+        promql: up
+        recommended_windows:
+          enabled: true
+          duration: 2h
+          lookahead: 1h
+""",
+    )
+    with pytest.raises(ValueError, match="must be <= lookahead"):
+        config_module.load(path)

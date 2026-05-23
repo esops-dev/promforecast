@@ -1,0 +1,190 @@
+{
+  "title": "promforecast — Explainability (component decomposition)",
+  "uid": "promforecast-explainability",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "tags": [
+    "promforecast",
+    "forecasting",
+    "explainability",
+    "decomposition"
+  ],
+  "timezone": "",
+  "time": {
+    "from": "now-6h",
+    "to": "now+24h"
+  },
+  "refresh": "5m",
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": {
+          "text": "VictoriaMetrics",
+          "value": "victoriametrics"
+        }
+      },
+      {
+        "name": "metric",
+        "type": "query",
+        "label": "Series",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "query": "label_values({__name__=~\".+_forecast_component\"}, __name__)",
+        "refresh": 2,
+        "includeAll": false,
+        "multi": false
+      },
+      {
+        "name": "model",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "query": "label_values({__name__=\"$metric\"}, model)",
+        "refresh": 2,
+        "includeAll": false,
+        "multi": false
+      }
+    ]
+  },
+  "panels": [
+    {
+      "type": "timeseries",
+      "id": 1,
+      "title": "Component contributions to the predicted curve (stacked)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 12,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "targets": [
+        {
+          "expr": "{__name__=\"$metric\",model=\"$model\"}",
+          "legendFormat": "{{component}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "fillOpacity": 40,
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            }
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "description": "Per-step decomposition of the predicted curve. Components sum to the central forecast row-by-row; an unexpected residual band signals model surprise."
+    },
+    {
+      "type": "timeseries",
+      "id": 2,
+      "title": "Trend component only",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 12
+      },
+      "targets": [
+        {
+          "expr": "{__name__=\"$metric\",model=\"$model\",component=\"trend\"}",
+          "legendFormat": "trend"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      },
+      "description": "Linear-best-fit slope across the horizon. A steepening trend explains 'X fills in N days' before the deviation alert catches up."
+    },
+    {
+      "type": "timeseries",
+      "id": 3,
+      "title": "Seasonal component only",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 12
+      },
+      "targets": [
+        {
+          "expr": "{__name__=\"$metric\",model=\"$model\",component=\"seasonal\"}",
+          "legendFormat": "seasonal"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      },
+      "description": "Per-position-within-cycle deviation. Peaks identify the part of the daily/weekly pattern most responsible for the predicted shape."
+    },
+    {
+      "type": "stat",
+      "id": 4,
+      "title": "Decomposition skips (recent)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 24,
+        "x": 0,
+        "y": 20
+      },
+      "targets": [
+        {
+          "expr": "sum by (model, reason) (increase(forecast_decomposition_skipped_total[1h]))",
+          "legendFormat": "{{model}} / {{reason}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 1
+              }
+            ]
+          }
+        }
+      },
+      "description": "Per-(model, reason) skip counter rate. A sustained non-zero reading means the configured model can't decompose for some series — switch models or disable the family for that query."
+    }
+  ]
+}

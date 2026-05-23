@@ -10,7 +10,7 @@ renders a ``metricRelabelings`` block dropping the
 off, no relabeling is rendered. A literal ``true`` / ``false`` pins the
 behaviour irrespective of the sink. The umbrella chart pre-sets both
 the sink and ServiceMonitor toggles so a fresh install lands on
-sink+VM with the snapshot drop applied (the v1.5 default).
+sink+VM with the snapshot drop applied by default.
 
 These tests shell out to ``helm template`` because the alternative
 (implementing a Go template renderer in Python) would diverge from the
@@ -263,6 +263,44 @@ def test_umbrella_datasources_default_to_victoriametrics() -> None:
     vm = next(ds for ds in provisioning["datasources"] if ds["name"] == "VictoriaMetrics")
     assert vm["isDefault"] is True
     assert vm["uid"] == "victoriametrics"
+
+
+def test_standalone_validate_hook_pod_renders_by_default() -> None:
+    """The ``helm test`` validate-config Pod renders with the strict flag.
+
+    The hook lets an operator chain ``helm test <release>`` into a
+    GitOps PostSync gate that rejects configs whose projected
+    cardinality exceeds ``safety.max_total_series``. CI does not run
+    ``helm test`` (no kind cluster), but ``helm template`` +
+    ``kubeconform`` validate that the asset renders to a schema-valid
+    Pod and carries the expected ``--strict-cardinality`` argument so
+    the gate is actually wired up.
+    """
+    docs = _helm_template(STANDALONE_CHART)
+    pod = _find(docs, "Pod", name_contains="test-validate")
+    assert pod is not None, "standalone chart must render the validate-config test pod by default"
+    annotations = pod["metadata"]["annotations"]
+    assert annotations.get("helm.sh/hook") == "test"
+    # Inspect the container's args so a regression that drops the
+    # strict flag (turning the hook back into an advisory smoke test)
+    # surfaces in CI.
+    containers = pod["spec"]["containers"]
+    assert containers, "validate-config test pod must declare a container"
+    args = containers[0].get("args") or []
+    assert "validate" in args
+    assert "--strict-cardinality" in args
+    assert "--config=/etc/promforecast/config.yaml" in args
+
+
+def test_standalone_validate_hook_can_be_disabled() -> None:
+    """``tests.validateConfig.enabled=false`` suppresses the hook entirely.
+
+    Useful for managed-cluster environments that forbid Helm hook
+    Pod creation.
+    """
+    docs = _helm_template(STANDALONE_CHART, "tests.validateConfig.enabled=false")
+    pod = _find(docs, "Pod", name_contains="test-validate")
+    assert pod is None
 
 
 def test_umbrella_helm_test_pod_renders() -> None:

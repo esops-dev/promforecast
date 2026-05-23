@@ -21,16 +21,24 @@ from typing import TYPE_CHECKING
 from . import deviation as deviation_mod
 from . import quality as quality_mod
 from .accuracy import overall_mape, overall_mase
+from .capacity import DRAIN_COMPARATORS
 from .exporter import (
     AccuracyPoint,
     CalibrationOffsetPoint,
+    ComponentDecompositionPoint,
+    ConditionalDeviationPoint,
+    ConditionalForecastPoint,
     ContributionPoint,
     DeviationPoint,
     EnsembleWeightPoint,
+    ErrorBudgetPoint,
     ForecastPoint,
     GrowthRatePoint,
     QualityPoint,
+    RecommendedMaintenanceWindowPoint,
     ThresholdEtaPoint,
+    TimeToDrainPoint,
+    WillBreachPoint,
 )
 from .sink import ForecastCurvePoint
 
@@ -40,9 +48,11 @@ if TYPE_CHECKING:
     import pandas as pd
 
     from .accuracy import AccuracyResult
-    from .capacity import GrowthRate, ThresholdEta
+    from .capacity import GrowthRate, ThresholdEta, WillBreach
     from .contribution import ContributionResult
+    from .maintenance import RecommendedWindow
     from .selector import SelectionResult
+    from .slo import BudgetSample
 
 
 def format_window(seconds: float) -> str:
@@ -177,6 +187,188 @@ class SeriesPointFactory:
                     value=float(last[hi_col]),
                 )
 
+    def conditional_forecast_points(
+        self,
+        forecast: pd.DataFrame,
+        model_name: str,
+        selection: SelectionResult | None,
+    ) -> Iterable[ConditionalForecastPoint]:
+        """Mirror of :meth:`forecast_points` for the conditional family.
+
+        Same end-of-horizon convention — one snapshot value per (series,
+        model, level). The metric names carry the
+        ``_forecast_conditional`` suffix family instead of ``_forecast``.
+        """
+        if forecast.empty:
+            return
+        last = forecast.iloc[-1]
+        common = self._build_common_labels(model_name, selection)
+        yield ConditionalForecastPoint(
+            metric=f"{self._metric_id}_forecast_conditional",
+            labels=common,
+            value=float(last["yhat"]),
+        )
+        for level in self._levels:
+            lo_col = f"yhat_lower_{level}"
+            hi_col = f"yhat_upper_{level}"
+            if lo_col in forecast.columns:
+                yield ConditionalForecastPoint(
+                    metric=f"{self._metric_id}_forecast_conditional_lower",
+                    labels={**common, "level": str(level)},
+                    value=float(last[lo_col]),
+                )
+            if hi_col in forecast.columns:
+                yield ConditionalForecastPoint(
+                    metric=f"{self._metric_id}_forecast_conditional_upper",
+                    labels={**common, "level": str(level)},
+                    value=float(last[hi_col]),
+                )
+
+    def conditional_forecast_curve_points(
+        self,
+        forecast: pd.DataFrame,
+        model_name: str,
+        selection: SelectionResult | None,
+    ) -> Iterable[ForecastCurvePoint]:
+        """Yield every horizon step as a push point for the conditional sink curve.
+
+        Mirrors :meth:`forecast_curve_points` but emits under the
+        ``_forecast_conditional`` metric-name family so the sink lands
+        the conditional curves in a parallel TSDB family. Caller-side
+        renaming is no longer needed once this method is used.
+
+        Rows with non-finite timestamps or values are dropped — TSDBs
+        reject NaN samples, and emitting them would just generate noise
+        in the sink's failure counter.
+        """
+        yield from self._curve_points(forecast, model_name, selection, suffix_family="_conditional")
+
+    def conditional_deviation_points(
+        self,
+        forecast: pd.DataFrame,
+        model_name: str,
+        actual: float,
+    ) -> Iterable[ConditionalDeviationPoint]:
+        """Yield one conditional deviation sample per emitted (model, level).
+
+        ``actual`` is the trailing in-sample observation (the most
+        recent value of the input series). ``forecast`` is the
+        conditional-fit forecast frame — we read its **first** horizon
+        step as "what the model would predict immediately given the
+        held-constant regressors".
+        """
+        if forecast.empty:
+            return
+        from . import deviation as deviation_mod  # noqa: PLC0415
+
+        first = forecast.iloc[0]
+        try:
+            yhat = float(first["yhat"])
+        except (KeyError, ValueError):
+            return
+        common = self._common_with_id()
+        for level in self._levels:
+            lo_col = f"yhat_lower_{level}"
+            hi_col = f"yhat_upper_{level}"
+            if lo_col not in forecast.columns or hi_col not in forecast.columns:
+                continue
+            try:
+                lo = float(first[lo_col])
+                hi = float(first[hi_col])
+            except (KeyError, ValueError):
+                continue
+            dev = deviation_mod.compute(
+                actual=actual,
+                yhat=yhat,
+                yhat_lower=lo,
+                yhat_upper=hi,
+            )
+            yield ConditionalDeviationPoint(
+                labels={**common, "model": model_name, "level": str(level)},
+                ratio=dev.ratio,
+                outside_band=dev.outside_band,
+            )
+
+    def component_curve_points(
+        self,
+        forecast: pd.DataFrame,
+        model_name: str,
+        components: dict[str, list[float]],
+        selection: SelectionResult | None,
+    ) -> Iterable[ForecastCurvePoint]:
+        """Yield per-(step, component) push-format points for the sink.
+
+        Mirrors :meth:`forecast_curve_points` but emits one row per
+        component per horizon step. Consumed by the remote_write sink so
+        a Grafana stacked-area panel can plot how trend / seasonal /
+        level / residual layer up over the predicted curve.
+
+        Rows with non-finite timestamps or values are dropped — TSDBs
+        reject NaN samples and emitting them just generates noise in the
+        sink's failure counter.
+        """
+        if forecast.empty or not components:
+            return
+        rows = len(forecast)
+        common = self._build_common_labels(model_name, selection)
+        metric_name = f"{self._metric_id}_forecast_component"
+        for i in range(rows):
+            try:
+                ts = forecast["ds"].iloc[i]
+                ts_ms = int(float(ts.timestamp()) * 1000)
+            except (KeyError, AttributeError, TypeError, ValueError):
+                continue
+            for component_name, values in components.items():
+                if len(values) != rows:
+                    continue
+                raw = values[i]
+                if not math.isfinite(raw):
+                    continue
+                yield ForecastCurvePoint(
+                    metric=metric_name,
+                    labels={**common, "component": component_name},
+                    value=float(raw),
+                    timestamp_ms=ts_ms,
+                )
+
+    def component_points(
+        self,
+        forecast: pd.DataFrame,
+        model_name: str,
+        components: dict[str, list[float]],
+        selection: SelectionResult | None,
+    ) -> Iterable[ComponentDecompositionPoint]:
+        """Yield one end-of-horizon decomposition sample per component.
+
+        Snapshot convention (mirrors :meth:`forecast_points`): emit the
+        value at the configured horizon as a single gauge sample per
+        (series, model, component). ``components`` maps each component
+        name (``trend`` / ``seasonal`` / ``level`` / ``residual``) to
+        the per-step value list — same length as the forecast frame.
+
+        The full per-step curve flows through
+        :meth:`component_curve_points`; this method only produces the
+        scrape-side snapshot row used by /metrics, matching how
+        ``_forecast`` (a single snapshot point) and the sink curve
+        (every step) split today.
+        """
+        if forecast.empty or not components:
+            return
+        rows = len(forecast)
+        common = self._build_common_labels(model_name, selection)
+        metric_name = f"{self._metric_id}_forecast_component"
+        for component_name, values in components.items():
+            if len(values) != rows or not values:
+                continue
+            last_val = float(values[-1])
+            if not math.isfinite(last_val):
+                continue
+            yield ComponentDecompositionPoint(
+                metric=metric_name,
+                labels={**common, "component": component_name},
+                value=last_val,
+            )
+
     def drift_labels(self, model_name: str) -> dict[str, str]:
         """Common label set for a :class:`DriftPoint` in this series.
 
@@ -222,9 +414,32 @@ class SeriesPointFactory:
         NaN samples, and emitting them would just generate noise in the
         sink's failure counter.
         """
+        yield from self._curve_points(forecast, model_name, selection, suffix_family="")
+
+    def _curve_points(
+        self,
+        forecast: pd.DataFrame,
+        model_name: str,
+        selection: SelectionResult | None,
+        *,
+        suffix_family: str,
+    ) -> Iterable[ForecastCurvePoint]:
+        """Internal helper shared by every per-step curve emission method.
+
+        ``suffix_family`` is inserted between ``_forecast`` and the
+        ``_lower`` / ``_upper`` band suffix — empty for the standard
+        family (``<id>_forecast``, ``<id>_forecast_lower``,
+        ``<id>_forecast_upper``), ``"_conditional"`` for the conditional
+        family. Keeping the rendering logic in one place stops the two
+        public callers from drifting on band-handling or NaN-skip
+        semantics as new options arrive.
+        """
         if forecast.empty:
             return
         common = self._build_common_labels(model_name, selection)
+        base_metric = f"{self._metric_id}_forecast{suffix_family}"
+        lower_metric = f"{self._metric_id}_forecast{suffix_family}_lower"
+        upper_metric = f"{self._metric_id}_forecast{suffix_family}_upper"
         for _, row in forecast.iterrows():
             ts = row.get("ds")
             if ts is None:
@@ -237,7 +452,7 @@ class SeriesPointFactory:
             yhat_raw = row.get("yhat")
             if yhat_raw is not None and math.isfinite(float(yhat_raw)):
                 yield ForecastCurvePoint(
-                    metric=f"{self._metric_id}_forecast",
+                    metric=base_metric,
                     labels=common,
                     value=float(yhat_raw),
                     timestamp_ms=ts_ms,
@@ -249,7 +464,7 @@ class SeriesPointFactory:
                     lo = row[lo_col]
                     if math.isfinite(float(lo)):
                         yield ForecastCurvePoint(
-                            metric=f"{self._metric_id}_forecast_lower",
+                            metric=lower_metric,
                             labels={**common, "level": str(level)},
                             value=float(lo),
                             timestamp_ms=ts_ms,
@@ -258,7 +473,7 @@ class SeriesPointFactory:
                     hi = row[hi_col]
                     if math.isfinite(float(hi)):
                         yield ForecastCurvePoint(
-                            metric=f"{self._metric_id}_forecast_upper",
+                            metric=upper_metric,
                             labels={**common, "level": str(level)},
                             value=float(hi),
                             timestamp_ms=ts_ms,
@@ -307,7 +522,7 @@ class SeriesPointFactory:
         etas: list[ThresholdEta],
         selection: SelectionResult | None,
     ) -> Iterable[ThresholdEtaPoint]:
-        """Yield one ``<id>_forecast_time_to_threshold_seconds`` per ETA.
+        """Yield one ``<id>_forecast_time_to_threshold_seconds`` per non-drain ETA.
 
         ``etas`` carries the per-(threshold, level) ETA computed by
         :func:`promforecast.capacity.compute_threshold_etas`. The metric
@@ -317,12 +532,20 @@ class SeriesPointFactory:
         plus optional ``best_model``/``model_fallback``) and add
         ``name`` + ``comparator`` for the threshold, and ``level`` when
         the ETA was computed against a band.
+
+        ETAs whose comparator is one of :data:`promforecast.capacity.DRAIN_COMPARATORS`
+        are *routed* to the drain family — see :meth:`time_to_drain_points` —
+        and not emitted here. Keeping the routing in the factory (rather
+        than the runner) means a future ``ge_fill`` or similar can land
+        with one new dispatch line and no runner change.
         """
         if not etas:
             return
         common = self._build_common_labels(model_name, selection)
         metric_name = f"{self._metric_id}_forecast_time_to_threshold_seconds"
         for eta in etas:
+            if eta.comparator in DRAIN_COMPARATORS:
+                continue
             labels = {
                 **common,
                 "name": eta.name,
@@ -334,6 +557,168 @@ class SeriesPointFactory:
                 metric=metric_name,
                 labels=labels,
                 seconds=eta.seconds,
+            )
+
+    def time_to_drain_points(
+        self,
+        model_name: str,
+        etas: list[ThresholdEta],
+        selection: SelectionResult | None,
+    ) -> Iterable[TimeToDrainPoint]:
+        """Yield one ``<id>_forecast_time_to_drain_seconds`` per drain ETA.
+
+        Sibling of :meth:`threshold_eta_points` for the ``le_drain``
+        comparator. Different metric name (and the ``+Inf`` no-crossing
+        sentinel passes through to the exporter intact so the "queue is
+        not draining" alert can match it).
+
+        Unlike the threshold-ETA family we do *not* emit a ``comparator``
+        label: the metric name itself already carries the routing
+        ("drain"), and every row in this family would carry the same
+        value (``le_drain``) — a label that's constant across the family
+        is pure noise.
+        """
+        if not etas:
+            return
+        common = self._build_common_labels(model_name, selection)
+        metric_name = f"{self._metric_id}_forecast_time_to_drain_seconds"
+        for eta in etas:
+            if eta.comparator not in DRAIN_COMPARATORS:
+                continue
+            labels = {
+                **common,
+                "name": eta.name,
+            }
+            if eta.level is not None:
+                labels["level"] = str(eta.level)
+            yield TimeToDrainPoint(
+                metric=metric_name,
+                labels=labels,
+                seconds=eta.seconds,
+            )
+
+    def error_budget_points(
+        self,
+        model_name: str,
+        samples: list[BudgetSample],
+        selection: SelectionResult | None,
+    ) -> Iterable[ErrorBudgetPoint]:
+        """Yield SLO error-budget snapshot rows for one (model, series).
+
+        Each :class:`promforecast.slo.BudgetSample` fans out to up to
+        ``(2 + 1 + N_levels)`` rows:
+
+        * one ``<id>_forecast_error_budget_remaining_seconds{window}``
+          row (the static allowed-error budget),
+        * one ``<id>_forecast_error_budget_burn_rate{window}`` row
+          (the predicted consumption rate divided by the allowed rate),
+        * one ``<id>_forecast_error_budget_exhausted_in_seconds{window}``
+          row for the central forecast (no ``level`` label), plus
+        * one ``... _exhausted_in_seconds{window, level=<N>}`` row per
+          confidence level the forecast carried.
+
+        Mirrors the ETA family's per-id metric-name convention so
+        dashboards can join the underlying forecast against its derived
+        budget projection on ``id``.
+        """
+        if not samples:
+            return
+        common = self._build_common_labels(model_name, selection)
+        remaining_metric = f"{self._metric_id}_forecast_error_budget_remaining_seconds"
+        burn_metric = f"{self._metric_id}_forecast_error_budget_burn_rate"
+        exh_metric = f"{self._metric_id}_forecast_error_budget_exhausted_in_seconds"
+        for sample in samples:
+            window_label = format_window(sample.window_seconds)
+            base = {**common, "window": window_label}
+            yield ErrorBudgetPoint(
+                metric=remaining_metric,
+                labels=base,
+                value=sample.remaining_seconds,
+            )
+            yield ErrorBudgetPoint(
+                metric=burn_metric,
+                labels=base,
+                value=sample.burn_rate,
+            )
+            # Central exhausted-in: no ``level`` label so an alert on
+            # the central forecast doesn't need to filter for a missing
+            # level.
+            yield ErrorBudgetPoint(
+                metric=exh_metric,
+                labels=base,
+                value=sample.exhausted_in_point,
+            )
+            for level, exhausted_in in sample.exhausted_in_per_level.items():
+                yield ErrorBudgetPoint(
+                    metric=exh_metric,
+                    labels={**base, "level": str(level)},
+                    value=exhausted_in,
+                )
+
+    def recommended_maintenance_window_points(
+        self,
+        model_name: str,
+        windows: list[RecommendedWindow],
+        selection: SelectionResult | None,
+    ) -> Iterable[RecommendedMaintenanceWindowPoint]:
+        """Yield one ``forecast_recommended_maintenance_window`` row per ranked window.
+
+        ``rank``, ``start_timestamp_seconds`` and ``duration_seconds``
+        all live on the label set so a single Grafana panel can render
+        the ranked recommendations across every opted-in query. The
+        sample value is the window's predicted load (mean ``yhat``
+        across the window's rows); lower is better. ``rank=1`` is the
+        suggested window.
+        """
+        if not windows:
+            return
+        common = self._build_common_labels(model_name, selection)
+        # The operational families add ``id`` as a discriminator label;
+        # do the same here so the metric is queryable by id across
+        # groups. ``_build_common_labels`` does not include ``id`` (it
+        # lives on the metric name for the snapshot families) so we
+        # splice it in explicitly.
+        common_with_id = {**common, "id": self._metric_id}
+        for window in windows:
+            yield RecommendedMaintenanceWindowPoint(
+                labels={
+                    **common_with_id,
+                    "rank": str(window.rank),
+                    "start_timestamp_seconds": str(int(window.start_timestamp)),
+                    "duration_seconds": str(int(window.duration_seconds)),
+                },
+                predicted_load=window.predicted_load,
+            )
+
+    def will_breach_points(
+        self,
+        model_name: str,
+        breaches: list[WillBreach],
+        selection: SelectionResult | None,
+    ) -> Iterable[WillBreachPoint]:
+        """Yield one ``<id>_forecast_will_breach`` per derived 0/1 sample.
+
+        Labels mirror the ETA family (``model``, ``horizon``, plus
+        optional ``best_model``/``model_fallback``) and add ``name`` +
+        ``severity`` for the threshold, plus ``level`` when the sample
+        was derived from a band ETA.
+        """
+        if not breaches:
+            return
+        common = self._build_common_labels(model_name, selection)
+        metric_name = f"{self._metric_id}_forecast_will_breach"
+        for breach in breaches:
+            labels = {
+                **common,
+                "name": breach.name,
+                "severity": breach.severity,
+            }
+            if breach.level is not None:
+                labels["level"] = str(breach.level)
+            yield WillBreachPoint(
+                metric=metric_name,
+                labels=labels,
+                value=breach.value,
             )
 
     def growth_rate_points(

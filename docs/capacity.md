@@ -121,6 +121,55 @@ ETA is reported as **0** (read: already in violation).
 - **Quota exhaustion**: forecast the in-use side of any quota,
   `comparator: gt`, `value` = the quota cap.
 
+### Predictive will-breach boolean
+
+`time_to_threshold_seconds < 6h` is a perfectly good alert, but every
+operator who writes one re-derives the same arithmetic. Set
+`alert_within` + `severity` on a threshold and the forecaster emits a
+boolean shaped exactly for `forecast_will_breach == 1`:
+
+```yaml
+queries:
+  - id: node_filesystem_avail_bytes
+    promql: node_filesystem_avail_bytes{fstype!~"tmpfs|overlay|squashfs"}
+    thresholds:
+      - name: critical
+        value: 5368709120     # 5 GiB
+        comparator: lt
+        alert_within: 6h      # opt into the will_breach gauge
+        severity: critical
+```
+
+| Field            | Required               | Meaning                                                                              |
+|------------------|------------------------|--------------------------------------------------------------------------------------|
+| `alert_within`   | only when paired       | Lookahead window. The boolean fires whenever the ETA is finite and below this value. |
+| `severity`       | only when paired       | Becomes the `severity` label on the emitted metric.                                  |
+
+Both fields must be set together — the predictive metric is a derived
+shape and partial config is rejected at load time. The metric is emitted
+even when the predicate is `0`, so dashboards have a baseline series to
+chart from boot:
+
+```
+node_filesystem_avail_bytes_forecast_will_breach{
+  name="critical", severity="critical", level="95",
+  group="node_capacity", model="AutoETSDamped", instance="host-a"
+} 1.0
+```
+
+The same fan-out as the ETA family applies: a row for the central
+forecast (no `level` label) plus one row per confidence level so
+operators can choose how conservative to be. Alerts read like:
+
+```promql
+forecast_will_breach{severity="critical", level="95"} == 1
+```
+
+The corresponding `forecast_time_to_threshold_seconds` value at the
+same labelset is the operator-visible "when" for the breach. See
+`examples/alerts/promforecast-rules.yaml` for the `ForecastWillBreach`
+rule template.
+
 ## Forecast growth rate
 
 Configure per-query growth-rate emission to publish how fast the
@@ -170,14 +219,77 @@ window — the alert query you wrote with `window="7d"` keeps meaning
 what it said. Configure shorter windows or extend `defaults.horizon`
 if you need them.
 
+## Queue burn-down / drain forecasting
+
+A queue (Kafka consumer lag, Sidekiq job backlog, alert backlog) that
+*should* drain over time is the inverse of capacity: instead of
+"when will this hit X from below?", you want "when will this hit
+zero from above?". Use the `le_drain` comparator on a threshold to
+opt into the dedicated drain ETA family:
+
+```yaml
+queries:
+  - id: kafka_consumer_lag
+    promql: sum by (topic) (kafka_consumergroup_lag{group="orders"})
+    thresholds:
+      - name: drained
+        value: 0
+        comparator: le_drain
+```
+
+Output (note the different metric name — `_forecast_time_to_drain_seconds`,
+not `_time_to_threshold_seconds`):
+
+```
+kafka_consumer_lag_forecast_time_to_drain_seconds{
+  name="drained", group="kafka", topic="orders"
+} 5400
+```
+
+`le_drain` is mechanically the same predicate as `lt` (value drops
+below threshold), but with three deliberate differences:
+
+1. **Different metric name.** Emits under
+   `<id>_forecast_time_to_drain_seconds`, parallel to the
+   threshold-ETA family. The two never collide on the same query.
+2. **`+Inf` instead of NaN on no-crossing.** When the forecast curve
+   never crosses the threshold from above within the horizon, the
+   sample reads `+Inf`. Operators alert with
+   `forecast_time_to_drain_seconds == +Inf for 30m` to catch "queue
+   is not actually draining" as a distinct condition from "draining
+   slowly". With NaN (the standard `lt` behaviour), the alert would
+   silently never match.
+3. **`yhat_upper` for the conservative band.** A larger predicted
+   queue drains later, so `yhat_upper` is the *latest* predicted
+   drain — the conservative answer when alerting on a stuck queue.
+   (`lt` uses `yhat_lower` for the earliest-crossing semantics that
+   capacity alerts want.)
+
+The shipped `examples/alerts/promforecast-rules.yaml` includes a
+`promforecast.queue.examples` group with two reference alerts:
+
+```promql
+# Queue is not actually draining
+kafka_consumer_lag_forecast_time_to_drain_seconds{name="drained"} == +Inf
+
+# Drain projected to take >4h (and is happening at all)
+kafka_consumer_lag_forecast_time_to_drain_seconds{name="drained"} > 4 * 60 * 60
+and
+kafka_consumer_lag_forecast_time_to_drain_seconds{name="drained"} != +Inf
+```
+
 ## Cardinality
 
-Both new families count against the global `safety.max_total_series`
-cap; the cardinality estimator in `promforecast validate` includes
-them:
+All the capacity-style families count against the global
+`safety.max_total_series` cap; the cardinality estimator in
+`promforecast validate` includes them:
 
 - Threshold ETA: `N_series × N_models × N_thresholds × (1 + N_levels)`
-  per query that configures thresholds.
+  per query that configures thresholds (excluding `le_drain`).
+- Drain ETA: same shape, charged separately. Only `le_drain` thresholds
+  count.
+- Will-breach: `N_series × N_models × N_thresholds_with_alert × (1 + N_levels)`
+  per query — only thresholds with `alert_within` + `severity` count.
 - Growth rate: `N_series × N_models × N_windows` per query that opts in.
 
 Run `promforecast validate config.yaml` after adding thresholds or

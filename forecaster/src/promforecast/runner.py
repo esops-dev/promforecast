@@ -26,15 +26,18 @@ from . import capacity as capacity_mod
 from . import cold_start as cold_start_mod
 from . import conformal as conformal_mod
 from . import contribution as contribution_mod
+from . import decomposition as decomposition_mod
 from . import deviation as deviation_mod
 from . import discovery as discovery_mod
 from . import drift as drift_mod
+from . import maintenance as maintenance_mod
 from . import models as model_registry
 from . import point_factory as point_factory_mod
 from . import preprocess as preprocess_mod
 from . import quality as quality_mod
 from . import regressors as regressors_mod
 from . import seasonality as seasonality_mod
+from . import slo as slo_mod
 from . import telemetry as telemetry_mod
 from .accuracy import (
     AccuracyResult,
@@ -59,10 +62,14 @@ from .exporter import (
     AccuracyPoint,
     BandCoveragePoint,
     CalibrationOffsetPoint,
+    ComponentDecompositionPoint,
+    ConditionalDeviationPoint,
+    ConditionalForecastPoint,
     ContributionPoint,
     DeviationPoint,
     DriftPoint,
     EnsembleWeightPoint,
+    ErrorBudgetPoint,
     Exporter,
     ForecastPoint,
     GroupSnapshot,
@@ -70,7 +77,10 @@ from .exporter import (
     InvalidMetricNameError,
     PreprocessStats,
     QualityPoint,
+    RecommendedMaintenanceWindowPoint,
     ThresholdEtaPoint,
+    TimeToDrainPoint,
+    WillBreachPoint,
     validate_metric_name,
 )
 from .point_factory import BacktestOutcome, BandSummary, SeriesPointFactory
@@ -148,6 +158,42 @@ class _FitResult:
     # aggregated into the run context without monotonic merging.
     threshold_etas: list[ThresholdEtaPoint] = field(default_factory=list)
     growth_rates: list[GrowthRatePoint] = field(default_factory=list)
+    # Per-(model, threshold[, level]) 0/1 predictive will-breach samples
+    # derived from the ETAs above. Snapshot-style; folded straight into
+    # the run context without monotonic merging.
+    will_breach: list[WillBreachPoint] = field(default_factory=list)
+    # Drain-ETA family for ``le_drain`` thresholds. Sibling of
+    # ``threshold_etas`` — separate field rather than a re-used one so
+    # the exporter's per-family rendering can preserve ``+Inf`` samples
+    # (the "queue is not draining" alert needs them to round-trip).
+    time_to_drain: list[TimeToDrainPoint] = field(default_factory=list)
+    # SLO error-budget snapshot rows (remaining, burn rate, exhausted_in).
+    # Snapshot-style; folded straight into the run context.
+    error_budget: list[ErrorBudgetPoint] = field(default_factory=list)
+    # Recommended maintenance windows — top-N lowest-load windows in the
+    # forecast horizon for this (series, model). Snapshot-style.
+    recommended_windows: list[RecommendedMaintenanceWindowPoint] = field(default_factory=list)
+    # Conditional forecast emission: snapshot + deviation + curve. All
+    # three are produced together when ``emission.conditional: true`` is
+    # on for the query. The curve flows into the optional remote_write
+    # sink alongside the unconditional curve.
+    conditional_points: list[ConditionalForecastPoint] = field(default_factory=list)
+    conditional_deviation_points: list[ConditionalDeviationPoint] = field(default_factory=list)
+    conditional_curve: list[ForecastCurvePoint] = field(default_factory=list)
+    # Component decomposition emission. Per-(series, model, component)
+    # end-of-horizon snapshot rows for /metrics + per-step curve points
+    # for the optional remote_write sink (consumed by the stacked-area
+    # explainability dashboard).
+    component_points: list[ComponentDecompositionPoint] = field(default_factory=list)
+    component_curve: list[ForecastCurvePoint] = field(default_factory=list)
+    # Per-reason conditional-fit failure counter. Bumped on every fit
+    # that times out or raises; merged into ``ctx.failures`` so the
+    # operator sees them under ``forecast_failures_total`` with a
+    # bounded ``conditional_fit_*`` reason set.
+    conditional_failures: dict[str, int] = field(default_factory=dict)
+    # ``(model_name, reason)`` skip records the runner folds into the
+    # exporter's per-(model, reason) decomposition-skipped counter.
+    decomposition_skipped: list[tuple[str, str]] = field(default_factory=list)
     # Per-model forecast dataframes retained until after conformal
     # calibration so the capacity helpers can compute ETAs against the
     # *calibrated* bands (a calibration that widens a band should pull
@@ -258,6 +304,26 @@ class _RunContext:
     # only the current run's samples land on /metrics.
     threshold_etas: list[ThresholdEtaPoint] = field(default_factory=list)
     growth_rates: list[GrowthRatePoint] = field(default_factory=list)
+    # Will-breach predictive boolean gauges (per series/model/threshold/level).
+    will_breach_points: list[WillBreachPoint] = field(default_factory=list)
+    # Drain-ETA points (queue burn-down). Snapshot-style; preserves
+    # ``+Inf`` samples for the "queue is not draining" alert.
+    time_to_drain_points: list[TimeToDrainPoint] = field(default_factory=list)
+    # SLO error-budget snapshot rows accumulated this run.
+    error_budget_points: list[ErrorBudgetPoint] = field(default_factory=list)
+    # Recommended maintenance windows accumulated this run.
+    recommended_maintenance_window_points: list[RecommendedMaintenanceWindowPoint] = field(
+        default_factory=list
+    )
+    # Conditional forecast emission accumulators (snapshot rows +
+    # per-(model, level) deviation gauges + per-step curve for the sink).
+    conditional_points: list[ConditionalForecastPoint] = field(default_factory=list)
+    conditional_deviation_points: list[ConditionalDeviationPoint] = field(default_factory=list)
+    conditional_curve_points: list[ForecastCurvePoint] = field(default_factory=list)
+    # Per-(series, model, component) end-of-horizon decomposition rows
+    # + per-step curve for the sink.
+    component_points: list[ComponentDecompositionPoint] = field(default_factory=list)
+    component_curve_points: list[ForecastCurvePoint] = field(default_factory=list)
     # Per-query preprocessing statistics for the most recent run.
     preprocess_stats: dict[str, PreprocessStats] = field(default_factory=dict)
     # Per-(query, strategy) gap-fill count for this run; merged with the
@@ -815,6 +881,15 @@ class Runner:
                     contribution_points=ctx.contribution_points,
                     threshold_etas=ctx.threshold_etas,
                     growth_rates=ctx.growth_rates,
+                    will_breach_points=ctx.will_breach_points,
+                    time_to_drain_points=ctx.time_to_drain_points,
+                    error_budget_points=ctx.error_budget_points,
+                    recommended_maintenance_window_points=(
+                        ctx.recommended_maintenance_window_points
+                    ),
+                    conditional_points=ctx.conditional_points,
+                    conditional_deviation_points=ctx.conditional_deviation_points,
+                    component_points=ctx.component_points,
                     last_run_timestamp=time.time(),
                     run_duration_seconds=duration,
                     run_duration_per_query=dict(ctx.run_duration_per_query),
@@ -876,19 +951,22 @@ class Runner:
             # ``on_retry`` is bound to *this* group so transient retries
             # show up under the right label without the sink needing to
             # know about group identity.
-            if self._sink is not None and ctx.curve_points:
+            sink_payload = (
+                ctx.curve_points + ctx.conditional_curve_points + ctx.component_curve_points
+            )
+            if self._sink is not None and sink_payload:
 
                 def _record_sink_retry(reason: str) -> None:
                     self._exporter.increment_remote_write_retry(group.name, reason)
 
                 try:
-                    await self._sink.write(ctx.curve_points, on_retry=_record_sink_retry)
+                    await self._sink.write(sink_payload, on_retry=_record_sink_retry)
                 except SinkError as exc:
                     log.warning(
                         "remote_write_failed",
                         reason=exc.reason,
                         error=str(exc),
-                        points=len(ctx.curve_points),
+                        points=len(sink_payload),
                     )
                     self._exporter.increment_remote_write_failure(group.name, exc.reason)
                 except Exception as exc:
@@ -1695,6 +1773,57 @@ class Runner:
                 result=result,
                 offsets=offsets,
             )
+        # Component decomposition emission. Pure post-processing on the
+        # already-computed forecast frame, so it costs no extra model
+        # fits. Runs on every emitted (model, series) when
+        # ``emission.decompose`` is on; unsupported models log a skip
+        # counter rather than emit garbage.
+        if query.emission.decompose:
+            for ci in result.capacity_inputs:
+                self._emit_decomposition(
+                    group_name=group_name,
+                    query_id=query.id,
+                    forecast=ci.forecast,
+                    model_name=ci.model_name,
+                    selection=ci.selection,
+                    factory=factory,
+                    in_sample_values=list(frame.values),
+                    season_length=eff_season_length,
+                    result=result,
+                )
+
+        # Conditional forecast emission. Re-fits each emitted model with
+        # a regressors frame whose values are flat-held at the most
+        # recent observation — operators alert on the divergence from the
+        # *conditional* baseline ("is the actual unusual given current
+        # regressors") rather than the unconditional band. For built-in
+        # models that ignore the regressors parameter the conditional
+        # output equals the unconditional output; the family still emits
+        # so downstream alerts have a stable schema. The pass reuses the
+        # unconditional fit's conformal offsets + count-aware safeguard
+        # toggles so the two families never disagree on calibrated band
+        # width or clipping policy.
+        if query.emission.conditional:
+            cond_clip, cond_rounder = effective_emission_safeguards(query)
+            await self._emit_conditional_forecasts(
+                df=df,
+                query=query,
+                group_name=group_name,
+                model_specs=model_specs,
+                emitted_inputs=list(result.capacity_inputs),
+                actual=float(frame.values[-1]) if frame.values else float("nan"),
+                horizon=horizon,
+                freq=freq,
+                levels=levels,
+                season_length=eff_season_length,
+                regressors=regressors_frame,
+                factory=factory,
+                result=result,
+                offsets_by_model=offsets_by_model,
+                clip=cond_clip,
+                rounder=cond_rounder,
+            )
+
         # Free the retained per-model dataframes — they can be MB-scale,
         # and ``_RunContext`` retains them across the per-series loop.
         result.capacity_inputs.clear()
@@ -1982,8 +2111,21 @@ class Runner:
         """
         if forecast.empty:
             return
+        # Apply the conformal offsets once and reuse the calibrated frame
+        # for every consumer that reads ``yhat_upper_<level>`` /
+        # ``yhat_lower_<level>`` (threshold ETAs and the SLO budget
+        # projection). Without the cache a query with both ``thresholds:``
+        # and ``slo:`` pays the DataFrame ``.copy()`` twice per fit.
+        # ``_apply_offsets_to_threshold_eta_inputs`` short-circuits to the
+        # original frame when no calibration ran, so the common
+        # zero-offsets path stays zero-copy.
+        needs_calibrated_bands = bool(query.thresholds) or query.slo is not None
+        calibrated_df = (
+            _apply_offsets_to_threshold_eta_inputs(forecast, offsets, levels)
+            if needs_calibrated_bands
+            else forecast
+        )
         if query.thresholds:
-            calibrated_df = _apply_offsets_to_threshold_eta_inputs(forecast, offsets, levels)
             etas = capacity_mod.compute_threshold_etas(
                 forecast=calibrated_df,
                 thresholds=query.thresholds,
@@ -1993,6 +2135,25 @@ class Runner:
                 result.threshold_etas.extend(
                     factory.threshold_eta_points(model_name, etas, selection)
                 )
+                # The drain ETA family is the parallel emission for
+                # ``le_drain`` thresholds — ``threshold_eta_points``
+                # already filters them out so the two metric names
+                # don't collide. Routing happens in the factory so
+                # adding a future ``ge_fill`` (or similar) lands as
+                # one new dispatch line, not a fresh runner branch.
+                result.time_to_drain.extend(
+                    factory.time_to_drain_points(model_name, etas, selection)
+                )
+                # Derive the predictive will_breach gauge from the same
+                # ETA set so an alert on ``forecast_will_breach{...} == 1``
+                # is always self-consistent with the
+                # ``forecast_time_to_threshold_seconds`` numbers
+                # displayed alongside it.
+                breaches = capacity_mod.compute_will_breach(etas=etas, thresholds=query.thresholds)
+                if breaches:
+                    result.will_breach.extend(
+                        factory.will_breach_points(model_name, breaches, selection)
+                    )
         growth_cfg = query.emission.growth_rate
         if growth_cfg.enabled and growth_cfg.windows:
             windows_seconds = [w.total_seconds() for w in growth_cfg.windows]
@@ -2003,6 +2164,273 @@ class Runner:
             )
             if rates:
                 result.growth_rates.extend(factory.growth_rate_points(model_name, rates, selection))
+        # SLO error budget projection. Off unless ``slo:`` is configured
+        # on the query; uses the leading forecast row as "now" so the
+        # burn rate / exhausted-in match what an operator reading the
+        # current /metrics scrape would compute by hand. Reads
+        # ``yhat_upper_N`` from the *calibrated* frame so the per-level
+        # ``exhausted_in`` agrees with the band an operator queries via
+        # ``yhat_upper`` at the same labelset.
+        if query.slo is not None:
+            budget_samples = slo_mod.compute_budget(
+                forecast=calibrated_df,
+                slo=query.slo,
+                levels=levels,
+            )
+            if budget_samples:
+                result.error_budget.extend(
+                    factory.error_budget_points(model_name, budget_samples, selection)
+                )
+        # Recommended maintenance windows. Sweeps the lookahead for the
+        # top-N lowest-mean-load windows of the configured duration.
+        rw_cfg = query.recommended_windows
+        if rw_cfg.enabled:
+            windows = maintenance_mod.recommend_windows(forecast=forecast, config=rw_cfg)
+            if windows:
+                result.recommended_windows.extend(
+                    factory.recommended_maintenance_window_points(model_name, windows, selection)
+                )
+
+    def _emit_decomposition(
+        self,
+        *,
+        group_name: str,
+        query_id: str,
+        forecast: pd.DataFrame,
+        model_name: str,
+        selection: SelectionResult | None,
+        factory: SeriesPointFactory,
+        in_sample_values: list[float],
+        season_length: int,
+        result: _FitResult,
+    ) -> None:
+        """Project ``forecast`` into trend/seasonal/level/residual snapshot rows.
+
+        Pure post-processing on the already-computed forecast frame;
+        cost is bounded to a few hundred float operations per (series,
+        model). Models listed in
+        :data:`decomposition.NON_DECOMPOSABLE_MODELS` skip with
+        ``reason="unsupported_model"`` so operators see the no-op via
+        ``forecast_decomposition_skipped_total``. ``group_name`` /
+        ``query_id`` flow onto the skip counter so persistent skips
+        can be alerted per-query without log scraping.
+        """
+        if not decomposition_mod.is_decomposable(model_name):
+            result.decomposition_skipped.append((model_name, "unsupported_model"))
+            self._exporter.increment_decomposition_skipped(
+                group_name, query_id, model_name, "unsupported_model"
+            )
+            return
+        try:
+            decomposition = decomposition_mod.decompose(
+                forecast=forecast,
+                in_sample_values=in_sample_values,
+                season_length=season_length,
+            )
+        except decomposition_mod.DecompositionError as exc:
+            result.decomposition_skipped.append((model_name, exc.reason))
+            self._exporter.increment_decomposition_skipped(
+                group_name, query_id, model_name, exc.reason
+            )
+            return
+        if not decomposition.components:
+            result.decomposition_skipped.append((model_name, "components_unavailable"))
+            self._exporter.increment_decomposition_skipped(
+                group_name, query_id, model_name, "components_unavailable"
+            )
+            return
+        result.component_points.extend(
+            factory.component_points(
+                forecast=forecast,
+                model_name=model_name,
+                components=decomposition.components,
+                selection=selection,
+            )
+        )
+        result.component_curve.extend(
+            factory.component_curve_points(
+                forecast=forecast,
+                model_name=model_name,
+                components=decomposition.components,
+                selection=selection,
+            )
+        )
+
+    async def _emit_conditional_forecasts(
+        self,
+        *,
+        df: pd.DataFrame,
+        query: QueryConfig,
+        group_name: str,
+        model_specs: list[ModelSpec],
+        emitted_inputs: list[_CapacityInput],
+        actual: float,
+        horizon: int,
+        freq: str,
+        levels: list[int],
+        season_length: int,
+        regressors: pd.DataFrame | None,
+        factory: SeriesPointFactory,
+        result: _FitResult,
+        offsets_by_model: dict[str, dict[int, float]],
+        clip: bool,
+        rounder: bool,
+    ) -> None:
+        """Re-fit each emitted model with held-constant regressors.
+
+        The pass adds one fit per emitted (model, series) on top of the
+        regular fit, so the cost roughly doubles the forecast budget
+        for queries that opt in. See ``docs/conditional-forecasts.md``.
+
+        When ``regressors`` is None (no regressors configured), the
+        held-constant frame is also None and the re-fit produces the
+        same numbers as the unconditional pass — the family still emits
+        so dashboards and alerts can target it unconditionally.
+
+        ``offsets_by_model`` reuses the unconditional fit's conformal
+        offsets so the conditional bands carry the same calibration
+        widening as the unconditional ones — otherwise an operator
+        comparing the two would see different empirical-coverage
+        guarantees and infer something incorrect.
+
+        ``clip`` / ``rounder`` mirror the count-aware safeguards applied
+        to the unconditional emission, so a count-shaped query sees
+        consistent rounding/clipping on both families.
+
+        Per-fit failures bump ``forecast_failures_total`` with a
+        distinct ``conditional_fit_error`` / ``conditional_fit_timeout``
+        reason so the operator can tell which fit family is misbehaving
+        without log scraping.
+        """
+        conditional_regressors = _flatten_regressors_to_last_value(regressors)
+        spec_by_name = {spec.name: spec for spec in model_specs}
+        # Two short-circuits below skip the refit when it would be a
+        # waste of CPU:
+        #   1. No regressors configured at all -> the held-constant frame
+        #      is identical to the original input, so the conditional fit
+        #      would produce the same numbers.
+        #   2. The model advertises ``uses_regressors = False`` -> the
+        #      model's ``fit_predict`` ignores the regressors parameter,
+        #      so a refit with held-constant regressors produces the same
+        #      numbers as the unconditional fit.
+        # In both cases we alias the already-computed unconditional frame
+        # rather than burning a fresh fit. The family still emits so
+        # downstream alerts have a stable schema (the docs explicitly
+        # promise this for queries with no regressors).
+        no_regressors_configured = regressors is None
+        for ci in emitted_inputs:
+            model_name = ci.model_name
+            # The synthetic ``ensemble`` row in ensemble mode doesn't
+            # correspond to a registered model, so we can't re-fit it.
+            # Skip cleanly rather than papering over with a bad fit.
+            if model_name == "ensemble":
+                continue
+            spec = spec_by_name.get(model_name) or ModelSpec(name=model_name)
+            short_circuit = no_regressors_configured or not model_registry.uses_regressors(
+                model_name
+            )
+            if short_circuit:
+                # Alias the unconditional forecast — same numeric result
+                # the refit would produce, at zero extra CPU. No
+                # ``fit_duration`` is recorded for an aliased emission
+                # because no fit ran; the slow-fit counter likewise
+                # isn't touched. We *do* bump the operational
+                # ``forecast_conditional_aliased_total`` counter so
+                # operators can confirm the short-circuit is firing —
+                # a flat-zero counter means every conditional emission
+                # is paying the refit cost.
+                self._exporter.increment_conditional_aliased(group_name, query.id, model_name)
+                cond_forecast = ci.forecast
+            else:
+                t0 = time.monotonic()
+                try:
+                    cond_forecast = await self._fit_one(
+                        spec=spec,
+                        df=df,
+                        horizon=horizon,
+                        freq=freq,
+                        levels=levels,
+                        season_length=season_length,
+                        regressors=conditional_regressors,
+                    )
+                except TimeoutError:
+                    logger.warning(
+                        "conditional_fit_timeout",
+                        group=group_name,
+                        query=query.id,
+                        model=model_name,
+                    )
+                    result.conditional_failures["conditional_fit_timeout"] = (
+                        result.conditional_failures.get("conditional_fit_timeout", 0) + 1
+                    )
+                    continue
+                except Exception as exc:
+                    logger.warning(
+                        "conditional_fit_failed",
+                        group=group_name,
+                        query=query.id,
+                        model=model_name,
+                        error=str(exc),
+                    )
+                    result.conditional_failures["conditional_fit_error"] = (
+                        result.conditional_failures.get("conditional_fit_error", 0) + 1
+                    )
+                    continue
+                fit_seconds = time.monotonic() - t0
+                # Track the conditional fit's duration alongside the
+                # unconditional one so ``forecast_fit_duration_seconds``
+                # reports both. Without this the slow-fit counter would
+                # tick under ``model="X/conditional"`` but the gauge
+                # would be silently absent.
+                result.fit_durations[f"{model_name}/conditional"] = fit_seconds
+                self._record_slow_fit_if_needed(
+                    result=result,
+                    group=group_name,
+                    query_id=query.id,
+                    model_name=f"{model_name}/conditional",
+                    fit_seconds=fit_seconds,
+                )
+
+            # Reuse the unconditional offsets so the conditional bands
+            # carry the same empirical-coverage guarantee. ``offsets_by_model``
+            # may not contain ``model_name`` (no calibration ran or
+            # ensemble row), in which case the helper is a no-op.
+            model_offsets = offsets_by_model.get(model_name)
+            calibrated_df = _apply_offsets_to_threshold_eta_inputs(
+                cond_forecast, model_offsets, levels
+            )
+            # Apply count-aware safeguards to the dataframe columns so
+            # the snapshot rows, the sink curve, and the deviation
+            # gauges all see the same clipped/rounded values.
+            adjusted_df = _apply_safeguards_to_forecast_frame(
+                calibrated_df, levels=levels, clip=clip, rounder=rounder
+            )
+
+            result.conditional_points.extend(
+                factory.conditional_forecast_points(
+                    forecast=adjusted_df,
+                    model_name=model_name,
+                    selection=ci.selection,
+                )
+            )
+            # Stream the per-step conditional curve into the sink list so
+            # remote_write users see the same smooth curve they get for
+            # the unconditional family. The curve uses a parallel metric
+            # name family (``_forecast_conditional*``) so the two paths
+            # never collide on the TSDB side.
+            result.conditional_curve.extend(
+                factory.conditional_forecast_curve_points(
+                    adjusted_df, model_name, selection=ci.selection
+                )
+            )
+            if math.isfinite(actual):
+                result.conditional_deviation_points.extend(
+                    factory.conditional_deviation_points(
+                        forecast=adjusted_df,
+                        model_name=model_name,
+                        actual=actual,
+                    )
+                )
 
     async def _explicit_forecast(
         self,
@@ -2991,6 +3419,17 @@ def _merge_fit_into_ctx(ctx: _RunContext, fit_result: _FitResult, query_id: str)
     ctx.calibration_offsets.extend(fit_result.calibration_offsets)
     ctx.threshold_etas.extend(fit_result.threshold_etas)
     ctx.growth_rates.extend(fit_result.growth_rates)
+    ctx.will_breach_points.extend(fit_result.will_breach)
+    ctx.time_to_drain_points.extend(fit_result.time_to_drain)
+    ctx.error_budget_points.extend(fit_result.error_budget)
+    ctx.recommended_maintenance_window_points.extend(fit_result.recommended_windows)
+    ctx.conditional_points.extend(fit_result.conditional_points)
+    ctx.conditional_deviation_points.extend(fit_result.conditional_deviation_points)
+    ctx.conditional_curve_points.extend(fit_result.conditional_curve)
+    ctx.component_points.extend(fit_result.component_points)
+    ctx.component_curve_points.extend(fit_result.component_curve)
+    for reason, count in fit_result.conditional_failures.items():
+        ctx.failures[reason] = ctx.failures.get(reason, 0) + count
     for model_name, fit_seconds in fit_result.fit_durations.items():
         ctx.fit_durations[(query_id, model_name)] = fit_seconds
     for model_name in fit_result.slow_fits:
@@ -3065,6 +3504,29 @@ def _inherit_prior_for_skipped_queries(  # noqa: PLR0912
     for gpoint in prior.growth_rates:
         if _query_id_from_metric(gpoint.metric) not in run_query_ids:
             ctx.growth_rates.append(gpoint)
+    for wbpoint in prior.will_breach_points:
+        if _query_id_from_metric(wbpoint.metric) not in run_query_ids:
+            ctx.will_breach_points.append(wbpoint)
+    for drain_point in prior.time_to_drain_points:
+        if _query_id_from_metric(drain_point.metric) not in run_query_ids:
+            ctx.time_to_drain_points.append(drain_point)
+    for ebpoint in prior.error_budget_points:
+        if _query_id_from_metric(ebpoint.metric) not in run_query_ids:
+            ctx.error_budget_points.append(ebpoint)
+    # ``forecast_recommended_maintenance_window`` is a global metric
+    # name (no per-id prefix); use the ``id`` label to scope inheritance.
+    for rwpoint in prior.recommended_maintenance_window_points:
+        if rwpoint.labels.get("id") not in run_query_ids:
+            ctx.recommended_maintenance_window_points.append(rwpoint)
+    for cfpoint in prior.conditional_points:
+        if _query_id_from_metric(cfpoint.metric) not in run_query_ids:
+            ctx.conditional_points.append(cfpoint)
+    for cdpoint in prior.conditional_deviation_points:
+        if cdpoint.labels.get("id") not in run_query_ids:
+            ctx.conditional_deviation_points.append(cdpoint)
+    for compoint in prior.component_points:
+        if _query_id_from_metric(compoint.metric) not in run_query_ids:
+            ctx.component_points.append(compoint)
     # Per-(query, model) and per-query dicts that aren't counters.
     for (q_id, model_name), fit_seconds in prior.fit_durations.items():
         if q_id not in run_query_ids:
@@ -3092,6 +3554,99 @@ def _inherit_prior_for_skipped_queries(  # noqa: PLR0912
     for q_id, count in prior.series_count_per_query.items():
         if q_id not in run_query_ids:
             ctx.series_count_per_query[q_id] = count
+
+
+def _apply_safeguards_to_forecast_frame(
+    forecast: pd.DataFrame,
+    *,
+    levels: list[int],
+    clip: bool,
+    rounder: bool,
+) -> pd.DataFrame:
+    """Return a copy of ``forecast`` with count-aware safeguards applied.
+
+    Used by the conditional emission path so the snapshot points, the
+    sink curve, and the deviation gauges built from the same frame all
+    see the same clipped/rounded values. Counter bumps live with the
+    unconditional pass — the conditional emission re-uses the same fit
+    semantics and counting twice would double-charge the per-(query,
+    kind) total.
+
+    Uses numpy vectorisation so a typical horizon (288 rows by 5 columns
+    at default 2 levels) is one pass per column instead of 1440
+    Python-level float conversions.
+    """
+    if forecast.empty or not (clip or rounder):
+        return forecast
+    import numpy as np  # noqa: PLC0415
+    import pandas as pd  # noqa: PLC0415
+
+    out = forecast.copy()
+    cols = ["yhat"] + [
+        col for level in levels for col in (f"yhat_lower_{level}", f"yhat_upper_{level}")
+    ]
+    for col in cols:
+        if col not in out.columns:
+            continue
+        # Coerce to float so clip / round have well-defined semantics
+        # against pandas extension-array columns. ``errors="coerce"``
+        # turns non-numeric entries into NaN, which both numpy ops
+        # tolerate and propagate — matching the Python-loop version's
+        # behaviour of passing such entries through unchanged.
+        arr = pd.to_numeric(out[col], errors="coerce").to_numpy(dtype=float)
+        # Pre-record the NaN mask so non-finite inputs round-trip
+        # unchanged: ``np.round`` of NaN is NaN already, but clipping
+        # would turn NaN into 0.0 under naive ``np.maximum`` semantics —
+        # we restore NaN at the end so the contract matches the scalar
+        # ``_classify_emission_correction`` path.
+        nan_mask = ~np.isfinite(arr)
+        if clip:
+            # ``np.maximum`` preserves the input shape and dtype (unlike
+            # ``np.where`` whose typed return is multidim) — the column
+            # is 1-D so this is the right primitive here.
+            arr = np.maximum(arr, 0.0)
+        if rounder:
+            arr = np.round(arr)
+        if nan_mask.any():
+            arr[nan_mask] = np.nan
+        out[col] = arr
+    return out
+
+
+def _flatten_regressors_to_last_value(
+    regressors: pd.DataFrame | None,
+) -> pd.DataFrame | None:
+    """Return a copy of ``regressors`` whose every row equals the last row.
+
+    Implements the "held at current value" semantics of the conditional
+    forecast: each regressor column is replaced with a constant series
+    equal to its most recent in-sample value. Calendar features (which
+    legitimately vary per timestamp) are preserved through the same
+    flattening — the conditional contract is "imagine current state
+    continued unchanged", which by construction freezes the calendar as
+    well. Returns ``None`` when no regressors were configured so the
+    caller skips the re-fit's regressor argument cleanly.
+
+    Uses scalar broadcast (``flat[col] = scalar``) instead of building a
+    Python list per column so a wide regressor frame doesn't materialise
+    N copies of the same value through the heap. pandas treats the
+    scalar assignment as a constant broadcast and writes a single typed
+    array.
+    """
+    if regressors is None or regressors.empty:
+        return regressors
+    import pandas as pd  # noqa: PLC0415
+
+    last_row = regressors.iloc[-1]
+    flat = pd.DataFrame(index=regressors.index)
+    for col in regressors.columns:
+        if col == "ds":
+            flat[col] = regressors[col].to_numpy()
+            continue
+        # Scalar broadcast: pandas writes a constant array of the right
+        # dtype without allocating a Python list of N references.
+        flat[col] = last_row[col]
+    return flat
 
 
 def _series_key_from_labels(labels: dict[str, str]) -> str:
@@ -3122,7 +3677,16 @@ def _format_band_window(window: timedelta) -> str:
 _FORECAST_METRIC_SUFFIXES: tuple[str, ...] = (
     "_forecast_contribution_ratio",
     "_forecast_time_to_threshold_seconds",
+    "_forecast_time_to_drain_seconds",
+    "_forecast_error_budget_remaining_seconds",
+    "_forecast_error_budget_exhausted_in_seconds",
+    "_forecast_error_budget_burn_rate",
     "_forecast_growth_rate",
+    "_forecast_will_breach",
+    "_forecast_conditional_lower",
+    "_forecast_conditional_upper",
+    "_forecast_conditional",
+    "_forecast_component",
     "_forecast_lower",
     "_forecast_upper",
     "_forecast",

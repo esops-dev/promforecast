@@ -111,9 +111,9 @@ The official charts ship that combination on by default:
 - The **umbrella `promforecast-stack` chart** sets
   `promforecast.config.sink.remote_write.enabled: true` and
   `promforecast.serviceMonitor.enabled: true`. The forecaster's
-  ServiceMonitor (Story 2) then derives the snapshot drop from the
-  sink toggle automatically, so a fresh `helm install` lands on
-  sink+VM with the dual-source trap closed.
+  ServiceMonitor then derives the snapshot drop from the sink toggle
+  automatically, so a fresh `helm install` lands on sink+VM with the
+  dual-source trap closed.
 - The **standalone `promforecast` chart** exposes
   `serviceMonitor.dropForecastSnapshots` (default `null`). When
   `null` it resolves to the value of `config.sink.remote_write.enabled`:

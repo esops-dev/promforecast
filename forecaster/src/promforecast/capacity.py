@@ -26,15 +26,26 @@ from __future__ import annotations
 import math
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Literal
+
+from ._time_axis import seconds_from_start as _seconds_from_start
 
 if TYPE_CHECKING:
     import pandas as pd
 
     from .config import ThresholdConfig
 
-Comparator = Literal["gt", "lt"]
+Comparator = Literal["gt", "lt", "le_drain"]
 GrowthUnits = Literal["units_per_second", "percent"]
+
+# Comparators that emit the dedicated "queue is draining" ETA family
+# (``<id>_forecast_time_to_drain_seconds``) instead of the standard
+# threshold ETA. The drain family reports ``+inf`` on no-crossing —
+# operators alert with ``... == +Inf for 30m`` to catch "queue is not
+# actually draining". The lt/gt families report NaN on no-crossing
+# (dropped at render time) because the typical alert against them is
+# ``... < N`` and a missing sample is the right "no concern" signal.
+DRAIN_COMPARATORS: frozenset[str] = frozenset({"le_drain"})
 
 # Forecast frames smaller than this can't define a meaningful slope or
 # crossing — one row is a point, not a curve.
@@ -65,6 +76,66 @@ class GrowthRate:
     window_seconds: float
     units: GrowthUnits
     rate: float
+
+
+@dataclass(frozen=True)
+class WillBreach:
+    """0/1 predictive sample derived from an ETA + an ``alert_within`` window.
+
+    ``value`` is ``1.0`` when the threshold ETA is finite and below the
+    operator's ``alert_within`` lookahead, ``0.0`` otherwise. ``level`` is
+    ``None`` for the central forecast, a numeric level for band-edge
+    samples — same convention as :class:`ThresholdEta`.
+    """
+
+    name: str
+    severity: str
+    level: int | None
+    value: float
+
+
+def compute_will_breach(
+    *,
+    etas: list[ThresholdEta],
+    thresholds: list[ThresholdConfig],
+) -> list[WillBreach]:
+    """Project ``etas`` onto 0/1 will-breach samples for the configured thresholds.
+
+    Walks the (threshold, level) ETAs already produced by
+    :func:`compute_threshold_etas` and emits a :class:`WillBreach` for
+    each (threshold, level) whose threshold opted into the predictive
+    family (``alert_within`` + ``severity`` both set). ETAs whose
+    threshold did not opt in are skipped; non-finite ETAs (no crossing
+    in the horizon) emit ``0`` rather than being suppressed so an alert
+    on ``forecast_will_breach == 1`` has a stable zero-baseline series
+    to chart against.
+    """
+    if not etas or not thresholds:
+        return []
+    by_name = {
+        t.name: t for t in thresholds if t.alert_within is not None and t.severity is not None
+    }
+    if not by_name:
+        return []
+    out: list[WillBreach] = []
+    for eta in etas:
+        threshold = by_name.get(eta.name)
+        if threshold is None:
+            continue
+        # mypy: narrowed by ``by_name`` filter above.
+        assert threshold.alert_within is not None
+        assert threshold.severity is not None
+        window_seconds = threshold.alert_within.total_seconds()
+        value = 1.0 if math.isfinite(eta.seconds) and eta.seconds < window_seconds else 0.0
+        out.append(
+            WillBreach(
+                name=eta.name,
+                severity=threshold.severity,
+                level=eta.level,
+                value=value,
+            )
+        )
+    return out
 
 
 def compute_threshold_etas(
@@ -112,10 +183,17 @@ def compute_threshold_etas(
                 ),
             )
         )
-        # The conservative band side depends on the direction: for "above"
-        # crossings, the *upper* band tells you the earliest possible
-        # crossing; for "below", the *lower* band does.
-        band_side = "yhat_upper" if comparator == "gt" else "yhat_lower"
+        # The conservative band side depends on the direction:
+        # * ``gt`` (e.g. "disk fills"): ``yhat_upper`` reports the
+        #   earliest possible crossing.
+        # * ``lt`` (e.g. "free space drops below floor"):
+        #   ``yhat_lower`` reports the earliest possible crossing.
+        # * ``le_drain`` (e.g. "queue drains to zero from above"):
+        #   ``yhat_upper`` is the *latest* drain time — the conservative
+        #   answer when alerting on "queue is not draining". A drain
+        #   that uses the lower band would tell us the optimistic
+        #   answer, which is the opposite of what the alert needs.
+        band_side = "yhat_upper" if comparator in ("gt", "le_drain") else "yhat_lower"
         for level in levels:
             col = f"{band_side}_{level}"
             if col not in forecast.columns:
@@ -178,30 +256,6 @@ def compute_growth_rates(
     return out
 
 
-def _seconds_from_start(ds: pd.Series[Any]) -> list[float] | None:
-    """Return per-row seconds since the first timestamp, or None on failure.
-
-    Forecast rows always carry timestamps in monotonically increasing
-    order. We anchor at row 0 because the operator's mental model is
-    "ETA = time from now", and "now" is the moment the forecast was
-    issued.
-    """
-    if ds.empty:
-        return None
-    try:
-        start = ds.iloc[0]
-        start_ts = float(start.timestamp())
-    except (AttributeError, ValueError, TypeError):
-        return None
-    out: list[float] = []
-    for item in ds.tolist():
-        try:
-            out.append(float(item.timestamp()) - start_ts)
-        except (AttributeError, ValueError, TypeError):
-            return None
-    return out
-
-
 def _first_crossing(
     *,
     seconds: list[float],
@@ -209,7 +263,7 @@ def _first_crossing(
     threshold: float,
     comparator: Comparator,
 ) -> float:
-    """Return the seconds-from-start of the first crossing, or NaN.
+    """Return the seconds-from-start of the first crossing, or NaN / +Inf.
 
     A "crossing" is the first adjacent pair where the predicate (``> v``
     or ``< v``) flips from False to True. Linear interpolation between
@@ -217,12 +271,26 @@ def _first_crossing(
     behaviour operators expect from reading a continuous curve in
     Grafana. If the series starts already on the wrong side of the
     threshold, the ETA is 0.
+
+    The no-crossing sentinel depends on the comparator:
+
+    * ``gt`` / ``lt``: NaN (dropped at render time so an alert on
+      ``... < N`` doesn't silently match).
+    * ``le_drain``: ``+inf``. Operators alert on
+      ``... == +Inf for 30m`` to catch "queue is not draining" — the
+      sentinel must round-trip through Prometheus and stay queryable
+      rather than being filtered out at render time.
     """
     if not values or not seconds or len(values) != len(seconds):
-        return float("nan")
-    triggered: Callable[[float], bool] = (
-        (lambda v: v > threshold) if comparator == "gt" else (lambda v: v < threshold)
-    )
+        return _no_crossing_sentinel(comparator)
+    # ``gt`` and ``lt`` use strict inequality (a value exactly at the
+    # threshold is "approaching", not "crossed"). ``le_drain`` uses
+    # non-strict ``<=`` so a forecast that touches the drain value
+    # (e.g. a queue forecast that hits exactly zero) registers as
+    # drained — otherwise an already-empty queue would report
+    # ``+Inf`` "not draining" and the QueueNotDraining alert would
+    # fire on a healthy queue.
+    triggered = _triggered_for(comparator, threshold)
     if triggered(values[0]) and math.isfinite(values[0]):
         return 0.0
     for i in range(1, len(values)):
@@ -238,7 +306,43 @@ def _first_crossing(
             ratio = (threshold - prev_v) / span
             ratio = max(0.0, min(1.0, ratio))
             return seconds[i - 1] + ratio * (seconds[i] - seconds[i - 1])
-    return float("nan")
+    return _no_crossing_sentinel(comparator)
+
+
+def _triggered_for(comparator: Comparator, threshold: float) -> Callable[[float], bool]:
+    """Return the per-step predicate that decides "has the curve crossed?"
+
+    Strict inequality for ``gt`` / ``lt`` (a value exactly at the
+    threshold is approaching, not crossed). Non-strict ``<=`` for
+    ``le_drain`` so a queue forecast that lands exactly on the drain
+    value is recognised as drained.
+    """
+    if comparator == "gt":
+
+        def gt_predicate(v: float) -> bool:
+            return v > threshold
+
+        return gt_predicate
+    if comparator == "le_drain":
+
+        def le_predicate(v: float) -> bool:
+            return v <= threshold
+
+        return le_predicate
+
+    def lt_predicate(v: float) -> bool:
+        return v < threshold
+
+    return lt_predicate
+
+
+def _no_crossing_sentinel(comparator: Comparator) -> float:
+    """Sentinel value for a curve that never crosses ``threshold``.
+
+    Centralised so the two callers (the leading-row triggered? guard
+    and the loop exit) agree on which sentinel each comparator uses.
+    """
+    return float("inf") if comparator in DRAIN_COMPARATORS else float("nan")
 
 
 def _slope_over_window(

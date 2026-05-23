@@ -262,6 +262,30 @@ spec:
               expected to cross the configured ``warn`` threshold within
               4 hours. Right-size before SLO-impacting saturation.
 
+        # Predictive will-breach alert. Reads the boolean directly so the
+        # rule stays a one-liner — the heavy lifting (ETA + alert_within
+        # comparison) is done by the forecaster. Pin ``level="95"`` so the
+        # rule fires once per series on the conservative band; the
+        # corresponding ``forecast_time_to_threshold_seconds`` value at the
+        # same labelset is the operator-visible "when" for the breach.
+        - alert: ForecastWillBreach
+          expr: |
+            node_filesystem_avail_bytes_forecast_will_breach{
+              severity="critical", level="95"
+            } == 1
+          for: 10m
+          labels:
+            severity: critical
+          annotations:
+            summary: "{{ $labels.instance }}{{ $labels.mountpoint }} will breach within the configured alert_within window"
+            description: |
+              {{ $labels.id }} for {{ $labels.instance }}
+              {{ $labels.mountpoint }} (95% band) is predicted to cross the
+              ``{{ $labels.name }}`` threshold inside the configured
+              ``alert_within`` window. Cross-reference
+              ``forecast_time_to_threshold_seconds`` at the same label set
+              for the exact ETA.
+
         # Growth-rate-change alert. Compares the 1d window slope
         # against the 7d baseline; magnitudes are kept absolute so the
         # alert catches sudden *deceleration* of a free-space metric
@@ -288,3 +312,95 @@ spec:
               ({{ $labels.mountpoint }}) is more than 3x the 7-day
               baseline. Investigate whether a workload change or leak is
               driving accelerated consumption.
+
+    - name: promforecast.slo.examples
+      interval: 1m
+      rules:
+        # SLO error budget will be exhausted at the current burn rate.
+        # Generic template aligned with the SRE workbook's burn-rate
+        # alerts — pair short / long windows on a single query to get
+        # multi-window/multi-burn-rate coverage. The example here uses
+        # a single 30d window; a real deployment would also configure
+        # 5m and 1h windows on the same query and alert on each.
+        - alert: SLOBudgetExhaustingSoon
+          expr: |
+            http_request_error_ratio_forecast_error_budget_exhausted_in_seconds{
+              window="30d"
+            } < 86400
+          for: 1h
+          labels:
+            severity: critical
+          annotations:
+            summary: "{{ $labels.id }} 30d error budget projected to exhaust in <24h"
+            description: |
+              At the predicted burn rate, the configured 30d error
+              budget for {{ $labels.id }} will be consumed within 24
+              hours. Investigate the source of elevated errors and
+              consider whether to slow the error rate or accept the
+              budget overrun.
+
+        # Fast burn — the predicted rate is multiples of the
+        # sustainable rate. ``burn_rate > 14.4`` corresponds to "the
+        # entire 30d budget would be exhausted in 2 days at this
+        # rate"; tune for your SLO and on-call sensitivity.
+        - alert: SLOFastBurn
+          expr: |
+            http_request_error_ratio_forecast_error_budget_burn_rate{
+              window="30d"
+            } > 14.4
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: "{{ $labels.id }} burning the 30d error budget at >14.4x sustainable rate"
+            description: |
+              At the predicted burn rate for {{ $labels.id }}, the
+              monthly budget would be consumed in roughly 2 days.
+              Cross-reference with ``..._exhausted_in_seconds`` for the
+              projected exhaustion time.
+
+    - name: promforecast.queue.examples
+      interval: 1m
+      rules:
+        # Queue is not actually draining — the projected curve is flat
+        # or growing, so the drain ETA is +Inf. Without this rule a
+        # stuck consumer is invisible because alerts on
+        # ``forecast_time_to_drain_seconds < N`` silently never match.
+        - alert: QueueNotDraining
+          expr: |
+            kafka_consumer_lag_forecast_time_to_drain_seconds{
+              name="drained"
+            } == +Inf
+          for: 30m
+          labels:
+            severity: warning
+          annotations:
+            summary: "{{ $labels.id }} is not projected to drain within the horizon"
+            description: |
+              The forecast for {{ $labels.id }} predicts no crossing
+              below the configured drain threshold within the horizon
+              — the queue is not actually being worked off. Check
+              consumer health and parallelism.
+
+        # Drain projected to happen far in the future. Useful as an
+        # early-warning alert on a backlog that *will* eventually
+        # drain but not before SLAs are at risk.
+        - alert: QueueDrainSlow
+          expr: |
+            kafka_consumer_lag_forecast_time_to_drain_seconds{
+              name="drained"
+            } > 4 * 60 * 60
+            and
+            kafka_consumer_lag_forecast_time_to_drain_seconds{
+              name="drained"
+            } != +Inf
+          for: 30m
+          labels:
+            severity: info
+          annotations:
+            summary: "{{ $labels.id }} projected to take >4h to drain"
+            description: |
+              The forecast for {{ $labels.id }} predicts a drain ETA
+              above 4h. The queue is being worked off, but the
+              backlog is too large to clear before downstream SLAs
+              are at risk. Add consumer capacity or shed load.

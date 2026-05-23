@@ -122,6 +122,7 @@ class _IntermittentBase:
     """
 
     name: ClassVar[str] = ""
+    uses_regressors: ClassVar[bool] = False
 
     def __init__(self, season_length: int = 288, **params: Any) -> None:
         # ``season_length`` is part of the registry-side contract — every

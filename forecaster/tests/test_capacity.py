@@ -10,6 +10,7 @@ import pandas as pd
 from promforecast.capacity import (
     compute_growth_rates,
     compute_threshold_etas,
+    compute_will_breach,
 )
 from promforecast.config import ThresholdConfig
 
@@ -162,3 +163,188 @@ def test_growth_rate_skips_no_windows() -> None:
     df = _forecast_frame([1.0, 2.0])
     rates = compute_growth_rates(forecast=df, windows_seconds=[], units="units_per_second")
     assert rates == []
+
+
+def test_will_breach_fires_when_eta_below_window() -> None:
+    """A finite ETA below ``alert_within`` flips the gauge to 1."""
+    # values 0, 50, 100 at t=0,60,120 → threshold 75 crosses at 90s.
+    df = _forecast_frame([0.0, 50.0, 100.0])
+    threshold = ThresholdConfig(
+        name="warn",
+        value=75.0,
+        comparator="gt",
+        alert_within=timedelta(seconds=120),
+        severity="critical",
+    )
+    etas = compute_threshold_etas(forecast=df, thresholds=[threshold], levels=[])
+    breaches = compute_will_breach(etas=etas, thresholds=[threshold])
+    assert len(breaches) == 1
+    assert breaches[0].value == 1.0
+    assert breaches[0].severity == "critical"
+    assert breaches[0].level is None
+
+
+def test_will_breach_quiet_when_eta_above_window() -> None:
+    """A finite ETA above ``alert_within`` emits a 0 (zero-baseline series)."""
+    df = _forecast_frame([0.0, 50.0, 100.0])
+    threshold = ThresholdConfig(
+        name="warn",
+        value=75.0,
+        comparator="gt",
+        alert_within=timedelta(seconds=30),  # crossing at 90s is well above 30s
+        severity="warning",
+    )
+    etas = compute_threshold_etas(forecast=df, thresholds=[threshold], levels=[])
+    breaches = compute_will_breach(etas=etas, thresholds=[threshold])
+    assert len(breaches) == 1
+    assert breaches[0].value == 0.0
+
+
+def test_will_breach_emits_zero_when_no_crossing() -> None:
+    """NaN ETA = no crossing in horizon — emit 0 so the series exists."""
+    df = _forecast_frame([10.0, 20.0, 30.0])
+    threshold = ThresholdConfig(
+        name="warn",
+        value=100.0,
+        comparator="gt",
+        alert_within=timedelta(seconds=120),
+        severity="warning",
+    )
+    etas = compute_threshold_etas(forecast=df, thresholds=[threshold], levels=[])
+    breaches = compute_will_breach(etas=etas, thresholds=[threshold])
+    assert len(breaches) == 1
+    assert breaches[0].value == 0.0
+
+
+def test_will_breach_skips_thresholds_without_alert_within() -> None:
+    """Thresholds without ``alert_within`` produce no will-breach samples."""
+    df = _forecast_frame([0.0, 50.0, 100.0])
+    threshold = ThresholdConfig(name="warn", value=75.0, comparator="gt")
+    etas = compute_threshold_etas(forecast=df, thresholds=[threshold], levels=[])
+    breaches = compute_will_breach(etas=etas, thresholds=[threshold])
+    assert breaches == []
+
+
+def test_drain_eta_returns_inf_on_no_crossing() -> None:
+    """``le_drain`` returns +Inf — operators alert on ``... == +Inf for 30m``.
+
+    The distinction from ``lt`` matters: ``lt`` returns NaN (dropped at
+    render time) so an alert like ``time_to_threshold < N`` doesn't
+    silently match every series; ``le_drain``'s NaN-equivalent has to
+    round-trip through Prometheus and stay queryable as ``+Inf``.
+    """
+    # Forecast stays well above 0 the whole horizon → no drain crossing.
+    df = _forecast_frame([10.0, 12.0, 15.0])
+    out = compute_threshold_etas(
+        forecast=df,
+        thresholds=[ThresholdConfig(name="drained", value=0.0, comparator="le_drain")],
+        levels=[],
+    )
+    assert len(out) == 1
+    assert math.isinf(out[0].seconds)
+
+
+def test_drain_eta_emits_finite_when_curve_crosses_from_above() -> None:
+    """A draining queue → finite ETA on the first crossing-from-above."""
+    # 100 → 50 → 0 → -10 at 60s step. Threshold value=0 crossed between
+    # step 1 (50) and step 2 (0). Linear interp: at exactly the boundary.
+    df = _forecast_frame([100.0, 50.0, 0.0, -10.0])
+    out = compute_threshold_etas(
+        forecast=df,
+        thresholds=[ThresholdConfig(name="drained", value=0.0, comparator="le_drain")],
+        levels=[],
+    )
+    assert math.isfinite(out[0].seconds)
+    assert out[0].seconds > 0
+
+
+def test_drain_band_uses_yhat_upper() -> None:
+    """The conservative drain band is ``yhat_upper`` — the *latest* drain.
+
+    Alerts ask "queue still not draining" — the conservative answer is
+    the latest predicted drain. ``yhat_upper`` is a larger queue depth
+    that crosses zero later than ``yhat`` does.
+    """
+    # Central drains by step 2; yhat_upper still positive at step 2.
+    df = _forecast_frame([100.0, 50.0, 0.0, -10.0])
+    df["yhat_upper_95"] = [120.0, 80.0, 20.0, -5.0]
+    df["yhat_lower_95"] = [80.0, 20.0, -10.0, -15.0]
+    out = compute_threshold_etas(
+        forecast=df,
+        thresholds=[ThresholdConfig(name="drained", value=0.0, comparator="le_drain")],
+        levels=[95],
+    )
+    point = next(e for e in out if e.level is None)
+    band = next(e for e in out if e.level == 95)
+    # yhat_upper drains later than yhat → band ETA strictly greater.
+    assert band.seconds > point.seconds
+
+
+def test_drain_eta_zero_when_already_drained() -> None:
+    """A forecast that starts below the threshold reads as already-drained (ETA=0)."""
+    df = _forecast_frame([-5.0, -10.0, -15.0])
+    out = compute_threshold_etas(
+        forecast=df,
+        thresholds=[ThresholdConfig(name="drained", value=0.0, comparator="le_drain")],
+        levels=[],
+    )
+    assert out[0].seconds == 0.0
+
+
+def test_drain_eta_zero_when_forecast_exactly_at_threshold() -> None:
+    """A forecast that *equals* the drain value is drained (predicate is ``<=``).
+
+    Regression guard: a queue forecast that touches zero exactly used to
+    report ``+Inf`` "not draining" because the predicate was strict
+    ``<``. The fix is to use ``<=`` for ``le_drain`` so the alert
+    doesn't fire on a healthy zero-queue.
+    """
+    df = _forecast_frame([0.0, 0.0, 0.0])
+    out = compute_threshold_etas(
+        forecast=df,
+        thresholds=[ThresholdConfig(name="drained", value=0.0, comparator="le_drain")],
+        levels=[],
+    )
+    assert out[0].seconds == 0.0
+    assert not math.isinf(out[0].seconds)
+
+
+def test_drain_eta_still_inf_for_lt_predicate_at_threshold() -> None:
+    """``lt`` keeps strict ``<`` semantics — at-threshold is *not* a crossing.
+
+    Pairs with ``test_drain_eta_zero_when_forecast_exactly_at_threshold``
+    to assert the predicate split: ``le_drain`` is ``<=``, ``lt`` stays
+    ``<``. Without this guard a refactor that unifies the two predicates
+    would silently change ``lt`` semantics.
+    """
+    df = _forecast_frame([0.0, 0.0, 0.0])
+    out = compute_threshold_etas(
+        forecast=df,
+        thresholds=[ThresholdConfig(name="floor", value=0.0, comparator="lt")],
+        levels=[],
+    )
+    assert math.isnan(out[0].seconds)
+
+
+def test_will_breach_emits_per_level_row() -> None:
+    """Per-level ETAs produce per-level will-breach rows distinguished by level."""
+    df = _forecast_frame([10.0, 50.0, 60.0])
+    df["yhat_upper_80"] = [20.0, 70.0, 100.0]
+    df["yhat_lower_80"] = [0.0, 30.0, 20.0]
+    threshold = ThresholdConfig(
+        name="warn",
+        value=55.0,
+        comparator="gt",
+        # Point ETA ~90s; band ETA (yhat_upper) ~42s — pick a window that
+        # excludes the point but includes the band, so the two rows
+        # disagree and we can prove the level distinction.
+        alert_within=timedelta(seconds=60),
+        severity="critical",
+    )
+    etas = compute_threshold_etas(forecast=df, thresholds=[threshold], levels=[80])
+    breaches = compute_will_breach(etas=etas, thresholds=[threshold])
+    assert len(breaches) == 2
+    point = next(b for b in breaches if b.level is None)
+    band = next(b for b in breaches if b.level == 80)
+    assert point.value == 0.0
+    assert band.value == 1.0

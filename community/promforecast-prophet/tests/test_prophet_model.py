@@ -241,6 +241,78 @@ def _patched_entry_points(group: str = "") -> Any:
     return [*real, _StubEP()]
 
 
+def test_prophet_advertises_uses_regressors_true() -> None:
+    """Prophet's ``fit_predict`` actually consumes the ``regressors`` frame
+    (the wrapper registers each column via ``add_regressor`` and merges
+    it into the future frame). The forecaster's conditional-emission
+    path reads the ``uses_regressors`` class attribute to decide whether
+    to refit with held-constant regressors; Prophet must advertise
+    ``True`` so the refit actually happens.
+    """
+    assert ProphetModel.uses_regressors is True
+
+
+def test_prophet_uses_regressors_flag_via_registry_helper() -> None:
+    """Through the registry helper too — the forecaster reads
+    ``model_registry.uses_regressors(name)`` rather than reaching for
+    the class attribute directly. Verify the discovery + lookup path
+    agrees end-to-end.
+    """
+    from promforecast import models as registry  # noqa: PLC0415
+
+    registry.refresh()
+    try:
+        with patch("promforecast.models.entry_points", _patched_entry_points):
+            registry.refresh()
+            assert registry.uses_regressors("Prophet") is True
+    finally:
+        registry.refresh()
+
+
+def test_prophet_legitimately_differs_when_regressors_held_constant() -> None:
+    """End-to-end: the conditional refit path must produce different bands
+    when the regressors frame is flat-held vs. the original input.
+
+    The fake Prophet uses ``regressors[regressor_name].iloc[-1]`` as a
+    proxy for "the regressor's current value"; in our flat-held
+    contract every row of the conditional frame equals the in-sample
+    final value, so the post-fit predicted yhat tracks that value. We
+    confirm the wrapper preserves the regressors all the way through —
+    so the conditional refit really does see the held-constant frame —
+    by inspecting the per-instance ``add_regressor`` calls and the
+    fitted dataframe's regressor column.
+    """
+    df = _make_df()
+    # Two distinct configurations of the same regressor column:
+    #   (a) varying — the "unconditional" input the model would see
+    #       under a real fit.
+    #   (b) flat-held — every row pinned to the last observed value,
+    #       matching what the runner's
+    #       ``_flatten_regressors_to_last_value`` produces.
+    varying = pd.DataFrame({"ds": df["ds"], "deploys": [float(i % 5) for i in range(len(df))]})
+    held = pd.DataFrame({"ds": df["ds"], "deploys": [varying["deploys"].iloc[-1]] * len(df)})
+
+    ProphetModel().fit_predict(df=df, horizon=3, freq="h", levels=[80], regressors=varying)
+    unconditional_inst = _FakeProphet.instances[-1]
+    assert unconditional_inst.fit_df is not None
+    # The fit frame has the varying regressor merged in.
+    assert "deploys" in unconditional_inst.fit_df.columns
+    assert list(unconditional_inst.fit_df["deploys"]) == list(varying["deploys"])
+
+    _FakeProphet.instances.clear()
+    ProphetModel().fit_predict(df=df, horizon=3, freq="h", levels=[80], regressors=held)
+    conditional_inst = _FakeProphet.instances[-1]
+    assert conditional_inst.fit_df is not None
+    # The flat-held frame is what the conditional refit feeds Prophet.
+    # Every row equals the last value so the regressor effect is
+    # "frozen at the current state".
+    deploys_in_fit = list(conditional_inst.fit_df["deploys"])
+    assert deploys_in_fit == [held["deploys"].iloc[-1]] * len(df)
+    # Both fits add the regressor — the wrapper isn't accidentally
+    # silencing the regressor on the conditional pass.
+    assert conditional_inst.regressors == ["deploys"]
+
+
 def test_prophet_appears_in_promforecast_registry_via_entry_point() -> None:
     """End-to-end: once the package is installed, ``Prophet`` becomes a
     valid model name in promforecast configs without any forecaster-side

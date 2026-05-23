@@ -51,6 +51,7 @@ def cli() -> None:
             config_path=args.config,
             dry_run=args.dry_run,
             datasource_url_override=args.datasource_url,
+            strict_cardinality=args.strict_cardinality,
         )
         sys.exit(rc)
 
@@ -143,6 +144,16 @@ def _build_parser() -> argparse.ArgumentParser:
         help=(
             "Override datasource.url for the dry-run sample query. Useful "
             "when the production URL is unreachable from CI."
+        ),
+    )
+    validate_p.add_argument(
+        "--strict-cardinality",
+        action="store_true",
+        help=(
+            "Fail (exit 1) when the projected cardinality estimate exceeds "
+            "safety.max_total_series instead of emitting an advisory WARN. "
+            "Use in CI to reject configs whose opt-in emission would blow "
+            "the global series cap. See docs/operations/cardinality.md."
         ),
     )
 

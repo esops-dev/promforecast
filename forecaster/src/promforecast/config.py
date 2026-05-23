@@ -375,13 +375,114 @@ class ThresholdConfig(BaseModel):
     so capacity ETAs are conservative at the upper band — "disk fills
     no later than 24h from now" rather than "the central forecast hits
     full in 24h".
+
+    ``alert_within`` + ``severity`` opt the threshold into the
+    ``<id>_forecast_will_breach`` predictive boolean: a derived 0/1 gauge
+    that fires when the time-to-threshold ETA is below ``alert_within``.
+    Both fields are required together (one without the other is
+    rejected at load time) — the predictive metric is a derived shape and
+    cannot be partially configured.
+
+    The ``le_drain`` comparator targets the queue-burn-down case. It
+    differs from ``lt`` along four axes:
+
+    * ``v <= threshold`` predicate (non-strict) so a forecast at exactly
+      the drain value (e.g. queue lands on zero) registers as drained.
+    * No-crossing sentinel is ``+Inf`` (rather than NaN) so the
+      ``forecast_time_to_drain_seconds == +Inf for 30m`` alert can match
+      "queue is not actually draining".
+    * Band side picks ``yhat_upper`` (the *latest* drain — the
+      conservative answer when alerting on stuck queues).
+    * Emitted under ``<id>_forecast_time_to_drain_seconds`` instead of
+      ``..._time_to_threshold_seconds`` so the two families never
+      collide on the same query.
+
+    ``le_drain`` thresholds **must not** carry ``alert_within`` /
+    ``severity``: the derived ``forecast_will_breach`` gauge fires when
+    the ETA is small, which for a drain means "queue will drain soon"
+    — the opposite of a "predictive breach". The combination is
+    rejected at config-load time so the meaning of will_breach stays
+    unambiguous.
     """
 
     model_config = ConfigDict(extra="forbid")
 
     name: str
     value: float
-    comparator: Literal["gt", "lt"] = "gt"
+    comparator: Literal["gt", "lt", "le_drain"] = "gt"
+    alert_within: Duration | None = None
+    severity: Literal["warning", "critical"] | None = None
+
+
+class SLOConfig(BaseModel):
+    """Per-query SLO error-budget forecasting block.
+
+    Off-by-default. When configured on a query whose forecast represents
+    an error rate (fraction of failing requests, fraction of time in
+    error), the forecaster emits three derived families per configured
+    window:
+
+    * ``<id>_forecast_error_budget_remaining_seconds{window}`` — the
+      static allowed-error budget for the window
+      (``(1 - objective/100) * window``).
+    * ``<id>_forecast_error_budget_burn_rate{window}`` — the predicted
+      consumption rate divided by the allowed rate. ``1.0`` means
+      "consuming at exactly the budget-exhausting rate".
+    * ``<id>_forecast_error_budget_exhausted_in_seconds{window[, level]}`` —
+      projected seconds until cumulative consumption at the forecast's
+      current rate exhausts the budget. Central row carries no
+      ``level``; band rows use ``yhat_upper`` (the conservative side —
+      a higher predicted rate exhausts sooner).
+
+    Aligns with the SRE workbook's multi-window/multi-burn-rate
+    pattern: pair short and long ``windows`` (e.g. ``[5m, 1h, 30d]``)
+    and alert on the burn rate against each.
+
+    Cardinality multiplier ``N_windows * (N_levels + 1)`` per opted-in
+    query, counted by ``promforecast validate``.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    # Objective is the SLO target as a percentage in (0, 100): 99.9
+    # means "allow 0.1% errors". The bounds exclude both endpoints so a
+    # config can't accidentally request "100% success" (zero budget,
+    # divide-by-zero on burn rate) or "0% success" (every observation
+    # is an error, budget meaningless).
+    objective: float = Field(gt=0.0, lt=100.0)
+    windows: list[Duration] = Field(default_factory=lambda: [timedelta(days=30)])
+
+
+class RecommendedWindowsConfig(BaseModel):
+    """Maintenance-window recommendation block.
+
+    Off-by-default. When configured, the forecaster sweeps the next
+    ``lookahead`` of the forecast horizon for the lowest-predicted-load
+    windows of ``duration`` and emits a single ranked family —
+    ``forecast_recommended_maintenance_window{id, group, rank,
+    duration_seconds, start_timestamp_seconds}`` — whose value is the
+    mean predicted load within that window. Rank 1 is the best
+    (lowest-load) window; subsequent ranks are emitted up to ``count``.
+
+    The forecast already has all the data; this turns the "stare at a
+    weekly seasonality panel at 11 PM" decision into a config-knob
+    emission family operators can pin to a Grafana panel or feed into
+    a workflow.
+
+    Cardinality multiplier ``count`` per opted-in query — bounded by
+    construction. The ``start_timestamp_seconds`` label churns each
+    refresh (different windows become available as time moves
+    forward); operators on retention-sensitive TSDBs can drop the label
+    via ``metric_relabel_configs`` if the churn outpaces their
+    retention without losing the metric's value.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    duration: Duration = timedelta(minutes=30)
+    lookahead: Duration = timedelta(hours=48)
+    count: int = Field(default=3, ge=1)
 
 
 class GrowthRateEmissionConfig(BaseModel):
@@ -459,7 +560,7 @@ class BandCoverageConfig(BaseModel):
 class QueryEmissionConfig(BaseModel):
     """Per-query emission toggles.
 
-    Today five families of settings live here:
+    Today six families of settings live here:
 
     * :class:`GrowthRateEmissionConfig` — forecast growth-rate metric.
     * ``clip_non_negative`` and ``round_to_integer`` — count-aware
@@ -468,6 +569,8 @@ class QueryEmissionConfig(BaseModel):
       drift telemetry.
     * :class:`BandCoverageConfig` — empirical band coverage rolling
       gauges.
+    * ``conditional`` — parallel ``<id>_forecast_conditional*`` family
+      that re-runs the fit with regressors held at their current value.
 
     Every family is kept on the per-query :class:`EmissionConfig` block so
     operators opt in *per metric*: a config that mixes a count-valued
@@ -481,6 +584,14 @@ class QueryEmissionConfig(BaseModel):
     An operator who wants the count profile but explicit continuous
     emission still gets the override by setting the toggle to ``False``
     directly.
+
+    ``conditional`` is off by default. When on, the runner re-fits every
+    emitted model with a regressors frame whose values are flat-held at
+    the most recent observation. Models that ignore the regressors
+    parameter (the built-in ARIMA/ETS/SeasonalNaive wrappers) produce
+    a conditional forecast equal to the unconditional one — the family
+    still emits so downstream alerts have a stable schema; regressor-aware
+    models register additional gain.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -490,6 +601,12 @@ class QueryEmissionConfig(BaseModel):
     round_to_integer: bool | None = None
     drift: DriftEmissionConfig = Field(default_factory=DriftEmissionConfig)
     band_coverage: BandCoverageConfig = Field(default_factory=BandCoverageConfig)
+    conditional: bool = False
+    # Component decomposition emission (trend/seasonal/level/residual). Off by
+    # default; opt-in per query because decomposition adds N_components rows
+    # per (series, model) per horizon step. See `models.py` for which models
+    # actually decompose; non-decomposable models bump a skip counter.
+    decompose: bool = False
 
 
 class ColdStartBorrowConfig(BaseModel):
@@ -594,6 +711,11 @@ class QueryConfig(BaseModel):
     emission: QueryEmissionConfig = Field(default_factory=QueryEmissionConfig)
     data_profile: Literal["intermittent", "count", "continuous"] | None = None
     cold_start: ColdStartConfig = Field(default_factory=ColdStartConfig)
+    # Per-query SLO error-budget forecasting. ``None`` (default) skips
+    # the family entirely; set the block to opt in. See :class:`SLOConfig`.
+    slo: SLOConfig | None = None
+    # Per-query maintenance-window recommendation. Off by default.
+    recommended_windows: RecommendedWindowsConfig = Field(default_factory=RecommendedWindowsConfig)
     # Per-query refresh override. When ``None`` (default) the query
     # inherits ``server.refresh_interval`` from its group. Setting it
     # explicitly schedules an independent timer for this query, so a
@@ -1100,6 +1222,32 @@ def _validate_query_overrides(*, group_name: str, query: QueryConfig) -> None:  
                 "each threshold name must be unique within a query"
             )
         threshold_names.add(threshold.name)
+        has_alert_within = threshold.alert_within is not None
+        has_severity = threshold.severity is not None
+        if has_alert_within != has_severity:
+            raise ValueError(
+                f"{label}.thresholds[{threshold.name}]: alert_within and severity "
+                "must be set together (the will_breach metric is a derived shape "
+                "and cannot be partially configured)"
+            )
+        if threshold.alert_within is not None and threshold.alert_within.total_seconds() <= 0:
+            raise ValueError(
+                f"{label}.thresholds[{threshold.name}]: alert_within must be a positive duration"
+            )
+        # The will_breach gauge derives ``1`` from "ETA is finite and
+        # below alert_within". For a drain threshold the ETA shrinks as
+        # the queue drains faster — so will_breach would fire on a
+        # *healthy* fast-draining queue, the opposite of its
+        # "predictive breach" meaning. Reject the combination at
+        # load-time rather than emitting metrics whose meaning depends
+        # on the comparator.
+        if threshold.comparator == "le_drain" and has_alert_within:
+            raise ValueError(
+                f"{label}.thresholds[{threshold.name}]: alert_within + severity are not "
+                "supported on le_drain thresholds; the will_breach gauge would invert "
+                "(it would fire on a queue draining quickly). Use the +Inf-anchored "
+                "QueueNotDraining-style alert on forecast_time_to_drain_seconds instead."
+            )
     _validate_cold_start(label=label, query=query)
     growth = query.emission.growth_rate
     if growth.enabled:
@@ -1130,6 +1278,47 @@ def _validate_query_overrides(*, group_name: str, query: QueryConfig) -> None:  
                 )
     if query.refresh_interval is not None and query.refresh_interval.total_seconds() <= 0:
         raise ValueError(f"{label}.refresh_interval must be a positive duration")
+    _validate_slo(label=label, query=query)
+    _validate_recommended_windows(label=label, query=query)
+
+
+def _validate_slo(*, label: str, query: QueryConfig) -> None:
+    """Semantic checks for the SLO block of a query.
+
+    The numeric bounds on ``objective`` are enforced by pydantic; this
+    helper validates the per-window durations and the relationship
+    between windows and the forecast horizon. Failing at load time
+    means an over-budget config never reaches the runner.
+    """
+    if query.slo is None:
+        return
+    if not query.slo.windows:
+        raise ValueError(f"{label}.slo: at least one window is required")
+    for window in query.slo.windows:
+        if window.total_seconds() <= 0:
+            raise ValueError(f"{label}.slo.windows: must be positive durations")
+
+
+def _validate_recommended_windows(*, label: str, query: QueryConfig) -> None:
+    """Semantic checks for the recommended-windows block of a query.
+
+    The duration must fit inside the lookahead and ``count`` must be
+    positive (pydantic enforces ``count >= 1``; we still guard against
+    a non-positive ``duration`` or ``lookahead`` slipping through).
+    """
+    rw = query.recommended_windows
+    if not rw.enabled:
+        return
+    if rw.duration.total_seconds() <= 0:
+        raise ValueError(f"{label}.recommended_windows.duration must be a positive duration")
+    if rw.lookahead.total_seconds() <= 0:
+        raise ValueError(f"{label}.recommended_windows.lookahead must be a positive duration")
+    if rw.duration > rw.lookahead:
+        raise ValueError(
+            f"{label}.recommended_windows.duration ({rw.duration}) must be <= "
+            f"lookahead ({rw.lookahead}); a window longer than the lookahead "
+            "can never be recommended."
+        )
 
 
 def _validate_cold_start(*, label: str, query: QueryConfig) -> None:

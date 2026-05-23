@@ -325,6 +325,83 @@
         },
         "overrides": []
       }
+    },
+    {
+      "type": "table",
+      "id": 8,
+      "title": "Next maintenance windows (lowest predicted load)",
+      "description": "Top-N predicted-lowest-load windows in the next ``recommended_windows.lookahead`` of the forecast horizon. Lower predicted_load is better; rank=1 is the suggested window. Operators schedule reboots / cert rotations / security patches against the ranked recommendations.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 24,
+        "x": 0,
+        "y": 39
+      },
+      "targets": [
+        {
+          "expr": "forecast_recommended_maintenance_window{group=~\"$group\",id=~\"$id\"}",
+          "legendFormat": "",
+          "format": "table",
+          "instant": true
+        }
+      ],
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true,
+              "best_model": true,
+              "horizon": true,
+              "model": true,
+              "model_fallback": true,
+              "job": true,
+              "cluster": true,
+              "replica": true
+            },
+            "indexByName": {
+              "rank": 0,
+              "id": 1,
+              "group": 2,
+              "instance": 3,
+              "start_timestamp_seconds": 4,
+              "duration_seconds": 5,
+              "Value": 6
+            },
+            "renameByName": {
+              "Value": "predicted_load",
+              "start_timestamp_seconds": "start (unix)",
+              "duration_seconds": "duration (s)"
+            }
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "auto",
+            "displayMode": "auto"
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "start (unix)"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "dateTimeFromNow"
+              }
+            ]
+          }
+        ]
+      }
     }
   ]
 }

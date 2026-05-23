@@ -271,3 +271,19 @@ podLabels: {}
 extraEnv: []
 extraVolumes: []
 extraVolumeMounts: []
+
+# ``helm test`` hooks. Each hook below renders as a one-shot Pod that
+# the operator runs with ``helm test <release>``; nothing is created
+# during the normal ``helm install`` apply, so the production install
+# does not pay any test-pod resource cost. Disable a hook to suppress
+# the corresponding rendered template entirely.
+tests:
+  # ``validateConfig`` runs ``promforecast validate --strict-cardinality``
+  # against the mounted config. The strict flag flips the projected
+  # cardinality overshoot from an advisory ``WARN`` line into a hard
+  # fail, so an operator using a wrapper like ArgoCD's PostSync hook
+  # can reject changes that would blow the global series cap before the
+  # forecaster pod ingests them. See docs/operations/cardinality.md for
+  # the workflow.
+  validateConfig:
+    enabled: true

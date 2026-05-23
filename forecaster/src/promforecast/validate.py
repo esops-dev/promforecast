@@ -59,7 +59,14 @@ class CardinalityEstimate:
     calibration_lines: int
     preprocess_lines: int
     threshold_eta_lines: int
+    will_breach_lines: int
     growth_rate_lines: int
+    # Conditional emission: parallel forecast snapshot + deviation rows
+    # for queries that opt into ``emission.conditional: true``.
+    conditional_lines: int
+    # Component decomposition: per-(series, model, component) rows for
+    # queries that opt into ``emission.decompose: true``.
+    decomposition_lines: int
     # Count-aware emission counter — per (query, kind=negative|rounded)
     # when a query opts in via ``data_profile: count`` or sets the
     # explicit emission toggles.
@@ -73,6 +80,12 @@ class CardinalityEstimate:
     # Empirical band coverage: per-(series, model, level, window) rolling
     # gauge for every query that opts into ``emission.band_coverage``.
     band_coverage_lines: int
+    # SLO error-budget snapshot rows (remaining + burn_rate + exhausted_in)
+    # per (query, window). Only counted for queries that opt into ``slo:``.
+    slo_lines: int
+    # Recommended maintenance window rows — bounded by ``count`` per
+    # opted-in query.
+    recommended_window_lines: int
     operational_lines: int
 
     @property
@@ -86,11 +99,16 @@ class CardinalityEstimate:
             + self.calibration_lines
             + self.preprocess_lines
             + self.threshold_eta_lines
+            + self.will_breach_lines
             + self.growth_rate_lines
+            + self.conditional_lines
+            + self.decomposition_lines
             + self.emission_clipped_lines
             + self.cold_start_lines
             + self.drift_lines
             + self.band_coverage_lines
+            + self.slo_lines
+            + self.recommended_window_lines
             + self.operational_lines
         )
 
@@ -100,12 +118,20 @@ def run_validate(
     *,
     dry_run: bool = False,
     datasource_url_override: str | None = None,
+    strict_cardinality: bool = False,
     out: IO[str] | None = None,
 ) -> int:
     """Validate ``config_path`` and optionally run a sample fit.
 
-    Returns 0 on success, 1 on validation failure, 2 on dry-run failure.
+    Returns 0 on success, 1 on validation failure (including
+    over-budget cardinality in strict mode), 2 on dry-run failure.
     Output is plain text by default; ``out`` lets tests capture it.
+
+    ``strict_cardinality`` flips the projected-total overshoot from an
+    advisory ``WARN:`` line into a hard fail (exit code 1) so a CI job
+    on a config PR can reject configs whose projected emission exceeds
+    ``safety.max_total_series`` before the change ships. The knob is
+    opt-in so existing callers keep their advisory behaviour.
     """
     stream: IO[str] = out if out is not None else sys.stdout
 
@@ -145,18 +171,27 @@ def run_validate(
     write(f"  calibration lines  {estimate.calibration_lines:>8}")
     write(f"  preprocess lines   {estimate.preprocess_lines:>8}")
     write(f"  threshold ETA      {estimate.threshold_eta_lines:>8}")
+    write(f"  will-breach lines  {estimate.will_breach_lines:>8}")
     write(f"  growth rate lines  {estimate.growth_rate_lines:>8}")
+    write(f"  conditional lines  {estimate.conditional_lines:>8}")
+    write(f"  decomposition lines {estimate.decomposition_lines:>8}")
     write(f"  emission clipped   {estimate.emission_clipped_lines:>8}")
     write(f"  cold start lines   {estimate.cold_start_lines:>8}")
     write(f"  drift lines        {estimate.drift_lines:>8}")
     write(f"  band coverage      {estimate.band_coverage_lines:>8}")
+    write(f"  slo lines          {estimate.slo_lines:>8}")
+    write(f"  recommended wins   {estimate.recommended_window_lines:>8}")
     write(f"  operational lines  {estimate.operational_lines:>8}")
     write(f"  total              {estimate.total:>8}")
-    if cfg.safety.max_total_series and estimate.total > cfg.safety.max_total_series:
-        write(
-            f"  WARN: total exceeds safety.max_total_series ({cfg.safety.max_total_series}); "
-            "series_overflow will drop the excess"
-        )
+    rc = _handle_cardinality_overshoot(
+        cfg=cfg,
+        estimate=estimate,
+        strict_cardinality=strict_cardinality,
+        write=write,
+        err=err,
+    )
+    if rc != 0:
+        return rc
 
     if not dry_run:
         return 0
@@ -169,6 +204,44 @@ def run_validate(
         err(f"error: dry-run failed: {exc}")
         return 2
     return rc
+
+
+def _handle_cardinality_overshoot(
+    *,
+    cfg: Config,
+    estimate: CardinalityEstimate,
+    strict_cardinality: bool,
+    write: Writer,
+    err: Writer,
+) -> int:
+    """Apply the per-mode policy when the estimate overshoots the cap.
+
+    Returns ``0`` when the estimate fits inside ``safety.max_total_series``
+    *or* when the legacy advisory-only mode is in effect (the caller emits
+    the WARN line and continues). Returns ``1`` only in
+    ``strict_cardinality`` mode when the projection exceeds the cap.
+
+    Pulled out of :func:`run_validate` so the runtime statement count
+    stays under ruff's PLR0915 threshold without hand-waving with a
+    blanket noqa.
+    """
+    over_budget = bool(cfg.safety.max_total_series and estimate.total > cfg.safety.max_total_series)
+    if not over_budget:
+        return 0
+    if strict_cardinality:
+        err(
+            f"error: projected total ({estimate.total}) exceeds "
+            f"safety.max_total_series ({cfg.safety.max_total_series}); "
+            "strict-cardinality mode rejects over-budget configs. "
+            "Raise the cap, narrow your queries, or disable opt-in emission "
+            "families. See docs/operations/cardinality.md."
+        )
+        return 1
+    write(
+        f"  WARN: total exceeds safety.max_total_series ({cfg.safety.max_total_series}); "
+        "series_overflow will drop the excess"
+    )
+    return 0
 
 
 def _estimate_cardinality(cfg: Config) -> CardinalityEstimate:  # noqa: PLR0912, PLR0915
@@ -240,6 +313,10 @@ def _estimate_cardinality(cfg: Config) -> CardinalityEstimate:  # noqa: PLR0912,
     # band ETA for each threshold. Counted only against queries that
     # actually configure thresholds — most don't.
     threshold_eta_lines = 0
+    # Predictive will-breach gauge: same shape as the ETA family above
+    # but only for thresholds that opt into ``alert_within`` + ``severity``.
+    # ``N_thresholds_with_alert * (N_levels + 1)`` per (series, model).
+    will_breach_lines = 0
     for group in cfg.groups:
         for q in group.queries:
             if not q.thresholds:
@@ -248,16 +325,40 @@ def _estimate_cardinality(cfg: Config) -> CardinalityEstimate:  # noqa: PLR0912,
             threshold_eta_lines += (
                 series_cap * emitted_models * len(q.thresholds) * per_threshold_emissions
             )
+            opted_in = sum(
+                1 for t in q.thresholds if t.alert_within is not None and t.severity is not None
+            )
+            if opted_in:
+                will_breach_lines += (
+                    series_cap * emitted_models * opted_in * per_threshold_emissions
+                )
 
     # Growth-rate: per (series, model, window) gauge. Counted only against
     # queries that opt into ``emission.growth_rate.enabled: true``.
     growth_rate_lines = 0
+    # Conditional forecast: parallel emission family + per-(series, model,
+    # level) deviation gauges. Charged only against queries that opt
+    # into ``emission.conditional: true``.
+    conditional_lines = 0
+    # Decomposition: per-(series, model, component=trend|seasonal|level|residual)
+    # — bounded to 4 lines per (series, model) per opted-in query.
+    decomposition_lines = 0
+    n_components = 4
     for group in cfg.groups:
         for q in group.queries:
-            if not q.emission.growth_rate.enabled:
-                continue
-            n_windows = max(1, len(q.emission.growth_rate.windows))
-            growth_rate_lines += series_cap * emitted_models * n_windows
+            if q.emission.growth_rate.enabled:
+                n_windows = max(1, len(q.emission.growth_rate.windows))
+                growth_rate_lines += series_cap * emitted_models * n_windows
+            if q.emission.conditional:
+                # Per-series snapshot: central + 2 * levels rows per model.
+                # Conditional deviation: 2 lines per (series, model, level)
+                # (ratio + outside_band).
+                conditional_lines += (
+                    series_cap * emitted_models * (1 + 2 * n_levels)
+                    + series_cap * emitted_models * n_levels * 2
+                )
+            if q.emission.decompose:
+                decomposition_lines += series_cap * emitted_models * n_components
     # Preprocessing emits per-(group, query) telemetry. The label sets
     # are all bounded:
     #   * max_gap_seconds         : 1 line per query
@@ -331,6 +432,29 @@ def _estimate_cardinality(cfg: Config) -> CardinalityEstimate:  # noqa: PLR0912,
             n_windows = max(1, len(q.emission.band_coverage.windows))
             band_coverage_lines += series_cap * emitted_models * n_levels * n_windows
 
+    # SLO error-budget projections. Three sibling metrics — remaining,
+    # burn_rate, exhausted_in — per (series, model, window). The
+    # exhausted_in row has an additional fan-out by level (central row +
+    # one per level), so we charge ``2 + 1 + N_levels = 3 + N_levels``
+    # rows per (series, model, window). Bounded; only counted for
+    # queries that opt into ``slo:``.
+    slo_lines = 0
+    for group in cfg.groups:
+        for q in group.queries:
+            if q.slo is None:
+                continue
+            n_windows = max(1, len(q.slo.windows))
+            slo_lines += series_cap * emitted_models * n_windows * (3 + n_levels)
+
+    # Recommended maintenance windows — ``count`` rows per (series,
+    # model) for queries that opt in. Bounded by construction.
+    recommended_window_lines = 0
+    for group in cfg.groups:
+        for q in group.queries:
+            if not q.recommended_windows.enabled:
+                continue
+            recommended_window_lines += series_cap * emitted_models * q.recommended_windows.count
+
     # Operational: 7 gauges + N reasons per group; we ballpark 7 per group.
     # The runner also emits per-(group, query) rows of
     # ``forecast_query_run_duration_seconds`` and
@@ -352,11 +476,16 @@ def _estimate_cardinality(cfg: Config) -> CardinalityEstimate:  # noqa: PLR0912,
         calibration_lines=calibration_lines,
         preprocess_lines=preprocess_lines,
         threshold_eta_lines=threshold_eta_lines,
+        will_breach_lines=will_breach_lines,
         growth_rate_lines=growth_rate_lines,
+        conditional_lines=conditional_lines,
+        decomposition_lines=decomposition_lines,
         emission_clipped_lines=emission_clipped_lines,
         cold_start_lines=cold_start_lines,
         drift_lines=drift_lines,
         band_coverage_lines=band_coverage_lines,
+        slo_lines=slo_lines,
+        recommended_window_lines=recommended_window_lines,
         operational_lines=operational_lines,
     )
 

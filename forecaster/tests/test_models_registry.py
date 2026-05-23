@@ -108,6 +108,42 @@ def test_unknown_model_error_lists_alternatives() -> None:
         model_registry.build("AutoArimaa", season_length=288)
 
 
+@pytest.mark.parametrize(
+    "name",
+    [
+        "AutoARIMA",
+        "AutoARIMADamped",
+        "AutoETS",
+        "AutoETSDamped",
+        "MSTL",
+        "SeasonalNaive",
+        "Croston",
+        "CrostonSBA",
+        "ADIDA",
+        "IMAPA",
+    ],
+)
+def test_builtin_models_advertise_uses_regressors_false(name: str) -> None:
+    """Every built-in wrapper must advertise ``uses_regressors = False``.
+
+    The conditional-forecast emission path reads this flag to decide
+    whether to refit the model with held-constant regressors. A built-in
+    that silently flipped to True would double the per-series fit cost
+    for every operator who enables ``emission.conditional``.
+    """
+    assert model_registry.uses_regressors(name) is False
+
+
+def test_uses_regressors_returns_true_for_unknown_model() -> None:
+    """Unknown models must be treated as regressor-aware.
+
+    The conditional path uses ``uses_regressors`` to *skip* refits;
+    silently dropping refits for an unrecognised model would change
+    correctness, so the default for unknown names is the safe one.
+    """
+    assert model_registry.uses_regressors("__definitely_not_a_real_model__") is True
+
+
 class _FakeExternalModel:
     """Stand-in for an external plug-in registered via entry points.
 
