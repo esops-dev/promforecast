@@ -28,7 +28,7 @@ make chart-lint       # helm lint + kubeconform
   changes and require a deprecation period.
 - `mypy --strict` and `ruff` must be clean.
 - Adding a model? Update three places: `forecaster/src/promforecast/models/`,
-  `pyproject.toml` entry points, and `docs/models.md`.
+  `pyproject.toml` entry points, and `docs/reference/models.md`.
 - Adding a Helm value? Regenerate `values.schema.json` (`make chart-schema`).
 
 ## Commit style

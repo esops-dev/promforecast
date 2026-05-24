@@ -357,6 +357,16 @@ def _estimate_cardinality(cfg: Config) -> CardinalityEstimate:  # noqa: PLR0912,
                     series_cap * emitted_models * (1 + 2 * n_levels)
                     + series_cap * emitted_models * n_levels * 2
                 )
+                # Conditional-band conformal calibration emits one
+                # ``forecast_conditional_band_calibration_offset`` per
+                # (series, model, level) on the *emitted* model set —
+                # same shape as the unconditional ``calibration_lines``
+                # term, just on the conditional half. Only charged when
+                # ``accuracy.conformal.enabled`` is on; otherwise the
+                # conditional emission still runs but no calibration
+                # gauges land.
+                if cfg.defaults.accuracy.conformal.enabled:
+                    conditional_lines += series_cap * emitted_models * n_levels
             if q.emission.decompose:
                 decomposition_lines += series_cap * emitted_models * n_components
     # Preprocessing emits per-(group, query) telemetry. The label sets

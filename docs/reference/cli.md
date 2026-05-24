@@ -101,7 +101,7 @@ promforecast diagnose duplicates \
 Scans the configured TSDB for forecast metrics
 (`*_forecast` / `*_forecast_lower` / `*_forecast_upper`) that appear
 under more than one labelset family — the dual-source state described
-in [the architecture page](architecture/emission-paths.md). Exit codes
+in [the emission paths reference](emission-paths.md). Exit codes
 are CI-friendly: `0` for clean, `1` for duplicates detected, `2` for
 datasource unreachable.
 
@@ -122,6 +122,6 @@ over the window exceeds `--max-samples`. Covers the same-labelset case
 writing to the **same** series produce a count higher than either path
 alone would.
 
-See [operations/diagnose.md](operations/diagnose.md) for the full
+See [`../operations/diagnose.md`](../operations/diagnose.md) for the full
 reference, authentication recipes, in-cluster invocation
 (`kubectl exec`), and CI-integration patterns.

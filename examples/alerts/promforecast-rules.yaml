@@ -7,7 +7,7 @@
 # source labels (``instance``, ``device``, etc.) — no
 # ``instance="<forecaster-pod>:9091"`` and no ``job="promforecast"`` —
 # so the expressions below filter purely on source-side labels. See
-# ``docs/architecture/emission-paths.md`` for the two-path picture and
+# ``docs/reference/emission-paths.md`` for the two-path picture and
 # the scrape-drop snippet for an externally-managed Prometheus.
 apiVersion: monitoring.coreos.com/v1
 kind: PrometheusRule
@@ -207,7 +207,7 @@ spec:
         # template — do not deploy as-is without tuning. The
         # ``<id>_forecast`` snapshot value is the *end-of-horizon*
         # forecast (carrying ``horizon="next"``, which means "the next
-        # snapshot value to be served") — see ``docs/models.md`` for
+        # snapshot value to be served") — see ``docs/reference/models.md`` for
         # the convention. If ``defaults.horizon: 24h`` is the configured
         # forecast horizon then this alert reads "the disk is forecast
         # to be empty 24h from now".

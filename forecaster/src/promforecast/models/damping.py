@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     import pandas as pd
 
-# 0.98 is the capacity-planning rule of thumb cited in ``docs/models.md``:
+# 0.98 is the capacity-planning rule of thumb cited in ``docs/reference/models.md``:
 # at horizon=288 (24h at 5m step) it caps the extrapolated trend at
 # roughly the asymptote ``phi / (1 - phi) = 49`` trend units — well
 # under the undamped 288 — while leaving short-horizon forecasts within

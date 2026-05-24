@@ -15,7 +15,7 @@
 */}}
 {{- $explicit := .Values.serviceMonitor.dropForecastSnapshots }}
 {{- if and .Values.existingConfigMap (not (kindIs "bool" $explicit)) }}
-{{- fail "serviceMonitor.dropForecastSnapshots must be set explicitly (true/false) when existingConfigMap is set — the chart cannot read the sink toggle from an externally-managed ConfigMap. See docs/architecture/emission-paths.md for the dual-source labelset trap." }}
+{{- fail "serviceMonitor.dropForecastSnapshots must be set explicitly (true/false) when existingConfigMap is set — the chart cannot read the sink toggle from an externally-managed ConfigMap. See docs/reference/emission-paths.md for the dual-source labelset trap." }}
 {{- end }}
 {{- $sinkOn := dig "sink" "remote_write" "enabled" false .Values.config }}
 {{- $drop := ternary $explicit $sinkOn (kindIs "bool" $explicit) }}
@@ -56,7 +56,7 @@ spec:
       # making the example alerts in ``examples/alerts/promforecast-rules.yaml``
       # (which interpolate ``{{`{{ $labels.instance }}`}}`` to identify the
       # node-exporter target) report the wrong host. Matches the
-      # ``honor_labels: true`` snippet in ``docs/architecture/emission-paths.md``.
+      # ``honor_labels: true`` snippet in ``docs/reference/emission-paths.md``.
       honorLabels: true
       interval: {{ .Values.serviceMonitor.interval }}
       scrapeTimeout: {{ .Values.serviceMonitor.scrapeTimeout }}

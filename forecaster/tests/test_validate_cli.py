@@ -199,6 +199,90 @@ def test_cardinality_estimate_counts_threshold_and_growth_rate_lines() -> None:
     assert est.growth_rate_lines == 100 * 1 * 2
 
 
+def test_cardinality_estimate_counts_conditional_calibration_when_conformal_on() -> None:
+    """The dedicated conditional-band conformal gauge must show up in the estimate.
+
+    Each (series, model, level) emits one
+    ``forecast_conditional_band_calibration_offset`` row when both
+    ``accuracy.conformal.enabled`` and ``emission.conditional`` are
+    true; ``promforecast validate`` must account for it or the
+    estimate under-reports the post-v1.6.5 footprint.
+    """
+    from datetime import timedelta  # noqa: PLC0415
+
+    from promforecast.config import (  # noqa: PLC0415
+        AccuracyConfig,
+        Config,
+        ConformalConfig,
+        DatasourceConfig,
+        DefaultsConfig,
+        EmissionConfig,
+        GroupConfig,
+        QueryConfig,
+        QueryEmissionConfig,
+        SafetyConfig,
+        ServerConfig,
+    )
+
+    series_cap = 100
+    models = 2
+    levels = 2
+
+    def _build(*, conformal_enabled: bool) -> Config:
+        return Config(
+            datasource=DatasourceConfig(url="http://x"),
+            server=ServerConfig(),
+            safety=SafetyConfig(max_series_per_query=series_cap, max_total_series=0),
+            defaults=DefaultsConfig(
+                models=["AutoARIMA", "SeasonalNaive"],
+                confidence_levels=[80, 95],
+                accuracy=AccuracyConfig(
+                    evaluate=False,
+                    auto_select=False,
+                    horizons=[timedelta(hours=1)],
+                    conformal=ConformalConfig(enabled=conformal_enabled),
+                ),
+                emission=EmissionConfig(deviation=False, quality=False),
+            ),
+            groups=[
+                GroupConfig(
+                    name="g",
+                    queries=[
+                        QueryConfig(
+                            id="m",
+                            promql="up",
+                            emission=QueryEmissionConfig(conditional=True),
+                        )
+                    ],
+                )
+            ],
+        )
+
+    # Conditional snapshot + deviation are charged either way (the
+    # baseline below validates that side of the formula).
+    snapshot_rows = series_cap * models * (1 + 2 * levels)
+    deviation_rows = series_cap * models * levels * 2
+    calibration_rows = series_cap * models * levels
+
+    off = _estimate_cardinality(_build(conformal_enabled=False))
+    assert off.conditional_lines == snapshot_rows + deviation_rows
+    # No calibration gauge when conformal is off — even with conditional on.
+    assert off.calibration_lines == 0
+
+    on = _estimate_cardinality(_build(conformal_enabled=True))
+    # With conformal on, the unconditional calibration gauge appears
+    # for every emitted (series, model, level) too — that's the
+    # pre-v1.6.5 line — *and* the conditional family picks up the
+    # matching new gauge.
+    assert on.calibration_lines == series_cap * models * levels  # unconditional
+    assert on.conditional_lines == snapshot_rows + deviation_rows + calibration_rows
+    # Delta between off and on for the conditional family is exactly
+    # the new gauge — protects against drift if a future change
+    # widens the conditional emission and the test author forgets to
+    # update the formula here.
+    assert on.conditional_lines - off.conditional_lines == calibration_rows
+
+
 def test_validate_strict_cardinality_passes_when_under_budget(tmp_path: Path) -> None:
     """A config whose estimated total fits inside the cap exits 0 in strict mode."""
     path = _write(tmp_path, _GOOD_CONFIG)

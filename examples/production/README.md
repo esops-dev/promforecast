@@ -61,7 +61,7 @@ If you're an order of magnitude smaller, drop:
 * `resources.limits.cpu` to `"2"` and `memory` to `2Gi`
 
 If you're an order of magnitude larger, see
-[`docs/ha.md`](../../docs/ha.md) for sharding guidance.
+[`docs/operations/ha.md`](../../docs/operations/ha.md) for sharding guidance.
 
 ## A note on duplication
 

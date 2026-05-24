@@ -51,5 +51,5 @@ Dashboard tip: stack the static `defaults.lookback` against `forecast_input_effe
 
 ## See also
 
-- [Models](models.md) — how the adjusted lookback feeds the fit.
+- [Models](../reference/models.md) — how the adjusted lookback feeds the fit.
 - [Input preprocessing](preprocessing.md) — outlier scrubbing runs *before* change-point detection so a single spike cannot masquerade as a regime shift.

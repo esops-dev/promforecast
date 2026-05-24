@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from . import deviation as deviation_mod
 from . import quality as quality_mod
@@ -26,6 +26,7 @@ from .exporter import (
     AccuracyPoint,
     CalibrationOffsetPoint,
     ComponentDecompositionPoint,
+    ConditionalCalibrationOffsetPoint,
     ConditionalDeviationPoint,
     ConditionalForecastPoint,
     ContributionPoint,
@@ -192,12 +193,23 @@ class SeriesPointFactory:
         forecast: pd.DataFrame,
         model_name: str,
         selection: SelectionResult | None,
+        *,
+        calibrated: bool = False,
     ) -> Iterable[ConditionalForecastPoint]:
         """Mirror of :meth:`forecast_points` for the conditional family.
 
         Same end-of-horizon convention — one snapshot value per (series,
         model, level). The metric names carry the
         ``_forecast_conditional`` suffix family instead of ``_forecast``.
+
+        ``calibrated`` is True when the conditional band that
+        ``forecast`` carries was widened by a fresh per-fit conformal
+        calibration pass; in that case the band rows pick up a
+        ``calibrated="true"`` label matching the unconditional family's
+        post-hoc labelling convention so dashboards can distinguish
+        widened vs. raw conditional bands within a single emission
+        family. The yhat row never carries the label (calibration is a
+        band adjustment, not a point-forecast adjustment).
         """
         if forecast.empty:
             return
@@ -208,19 +220,20 @@ class SeriesPointFactory:
             labels=common,
             value=float(last["yhat"]),
         )
+        band_extra = {"calibrated": "true"} if calibrated else {}
         for level in self._levels:
             lo_col = f"yhat_lower_{level}"
             hi_col = f"yhat_upper_{level}"
             if lo_col in forecast.columns:
                 yield ConditionalForecastPoint(
                     metric=f"{self._metric_id}_forecast_conditional_lower",
-                    labels={**common, "level": str(level)},
+                    labels={**common, "level": str(level), **band_extra},
                     value=float(last[lo_col]),
                 )
             if hi_col in forecast.columns:
                 yield ConditionalForecastPoint(
                     metric=f"{self._metric_id}_forecast_conditional_upper",
-                    labels={**common, "level": str(level)},
+                    labels={**common, "level": str(level), **band_extra},
                     value=float(last[hi_col]),
                 )
 
@@ -229,6 +242,8 @@ class SeriesPointFactory:
         forecast: pd.DataFrame,
         model_name: str,
         selection: SelectionResult | None,
+        *,
+        calibrated: bool = False,
     ) -> Iterable[ForecastCurvePoint]:
         """Yield every horizon step as a push point for the conditional sink curve.
 
@@ -237,11 +252,24 @@ class SeriesPointFactory:
         the conditional curves in a parallel TSDB family. Caller-side
         renaming is no longer needed once this method is used.
 
+        ``calibrated`` is True when the conditional band rows were
+        widened by a fresh per-fit conformal pass; the resulting band
+        curve points pick up a ``calibrated="true"`` label so the
+        snapshot and the sink push agree on labelling (the unconditional
+        path applies the same label post-hoc via
+        :func:`~promforecast.runner._apply_offsets_to_curve_points`).
+
         Rows with non-finite timestamps or values are dropped — TSDBs
         reject NaN samples, and emitting them would just generate noise
         in the sink's failure counter.
         """
-        yield from self._curve_points(forecast, model_name, selection, suffix_family="_conditional")
+        yield from self._curve_points(
+            forecast,
+            model_name,
+            selection,
+            suffix_family="_conditional",
+            calibrated_band=calibrated,
+        )
 
     def conditional_deviation_points(
         self,
@@ -307,26 +335,39 @@ class SeriesPointFactory:
         reject NaN samples and emitting them just generates noise in the
         sink's failure counter.
         """
-        if forecast.empty or not components:
+        if forecast.empty or not components or "ds" not in forecast.columns:
             return
+        import pandas as pd  # noqa: PLC0415
+
         rows = len(forecast)
         common = self._build_common_labels(model_name, selection)
         metric_name = f"{self._metric_id}_forecast_component"
+        # Vectorise the ``ds`` -> ms conversion up-front so the inner loop
+        # only does integer indexing. Pre-filter the components dict to
+        # the ones whose value list matches the frame length, so we don't
+        # repeat the same length check for every row.
+        ds_normalised = pd.to_datetime(forecast["ds"], errors="coerce")
+        valid_ts_mask = ds_normalised.notna().to_numpy()
+        ts_ms_arr = ds_normalised.astype("int64").to_numpy() // 1_000_000
+        component_labels: dict[str, dict[str, str]] = {
+            name: {**common, "component": name}
+            for name, values in components.items()
+            if len(values) == rows
+        }
+        if not component_labels:
+            return
+        usable_components = [(name, components[name]) for name in component_labels]
         for i in range(rows):
-            try:
-                ts = forecast["ds"].iloc[i]
-                ts_ms = int(float(ts.timestamp()) * 1000)
-            except (KeyError, AttributeError, TypeError, ValueError):
+            if not valid_ts_mask[i]:
                 continue
-            for component_name, values in components.items():
-                if len(values) != rows:
-                    continue
+            ts_ms = int(ts_ms_arr[i])
+            for component_name, values in usable_components:
                 raw = values[i]
                 if not math.isfinite(raw):
                     continue
                 yield ForecastCurvePoint(
                     metric=metric_name,
-                    labels={**common, "component": component_name},
+                    labels=component_labels[component_name],
                     value=float(raw),
                     timestamp_ms=ts_ms,
                 )
@@ -398,6 +439,30 @@ class SeriesPointFactory:
                 offset=float(offset),
             )
 
+    def conditional_calibration_offset_points(
+        self,
+        model_name: str,
+        offsets: dict[int, float],
+    ) -> Iterable[ConditionalCalibrationOffsetPoint]:
+        """One ``forecast_conditional_band_calibration_offset`` per (model, level).
+
+        Mirrors :meth:`calibration_offset_points` but emits under the
+        conditional family so an operator alerting on
+        ``forecast_conditional_deviation_outside_band`` can read the
+        per-(model, level) widening that was actually applied to that
+        band. Emitted only when both ``accuracy.conformal.enabled`` and
+        ``emission.conditional`` are on and the fresh calibration fit
+        succeeded.
+        """
+        common = self._common_with_id()
+        for level, offset in offsets.items():
+            if not math.isfinite(offset):
+                continue
+            yield ConditionalCalibrationOffsetPoint(
+                labels={**common, "model": model_name, "level": str(level)},
+                offset=float(offset),
+            )
+
     def forecast_curve_points(
         self,
         forecast: pd.DataFrame,
@@ -423,6 +488,7 @@ class SeriesPointFactory:
         selection: SelectionResult | None,
         *,
         suffix_family: str,
+        calibrated_band: bool = False,
     ) -> Iterable[ForecastCurvePoint]:
         """Internal helper shared by every per-step curve emission method.
 
@@ -433,51 +499,79 @@ class SeriesPointFactory:
         family. Keeping the rendering logic in one place stops the two
         public callers from drifting on band-handling or NaN-skip
         semantics as new options arrive.
+
+        ``calibrated_band`` adds the ``calibrated="true"`` label to
+        band rows (lower/upper only — never to the yhat row, which is
+        not a band quantity). The unconditional curve path applies the
+        same label post-hoc via
+        :func:`~promforecast.runner._apply_offsets_to_curve_points`; the
+        conditional path applies the offsets to the DataFrame *before*
+        invoking the factory, so the in-factory flag is the symmetric
+        place to attach the label.
         """
-        if forecast.empty:
+        if forecast.empty or "ds" not in forecast.columns:
             return
+        import pandas as pd  # noqa: PLC0415
+
         common = self._build_common_labels(model_name, selection)
         base_metric = f"{self._metric_id}_forecast{suffix_family}"
         lower_metric = f"{self._metric_id}_forecast{suffix_family}_lower"
         upper_metric = f"{self._metric_id}_forecast{suffix_family}_upper"
-        for _, row in forecast.iterrows():
-            ts = row.get("ds")
-            if ts is None:
-                continue
-            try:
-                # ``Timestamp.timestamp()`` returns seconds; we want ms.
-                ts_ms = int(float(ts.timestamp()) * 1000)
-            except (AttributeError, TypeError, ValueError):
-                continue
-            yhat_raw = row.get("yhat")
-            if yhat_raw is not None and math.isfinite(float(yhat_raw)):
-                yield ForecastCurvePoint(
-                    metric=base_metric,
-                    labels=common,
-                    value=float(yhat_raw),
-                    timestamp_ms=ts_ms,
+        band_extra = {"calibrated": "true"} if calibrated_band else {}
+        # Column-oriented iteration: ``iterrows`` materialises one Series
+        # per row (~10x slower than indexing numpy arrays). For a typical
+        # 288-step horizon with two confidence levels the helper yields
+        # ~1440 points per series-model; the conditional emission family
+        # added in v1.6.5 doubles that, so the per-step assembly cost is
+        # worth keeping out of Python's Series-construction path.
+        ds_normalised = pd.to_datetime(forecast["ds"], errors="coerce")
+        ds_ns = ds_normalised.astype("int64").to_numpy()
+        # ``NaT`` becomes the int64 sentinel ``-9223372036854775808``; mask
+        # those rows so we don't emit a bogus 1677-era timestamp.
+        valid_ts_mask = ds_normalised.notna().to_numpy()
+        ts_ms_arr = ds_ns // 1_000_000
+        yhat_arr = forecast["yhat"].to_numpy(dtype=float) if "yhat" in forecast.columns else None
+        # Pre-resolve band columns once. Each entry carries the metric
+        # name, the (immutable-by-convention) labels dict to attach to
+        # every row of this band, and the value array as float64.
+        band_cols: list[tuple[str, dict[str, str], Any]] = []
+        for level in self._levels:
+            level_str = str(level)
+            lower_labels = {**common, "level": level_str, **band_extra}
+            upper_labels = {**common, "level": level_str, **band_extra}
+            lo_col = f"yhat_lower_{level}"
+            if lo_col in forecast.columns:
+                band_cols.append(
+                    (lower_metric, lower_labels, forecast[lo_col].to_numpy(dtype=float))
                 )
-            for level in self._levels:
-                lo_col = f"yhat_lower_{level}"
-                hi_col = f"yhat_upper_{level}"
-                if lo_col in forecast.columns:
-                    lo = row[lo_col]
-                    if math.isfinite(float(lo)):
-                        yield ForecastCurvePoint(
-                            metric=lower_metric,
-                            labels={**common, "level": str(level)},
-                            value=float(lo),
-                            timestamp_ms=ts_ms,
-                        )
-                if hi_col in forecast.columns:
-                    hi = row[hi_col]
-                    if math.isfinite(float(hi)):
-                        yield ForecastCurvePoint(
-                            metric=upper_metric,
-                            labels={**common, "level": str(level)},
-                            value=float(hi),
-                            timestamp_ms=ts_ms,
-                        )
+            hi_col = f"yhat_upper_{level}"
+            if hi_col in forecast.columns:
+                band_cols.append(
+                    (upper_metric, upper_labels, forecast[hi_col].to_numpy(dtype=float))
+                )
+        n = len(forecast)
+        for i in range(n):
+            if not valid_ts_mask[i]:
+                continue
+            ts_ms = int(ts_ms_arr[i])
+            if yhat_arr is not None:
+                v = yhat_arr[i]
+                if math.isfinite(v):
+                    yield ForecastCurvePoint(
+                        metric=base_metric,
+                        labels=common,
+                        value=float(v),
+                        timestamp_ms=ts_ms,
+                    )
+            for metric_name, band_labels, arr in band_cols:
+                v = arr[i]
+                if math.isfinite(v):
+                    yield ForecastCurvePoint(
+                        metric=metric_name,
+                        labels=band_labels,
+                        value=float(v),
+                        timestamp_ms=ts_ms,
+                    )
 
     def ensemble_weight_points(
         self,

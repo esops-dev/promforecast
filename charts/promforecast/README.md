@@ -74,7 +74,7 @@ release-name-agnostically:
 > forecaster pod's `instance` need to be updated to the new stable
 > values before upgrading.
 
-See [`docs/architecture/emission-paths.md`](../../docs/architecture/emission-paths.md)
+See [`docs/reference/emission-paths.md`](../../docs/reference/emission-paths.md)
 for what each emission path emits and the dual-source trap the drop
 prevents.
 

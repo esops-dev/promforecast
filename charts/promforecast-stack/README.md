@@ -42,7 +42,7 @@ on demand:
 helm test <release>
 ```
 
-See [`docs/architecture/emission-paths.md`](../../docs/architecture/emission-paths.md)
+See [`docs/reference/emission-paths.md`](../../docs/reference/emission-paths.md)
 for what the two paths emit, why running both unguarded is a silent
 trap, and the `metric_relabel_configs` snippet to paste into an
 externally-managed Prometheus.

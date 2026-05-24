@@ -478,4 +478,4 @@ def test_header_declares_sink_assumption() -> None:
     head = RULES_PATH.read_text(encoding="utf-8").splitlines()[:20]
     joined = "\n".join(head)
     assert "sink+VM" in joined or "sink + VM" in joined, joined
-    assert "docs/architecture/emission-paths.md" in joined, joined
+    assert "docs/reference/emission-paths.md" in joined, joined

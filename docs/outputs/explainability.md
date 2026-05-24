@@ -2,7 +2,7 @@
 
 Two related questions get two different metrics:
 
-* "Which **regressor** is moving the forecast?" → [`<id>_forecast_contribution_ratio`](regressors.md)
+* "Which **regressor** is moving the forecast?" → [`<id>_forecast_contribution_ratio`](../inputs/regressors.md)
 * "Which **model component** is driving the curve?" → the decomposition family below
 
 The decomposition projects the forecast onto `trend / seasonal / level / residual` so you can read “disk fills in 14 days because the trend steepened last week” directly from a stacked-area Grafana panel.

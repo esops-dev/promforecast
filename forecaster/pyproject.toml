@@ -180,6 +180,9 @@ module = ["holidays", "holidays.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]
-addopts = "-ra -q --strict-markers --strict-config"
+addopts = "-ra -q --strict-markers --strict-config -m 'not benchmark'"
 testpaths = ["tests"]
 asyncio_mode = "auto"
+markers = [
+    "benchmark: micro-benchmarks gated out of the default run; opt in with `-m benchmark`",
+]

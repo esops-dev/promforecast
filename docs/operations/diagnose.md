@@ -138,5 +138,4 @@ kubectl run promforecast-diagnose --rm -it --image=ghcr.io/... \
 
 ## See also
 
-- [Emission paths](../architecture/emission-paths.md) — why dual-source is a problem.
-- [Migrate to sink-first](../how-to/migrate-to-sink-first.md) — recommended remediation.
+- [Emission paths](../reference/emission-paths.md) — why dual-source is a problem.
