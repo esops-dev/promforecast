@@ -566,3 +566,182 @@ async def test_run_group_global_cap_truncates_across_queries() -> None:
     assert 'forecast_query_series_count{group="g",query="a"} 1.0' in body
     assert 'forecast_series_count{group="g"} 1.0' in body
     assert 'reason="total_cap"' in body
+
+
+@pytest.mark.asyncio
+async def test_run_group_records_per_series_staleness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A successful fit must populate ``forecast_data_staleness_seconds``.
+
+    Guards the runner wiring: ``Exporter.record_series_fit_success`` is
+    called from ``_run_one_series`` after a successful per-series fit,
+    once per emitted model, with the source labels + id + group + model.
+    Without this hook the operational ``ForecastSeriesStale`` alert
+    would never fire even on a healthy install.
+    """
+    from promforecast import models as model_registry  # noqa: PLC0415
+
+    cfg = Config(
+        datasource=DatasourceConfig(url="http://x"),
+        server=ServerConfig(),
+        safety=SafetyConfig(),
+        defaults=DefaultsConfig(
+            min_points=10,
+            models=["AutoARIMA"],
+            confidence_levels=[80],
+            accuracy=AccuracyConfig(
+                evaluate=False,
+                auto_select=False,
+                horizons=[timedelta(minutes=10)],
+            ),
+            emission=EmissionConfig(deviation=False, quality=False, contribution=False),
+        ),
+        groups=[GroupConfig(name="g", queries=[QueryConfig(id="m", promql="up")])],
+    )
+    monkeypatch.setattr(
+        model_registry,
+        "build",
+        lambda name, season_length, params=None: _FakeModel(name, value=1.0),
+    )
+    source = _FakeSource({"up": [_ramp_frame(60)]})
+    exporter = Exporter()
+    runner = Runner(config=cfg, source=source, exporter=exporter)
+
+    await runner.run_group(cfg.groups[0])
+
+    body = exporter.render().decode()
+    assert "# TYPE forecast_data_staleness_seconds gauge" in body
+    assert 'id="m"' in body
+    assert 'model="AutoARIMA"' in body
+    assert 'group="g"' in body
+    # The recorded timestamp is "just now" so elapsed must be small.
+    line = next(ln for ln in body.splitlines() if ln.startswith("forecast_data_staleness_seconds{"))
+    elapsed = float(line.rsplit(" ", 1)[-1])
+    assert 0.0 <= elapsed < 30.0
+
+
+@pytest.mark.asyncio
+async def test_apply_config_prunes_staleness_for_removed_groups(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A config reload that drops a group must clear its staleness rows.
+
+    Without retention the dropped group's series would linger on
+    /metrics with a forever-growing staleness value because no fit
+    will ever reset their clock.
+    """
+    from promforecast import models as model_registry  # noqa: PLC0415
+
+    monkeypatch.setattr(
+        model_registry,
+        "build",
+        lambda name, season_length, params=None: _FakeModel(name, value=1.0),
+    )
+    cfg = Config(
+        datasource=DatasourceConfig(url="http://x"),
+        server=ServerConfig(),
+        safety=SafetyConfig(),
+        defaults=DefaultsConfig(
+            min_points=10,
+            models=["AutoARIMA"],
+            confidence_levels=[80],
+            accuracy=AccuracyConfig(
+                evaluate=False, auto_select=False, horizons=[timedelta(minutes=10)]
+            ),
+            emission=EmissionConfig(deviation=False, quality=False, contribution=False),
+        ),
+        groups=[
+            GroupConfig(name="keep", queries=[QueryConfig(id="m", promql="up")]),
+            GroupConfig(name="drop", queries=[QueryConfig(id="m", promql="up")]),
+        ],
+    )
+    source = _FakeSource({"up": [_ramp_frame(60)]})
+    exporter = Exporter()
+    runner = Runner(config=cfg, source=source, exporter=exporter)
+    await runner.run_group(cfg.groups[0])
+    await runner.run_group(cfg.groups[1])
+
+    body = exporter.render().decode()
+    assert 'group="keep"' in body
+    assert 'group="drop"' in body
+
+    new_cfg = Config(
+        datasource=cfg.datasource,
+        server=cfg.server,
+        safety=cfg.safety,
+        defaults=cfg.defaults,
+        groups=[cfg.groups[0]],  # 'drop' removed
+    )
+    await runner.apply_config(new_cfg)
+    body = exporter.render().decode()
+    assert 'group="keep"' in body
+    assert 'group="drop"' not in body
+
+
+@pytest.mark.asyncio
+async def test_apply_config_prunes_stale_staleness_after_model_removal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A model dropped from defaults.models is cleaned up by the age sweep.
+
+    The per-group / per-query retention helpers can't reach this case
+    because the (group, query) pair still exists — only the model
+    label changed. Without the time-based sweep the dropped model's
+    rows would refresh-never and ``ForecastSeriesStale`` would fire
+    on them forever. We simulate "model dropped" by recording a fit
+    under model X, ageing it past the threshold, then reloading the
+    config; apply_config must call ``prune_stale_staleness`` with a
+    threshold low enough to drop the aged row.
+    """
+    from promforecast import models as model_registry  # noqa: PLC0415
+
+    monkeypatch.setattr(
+        model_registry,
+        "build",
+        lambda name, season_length, params=None: _FakeModel(name, value=1.0),
+    )
+    cfg = Config(
+        datasource=DatasourceConfig(url="http://x"),
+        server=ServerConfig(),
+        safety=SafetyConfig(),
+        defaults=DefaultsConfig(
+            min_points=10,
+            models=["AutoARIMA"],
+            confidence_levels=[80],
+            accuracy=AccuracyConfig(
+                evaluate=False, auto_select=False, horizons=[timedelta(minutes=10)]
+            ),
+            emission=EmissionConfig(deviation=False, quality=False, contribution=False),
+        ),
+        groups=[GroupConfig(name="g", queries=[QueryConfig(id="m", promql="up")])],
+    )
+    source = _FakeSource({"up": [_ramp_frame(60)]})
+    exporter = Exporter()
+    runner = Runner(config=cfg, source=source, exporter=exporter)
+    await runner.run_group(cfg.groups[0])
+
+    # Confirm the row is present.
+    assert any(key[2] == "AutoARIMA" for key in exporter._series_last_success), (
+        "fit must have recorded the AutoARIMA row"
+    )
+
+    # Age every staleness entry past the day threshold. In production
+    # this happens naturally when a config change removes a model and
+    # subsequent reloads don't see the row refreshed.
+    for k, (ts, labels) in list(exporter._series_last_success.items()):
+        exporter._series_last_success[k] = (ts - 100_000.0, labels)
+
+    # Reload identical config — the sweep is unconditional on
+    # apply_config, so even a no-op reload prunes aged rows. The
+    # actual call must use the production-shaped threshold; building
+    # a new Config object is enough to trigger the sweep.
+    new_cfg = Config(
+        datasource=cfg.datasource,
+        server=cfg.server,
+        safety=cfg.safety,
+        defaults=cfg.defaults,
+        groups=list(cfg.groups),
+    )
+    await runner.apply_config(new_cfg)
+    assert not exporter._series_last_success, "aged rows must be pruned by apply_config sweep"

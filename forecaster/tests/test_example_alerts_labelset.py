@@ -317,6 +317,23 @@ FIXTURE: dict[str, list[dict[str, str]]] = {
         for d in (0, 1, 2)
         for h in (0, 12, 23)
     ],
+    # Per-(series, model) staleness gauge. Snapshot-only, so it carries
+    # the forecaster scrape labels alongside the source-side labels the
+    # forecast emission picked up.
+    "forecast_data_staleness_seconds": [
+        _with(
+            _SNAPSHOT_OP_LABELS,
+            id=i,
+            group=g,
+            model=m,
+            instance="node-exporter:9100",
+        )
+        for g, i, m in [
+            ("node_capacity", "node_cpu_busy_pct", "AutoARIMA"),
+            ("node_capacity", "node_memory_used_bytes", "SeasonalNaive"),
+            ("node_storage", "node_filesystem_avail_bytes", "AutoARIMA"),
+        ]
+    ],
 }
 
 # ---------------------------------------------------------------------------

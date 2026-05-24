@@ -238,6 +238,25 @@ def _aggregate_regressor_values(
     return means, timestamps
 
 
+def _staleness_max_age_seconds(config: Config) -> float:
+    """Threshold for the staleness sweep on ``apply_config``.
+
+    Returns the larger of one day and 24x the *shortest* configured
+    refresh interval (so the sweep keeps pace with sub-hour cadences
+    without dropping rows that are merely in their second alert
+    cycle). Picked well past the canonical
+    ``ForecastSeriesStale`` alert horizon (4x refresh) so an operator
+    gets multiple alert cycles before a row silently disappears, while
+    still bounding the memory cost of a noisy fleet.
+    """
+    shortest = config.server.refresh_interval.total_seconds()
+    for group in config.groups:
+        for query in group.queries:
+            if query.refresh_interval is not None:
+                shortest = min(shortest, query.refresh_interval.total_seconds())
+    return max(86_400.0, shortest * 24)
+
+
 class Runner:
     """Schedules and executes per-group forecast runs.
 
@@ -393,6 +412,16 @@ class Runner:
 
             log = logger.bind(added=added, removed=removed, changed=changed)
 
+            # Unconditionally sweep the staleness state by age before
+            # the fast no-op short-circuit. The sweep is idempotent and
+            # cheap (dict comprehension over a bounded set), and running
+            # it on every reload gives operators a deterministic
+            # "trigger a cleanup" knob even when the config itself
+            # hasn't changed (the per-group run path also sweeps, but
+            # an explicit reload is a clearer mental model for
+            # debugging stale rows).
+            self._exporter.prune_stale_staleness(_staleness_max_age_seconds(new_config))
+
             # Fast no-op path: pydantic models compare structurally, so an
             # equal config means nothing changed and we shouldn't drain.
             # This matters when a ConfigMap is re-projected with identical
@@ -416,6 +445,17 @@ class Runner:
             self._exporter.retain_groups(set(new_by_name))
             self._exporter.retain_discovery_groups(set(new_by_name))
             self._exporter.retain_incident_recurrence_groups(set(new_by_name))
+            self._exporter.retain_staleness_groups(set(new_by_name))
+            # Per-query staleness cleanup: a reload that drops a single
+            # query from a still-present group needs the per-(group, query)
+            # entries pruned too, mirroring the incident-recurrence
+            # treatment below. Without this the dropped query's series
+            # would linger on /metrics with a forever-growing staleness
+            # value because no fit will ever reset their clock.
+            live_query_pairs = {
+                (group.name, query.id) for group in new_config.groups for query in group.queries
+            }
+            self._exporter.retain_staleness_queries(live_query_pairs)
             # Per-query cleanup for the incident-recurrence heatmap:
             # the group-level retain above handles whole-group removal,
             # but a reload that drops a single ``data_profile: events``
@@ -858,6 +898,17 @@ class Runner:
                 await self._refresh_deploy_risk(group, run_query_ids)
             except Exception:
                 log.exception("deploy_risk_refresh_failed")
+
+            # Sweep aged staleness rows after each successful group run.
+            # This is the only path that catches ephemeral-series leaks
+            # (per-pod metrics, deployment-id labels) without requiring
+            # an explicit ``/-/reload`` — the apply_config sweep handles
+            # model removal, but a series that simply stops appearing
+            # in the source data would otherwise linger forever. The
+            # operation is a single dict comprehension over a bounded
+            # dict, so amortising it across every group run adds
+            # negligible latency to the fit path.
+            self._exporter.prune_stale_staleness(_staleness_max_age_seconds(self._config))
 
     async def _refresh_deploy_risk(
         self,
@@ -1343,7 +1394,68 @@ class Runner:
             ctx.failures["fit_error"] = ctx.failures.get("fit_error", 0) + 1
             return False
         _merge_fit_into_ctx(ctx, fit_result, query.id)
+        self._record_series_fit_successes(
+            fit_result=fit_result,
+            group_name=group.name,
+            query_id=query.id,
+            frame=frame,
+        )
         return False
+
+    def _record_series_fit_successes(
+        self,
+        *,
+        fit_result: _FitResult,
+        group_name: str,
+        query_id: str,
+        frame: SeriesFrame,
+    ) -> None:
+        """Stamp ``forecast_data_staleness_seconds`` for every emitted model.
+
+        Iterates ``fit_result.points`` to extract the unique set of
+        models that produced a snapshot row for this series — that's
+        the precise success signal we want the staleness clock to
+        track. Models present in ``fit_result.fit_durations`` but
+        absent from ``fit_result.points`` (e.g. a backtest-only fit)
+        intentionally don't reset the clock; the operator-visible
+        signal is "is this series being forecast", not "did any
+        fit run".
+
+        The conditional refit family (model names suffixed
+        ``/conditional``) is filtered out — staleness tracks the
+        underlying model's emission cadence, and the conditional
+        emission rides on the same fit success.
+
+        Called from both :meth:`_run_one_series` (the normal path)
+        and :meth:`_try_cold_start` (the cold-start path) so
+        synthesised cold-start forecasts reset the clock too.
+        """
+        if not fit_result.points:
+            return
+        models: set[str] = set()
+        for point in fit_result.points:
+            model = point.labels.get("model", "")
+            if not model or model.endswith("/conditional"):
+                continue
+            models.add(model)
+        if not models:
+            return
+        series_key = _series_key_from_labels(frame.labels)
+        source_labels = {k: v for k, v in frame.labels.items() if k != "__name__"}
+        for model_name in models:
+            labels = {
+                **source_labels,
+                "id": query_id,
+                "group": group_name,
+                "model": model_name,
+            }
+            self._exporter.record_series_fit_success(
+                group=group_name,
+                query_id=query_id,
+                model_name=model_name,
+                series_key=series_key,
+                labels=labels,
+            )
 
     def _eligible_for_cold_start(self, query: QueryConfig) -> tuple[bool, str | None]:
         """Decide whether cold-start can run for ``query`` at all.
@@ -1580,6 +1692,12 @@ class Runner:
             fit_result.quality.append(QualityPoint(labels=quality_label, score=quality_score))
 
         _merge_fit_into_ctx(ctx, fit_result, query.id)
+        self._record_series_fit_successes(
+            fit_result=fit_result,
+            group_name=group.name,
+            query_id=query.id,
+            frame=frame,
+        )
         qlog.info(
             "cold_start_fit_emitted",
             siblings=outcome.sibling_count,

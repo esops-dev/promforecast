@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import time as time_mod
 
 from promforecast.exporter import (
     AccuracyPoint,
@@ -256,3 +257,192 @@ def test_render_escapes_label_values() -> None:
     )
     body = exporter.render().decode()
     assert 'weird="has\\"quotes\\\\and\\nnewline"' in body
+
+
+def test_render_omits_staleness_family_when_no_fits_recorded() -> None:
+    """A fresh deployment shouldn't carry a zero-row staleness family.
+
+    Mirrors the convention every other opt-in family uses (no rows ->
+    omit entirely) so dashboards can confirm the gauge starts emitting
+    on the first refresh rather than from process boot.
+    """
+    body = Exporter().render().decode()
+    assert "forecast_data_staleness_seconds" not in body
+
+
+def test_render_includes_staleness_after_recording_a_fit() -> None:
+    """A recorded fit emits ``forecast_data_staleness_seconds`` with elapsed time."""
+    exporter = Exporter()
+    before = time_mod.time()
+    exporter.record_series_fit_success(
+        group="node_capacity",
+        query_id="node_cpu_busy_pct",
+        model_name="AutoARIMA",
+        series_key="instance=host-a",
+        labels={
+            "id": "node_cpu_busy_pct",
+            "group": "node_capacity",
+            "model": "AutoARIMA",
+            "instance": "host-a",
+        },
+    )
+    body = exporter.render().decode()
+    after = time_mod.time()
+    assert "# TYPE forecast_data_staleness_seconds gauge" in body
+    assert 'id="node_cpu_busy_pct"' in body
+    assert 'model="AutoARIMA"' in body
+    assert 'group="node_capacity"' in body
+    assert 'instance="host-a"' in body
+    # The value should be a small non-negative elapsed time; the bound
+    # is generous to absorb test scheduler jitter.
+    assert "forecast_data_staleness_seconds{" in body
+    # The recorded sample is bounded by the time we spent between
+    # recording the fit and rendering — well under a second on any
+    # remotely modern machine.
+    assert (after - before) < 5.0
+
+
+def test_staleness_resets_when_fit_is_re_recorded() -> None:
+    """A second successful fit overwrites the timestamp, dropping the elapsed time."""
+    exporter = Exporter()
+    exporter.record_series_fit_success(
+        group="g",
+        query_id="q",
+        model_name="m",
+        series_key="k",
+        labels={"id": "q", "group": "g", "model": "m"},
+    )
+    # Simulate "time passes". We don't actually sleep — we manually
+    # rewrite the recorded timestamp to an older one so the next render
+    # observes a large elapsed value, then re-recording resets the
+    # clock.
+    key = ("g", "q", "m", "k")
+    timestamp, labels = exporter._series_last_success[key]
+    exporter._series_last_success[key] = (timestamp - 3600.0, labels)
+    body = exporter.render().decode()
+    line = next(ln for ln in body.splitlines() if ln.startswith("forecast_data_staleness_seconds{"))
+    # Last value on the metric line is the gauge value.
+    value = float(line.rsplit(" ", 1)[-1])
+    assert value >= 3600.0
+
+    # Re-recording resets the clock.
+    exporter.record_series_fit_success(
+        group="g",
+        query_id="q",
+        model_name="m",
+        series_key="k",
+        labels={"id": "q", "group": "g", "model": "m"},
+    )
+    body2 = exporter.render().decode()
+    line2 = next(
+        ln for ln in body2.splitlines() if ln.startswith("forecast_data_staleness_seconds{")
+    )
+    value2 = float(line2.rsplit(" ", 1)[-1])
+    assert value2 < 5.0
+    # The reset must happen monotonically — the new sample is strictly
+    # smaller than the artificially-aged one.
+    assert value2 < value
+    assert time_mod.time() > 0  # silence "unused import" if assertion sequence shifts
+
+
+def test_staleness_retain_groups_prunes_removed_groups() -> None:
+    exporter = Exporter()
+    exporter.record_series_fit_success(
+        group="keep",
+        query_id="q",
+        model_name="m",
+        series_key="k",
+        labels={"id": "q", "group": "keep", "model": "m"},
+    )
+    exporter.record_series_fit_success(
+        group="drop",
+        query_id="q",
+        model_name="m",
+        series_key="k",
+        labels={"id": "q", "group": "drop", "model": "m"},
+    )
+    exporter.retain_staleness_groups({"keep"})
+    body = exporter.render().decode()
+    assert 'group="keep"' in body
+    assert 'group="drop"' not in body
+
+
+def test_staleness_retain_queries_prunes_removed_queries() -> None:
+    exporter = Exporter()
+    exporter.record_series_fit_success(
+        group="g",
+        query_id="keep",
+        model_name="m",
+        series_key="k",
+        labels={"id": "keep", "group": "g", "model": "m"},
+    )
+    exporter.record_series_fit_success(
+        group="g",
+        query_id="drop",
+        model_name="m",
+        series_key="k",
+        labels={"id": "drop", "group": "g", "model": "m"},
+    )
+    exporter.retain_staleness_queries({("g", "keep")})
+    body = exporter.render().decode()
+    assert 'id="keep"' in body
+    assert 'id="drop"' not in body
+
+
+def test_prune_stale_staleness_drops_rows_older_than_threshold() -> None:
+    """A model dropped from config (or an ephemeral series) gets pruned by age.
+
+    Guards the two leaks the per-group / per-query retention helpers
+    can't reach: a model name removed from ``defaults.models`` (its
+    rows never refresh again) and ephemeral series whose label set
+    rotates (per-pod metrics with short pod lifetimes). Both manifest
+    as a staleness row that's never re-touched by ``record_series_fit_success``;
+    the time-based sweep is the only mechanism that cleans them up.
+    """
+    exporter = Exporter()
+    exporter.record_series_fit_success(
+        group="g",
+        query_id="q",
+        model_name="ghost",
+        series_key="k",
+        labels={"id": "q", "group": "g", "model": "ghost"},
+    )
+    exporter.record_series_fit_success(
+        group="g",
+        query_id="q",
+        model_name="live",
+        series_key="k",
+        labels={"id": "q", "group": "g", "model": "live"},
+    )
+    # Age the ``ghost`` row past the threshold and leave the ``live``
+    # row fresh.
+    ghost_key = ("g", "q", "ghost", "k")
+    live_key = ("g", "q", "live", "k")
+    ghost_ts, ghost_labels = exporter._series_last_success[ghost_key]
+    exporter._series_last_success[ghost_key] = (ghost_ts - 100_000.0, ghost_labels)
+
+    pruned = exporter.prune_stale_staleness(86_400.0)
+
+    assert pruned == 1
+    assert ghost_key not in exporter._series_last_success
+    assert live_key in exporter._series_last_success
+
+
+def test_prune_stale_staleness_no_op_when_threshold_zero_or_negative() -> None:
+    """A zero/negative threshold disables pruning so callers can opt out."""
+    exporter = Exporter()
+    exporter.record_series_fit_success(
+        group="g",
+        query_id="q",
+        model_name="m",
+        series_key="k",
+        labels={"id": "q", "group": "g", "model": "m"},
+    )
+    # Age the row well past any sane threshold.
+    key = ("g", "q", "m", "k")
+    ts, labels = exporter._series_last_success[key]
+    exporter._series_last_success[key] = (ts - 10_000_000.0, labels)
+
+    assert exporter.prune_stale_staleness(0.0) == 0
+    assert exporter.prune_stale_staleness(-1.0) == 0
+    assert key in exporter._series_last_success

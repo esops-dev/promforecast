@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import math
 import threading
+import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -646,6 +647,21 @@ class Exporter:
         # cycle's scores are emitted. Bounded cardinality:
         # 7 days * 24 hours = 168 rows per opted-in (group, query).
         self._incident_recurrence: dict[tuple[str, str, str, str], IncidentRecurrencePoint] = {}
+        # Per-(group, query, model, series_key) last-successful-fit
+        # timestamp. Renders as ``forecast_data_staleness_seconds`` —
+        # the per-series complement to the group-level
+        # ``forecast_last_run_timestamp_seconds``. Successful fits
+        # write a fresh timestamp; failed fits leave the previous
+        # value alone so the staleness clock keeps running. The labels
+        # captured at first record let the render path emit the
+        # complete labelset (source labels + id + group + model)
+        # without the runner having to thread them through every
+        # subsequent render. Bounded by ``N_series * N_models`` per
+        # opted-in query — already counted as part of the forecast
+        # emission so no new cardinality budget is required.
+        self._series_last_success: dict[
+            tuple[str, str, str, str], tuple[float, dict[str, str]]
+        ] = {}
         self._registry = CollectorRegistry()
         self._registry.register(_SnapshotCollector(self))
 
@@ -1004,6 +1020,108 @@ class Exporter:
                 key: point for key, point in self._incident_recurrence.items() if key[0] in names
             }
 
+    def record_series_fit_success(
+        self,
+        *,
+        group: str,
+        query_id: str,
+        model_name: str,
+        series_key: str,
+        labels: dict[str, str],
+    ) -> None:
+        """Record a successful per-(series, model) fit for staleness tracking.
+
+        The runner calls this once per emitted model per series after a
+        successful fit. ``series_key`` is the
+        :func:`_series_key_from_labels` digest used elsewhere in the
+        runner to address per-series state; ``labels`` is the full
+        labelset (source labels + ``id`` + ``group`` + ``model``) the
+        render path emits with the gauge — captured once at first record
+        so the runner doesn't have to re-thread it on every refresh.
+
+        Failed fits never call this method, so the previous timestamp
+        lingers and the next ``render`` returns a growing staleness
+        value — the alert ``ForecastSeriesStale`` keys on that
+        signal.
+        """
+        with self._lock:
+            self._series_last_success[(group, query_id, model_name, series_key)] = (
+                time.time(),
+                dict(labels),
+            )
+
+    def retain_staleness_groups(self, names: set[str]) -> None:
+        """Drop staleness state for groups removed by a config reload.
+
+        Without this an operator who renames a group would see the
+        old group's series stay on /metrics with a forever-growing
+        staleness value because no fit will ever reset their clock.
+        """
+        with self._lock:
+            self._series_last_success = {
+                key: value for key, value in self._series_last_success.items() if key[0] in names
+            }
+
+    def retain_staleness_queries(self, live_pairs: set[tuple[str, str]]) -> None:
+        """Drop staleness state for (group, query) pairs no longer in config.
+
+        Mirrors :meth:`retain_incident_recurrence_queries`. Per-query
+        cleanup so a reload that drops a single query from a
+        still-present group also clears the staleness rows that query
+        contributed; the group-level :meth:`retain_staleness_groups`
+        only handles whole-group removal.
+        """
+        with self._lock:
+            self._series_last_success = {
+                key: value
+                for key, value in self._series_last_success.items()
+                if (key[0], key[1]) in live_pairs
+            }
+
+    def prune_stale_staleness(self, max_age_seconds: float) -> int:
+        """Drop staleness rows whose timestamp is older than ``max_age_seconds``.
+
+        Catches the two failure modes the group/query retention helpers
+        don't cover:
+
+        * **Model removal** — a model dropped from ``defaults.models``
+          never refreshes its clock, so without a sweep the dropped
+          model's rows would fire ``ForecastSeriesStale`` forever.
+        * **Ephemeral series** — series whose label set rotates
+          (per-pod metrics, deployment-id labels) would accumulate
+          unbounded rows; the runner has no way to distinguish "gone"
+          from "temporarily missing" so we sweep by age rather than by
+          explicit liveness.
+
+        The threshold is chosen by the caller so the runner can scale
+        it with ``refresh_interval`` rather than baking in a guess. A
+        sensible default is `max(1d, 24x refresh_interval)` — well
+        past the ``ForecastSeriesStale`` alert horizon (4x refresh)
+        so the operator gets multiple alert cycles before the row
+        disappears, then the row is pruned silently.
+
+        Returns the number of pruned rows for log telemetry — callers
+        can flag a pruning storm as a config-change side effect rather
+        than a routine event.
+        """
+        if max_age_seconds <= 0:
+            return 0
+        cutoff = time.time() - max_age_seconds
+        with self._lock:
+            survivors = {
+                key: value for key, value in self._series_last_success.items() if value[0] >= cutoff
+            }
+            pruned = len(self._series_last_success) - len(survivors)
+            if pruned:
+                self._series_last_success = survivors
+            return pruned
+
+    def _series_last_success_state(
+        self,
+    ) -> dict[tuple[str, str, str, str], tuple[float, dict[str, str]]]:
+        with self._lock:
+            return dict(self._series_last_success)
+
     def retain_incident_recurrence_queries(self, live_pairs: set[tuple[str, str]]) -> None:
         """Drop heatmap rows for (group, query) pairs no longer in config.
 
@@ -1047,6 +1165,7 @@ class _SnapshotCollector:
         )
         deploy_risk_state = self._exporter._deploy_risk_state()
         incident_recurrence_state = self._exporter._incident_recurrence_state()
+        staleness_state = self._exporter._series_last_success_state()
         yield from _forecast_families(groups)
         yield from _conditional_forecast_families(groups)
         yield from _conditional_deviation_families(groups)
@@ -1087,6 +1206,7 @@ class _SnapshotCollector:
         yield from _conditional_aliased_families(conditional_aliased_state)
         yield from _deploy_risk_families(deploy_risk_state)
         yield from _incident_recurrence_families(incident_recurrence_state)
+        yield from _staleness_families(staleness_state)
 
 
 def _emit_gauge_family(
@@ -2278,4 +2398,59 @@ def _incident_recurrence_families(
         "the bucket sees more incidents than average.",
         value_fn=lambda p: p.score,
         skip_fn=lambda p: not math.isfinite(p.score),
+    )
+
+
+@dataclass(frozen=True)
+class _StalenessPoint:
+    """Adapter so :func:`_emit_gauge_family` can render staleness state.
+
+    Built from the captured ``(timestamp, labels)`` tuple at render
+    time, with ``value`` already converted to the elapsed-seconds
+    gauge value. Avoids hand-rolling the label-union recipe that
+    every other gauge family in this module already shares.
+    """
+
+    labels: dict[str, str]
+    value: float
+
+
+def _staleness_families(
+    state: dict[tuple[str, str, str, str], tuple[float, dict[str, str]]],
+) -> Iterator[GaugeMetricFamily]:
+    """Render ``forecast_data_staleness_seconds{id, group, model, ...}``.
+
+    Per-(series, model) gauge of seconds since the last successful
+    forecast emission. The per-series complement to the group-level
+    ``forecast_last_run_timestamp_seconds``: a single series whose
+    model crashed silently goes undetected on the group gauge (the
+    other series keep the group's last-run timestamp ticking) but
+    its staleness clock visibly grows here, so an alert on
+    ``forecast_data_staleness_seconds > 4 * <refresh_interval>``
+    catches the silent failure.
+
+    Emitted only after at least one successful fit has been recorded
+    so /metrics stays quiet on a fresh deployment before the first
+    refresh cycle completes. Cardinality is bounded by
+    ``N_series * N_models`` per opted-in query — already part of the
+    forecast emission budget.
+    """
+    if not state:
+        return
+    now = time.time()
+    points = [
+        _StalenessPoint(labels=labels, value=max(0.0, now - timestamp))
+        for timestamp, labels in state.values()
+    ]
+    yield from _emit_gauge_family(
+        points,
+        "forecast_data_staleness_seconds",
+        "Seconds elapsed since the last successful forecast emission for "
+        "the (series, model) tuple. The per-series complement to the "
+        "group-level ``forecast_last_run_timestamp_seconds`` — a single "
+        "series whose model crashed silently keeps the group's last-run "
+        "timestamp ticking via the other series, but its staleness clock "
+        "visibly grows here. Failed fits leave the clock running; "
+        "successful fits reset it to zero.",
+        value_fn=lambda p: p.value,
     )

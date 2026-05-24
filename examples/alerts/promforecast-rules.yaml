@@ -34,6 +34,33 @@ spec:
               {{ $labels.group }} in over 2 hours. Check pod logs and
               datasource availability.
 
+        # Per-series complement to ForecastStale above. The group-level
+        # gauge keeps ticking as long as *any* series of the group is
+        # fit successfully, so a single series whose model crashes
+        # silently is invisible there. ``forecast_data_staleness_seconds``
+        # tracks the per-(series, model) clock so the silent failure
+        # surfaces — alert when staleness exceeds four refresh cycles
+        # (≈ four hours at the default 1h refresh).
+        - alert: ForecastSeriesStale
+          expr: forecast_data_staleness_seconds > 14400
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: >-
+              Forecast {{ $labels.id }} model {{ $labels.model }} on
+              {{ $labels.instance }} hasn't been refit for >4h
+            description: |
+              The (series, model) tuple for {{ $labels.id }} on group
+              {{ $labels.group }} hasn't produced a successful forecast
+              for over four hours. The group-level ForecastStale alert
+              stays quiet because other series in the group are still
+              being fit successfully; this rule catches the silent
+              per-series failure (model crash, persistent fit timeout,
+              data gap that drops the series under min_points). Check
+              the forecaster logs filtered by group + query, then by
+              the source-side labels carried on the staleness gauge.
+
         # Backtest accuracy has degraded — model needs retraining or
         # replacement. Threshold is intentionally loose; tune for the SLOs
         # of the metrics being forecasted.

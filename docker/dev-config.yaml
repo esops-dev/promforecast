@@ -40,6 +40,12 @@ server:
   # Earlier 1m caused the per-group lock to back up runs to ~10 min effective
   # cadence on http_demo and node_storage.
   refresh_interval: 5m
+  # Expose the warm-up status endpoint so an operator can verify the
+  # fresh-install behaviour with
+  #   docker compose exec pf-forecaster promforecast warmup --url http://localhost:9091
+  # from the dev stack without re-rendering the chart. Safe in dev because the
+  # forecaster's metrics port isn't exposed beyond the docker-compose network.
+  expose_warmup_endpoint: true
 
 # Tight caps to exercise overflow handling end-to-end in dev.
 safety:

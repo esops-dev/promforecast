@@ -1,7 +1,8 @@
 # CLI reference
 
-The `promforecast` binary provides three subcommands: `run`, `validate`,
-and `diagnose` (with `duplicates` and `sample-rate` sub-subcommands).  
+The `promforecast` binary provides seven subcommands: `run`,
+`validate`, `adapter`, `diagnose` (with `duplicates` and `sample-rate`
+sub-subcommands), `inspect`, `warmup`, and `backfill`.
 Running `promforecast --config foo.yaml` is identical to `promforecast run --config foo.yaml`, so existing container entrypoints continue to work unchanged.
 
 ## `promforecast run`
@@ -125,3 +126,60 @@ alone would.
 See [`../operations/diagnose.md`](../operations/diagnose.md) for the full
 reference, authentication recipes, in-cluster invocation
 (`kubectl exec`), and CI-integration patterns.
+
+## `promforecast inspect`
+
+```bash
+promforecast inspect \
+    --config <path> --query <id> \
+    [--series-filter '{label="value",...}'] \
+    [--horizon <duration>] [--lookback <duration>] [--model <name>] \
+    [--backtest] [--json]
+```
+
+Debugs a single weird forecast: fetches the configured series from
+the TSDB, runs the configured fit pipeline exactly as the live
+forecaster would, and prints the inputs, the fit, the forecast curve,
+and (with `--backtest`) the per-fold backtest predictions vs.
+actuals. See [`../operations/inspect.md`](../operations/inspect.md)
+for debugging walkthroughs.
+
+Exit codes: `0` on success, `1` for inspector-level failures (unknown
+query, ambiguous series, fit error), `2` for datasource / network
+failures.
+
+## `promforecast warmup`
+
+```bash
+promforecast warmup \
+    [--url http://forecaster:9091] [--timeout 30] [--json]
+```
+
+Calls a running forecaster's `GET /forecast/warmup` endpoint and
+prints per-(group, query) "what is still loading?" status. The
+endpoint must be enabled via `server.expose_warmup_endpoint: true`;
+see [`../operations/warmup.md`](../operations/warmup.md).
+
+Exit codes: `0` when every query reports `status=ready`, `1` when at
+least one is still warming or errored, `2` for network failures
+(suitable for a `until` loop in a pre-flight script).
+
+## `promforecast backfill`
+
+```bash
+promforecast backfill \
+    --config <path> --from <duration> \
+    [--to now|<iso-8601>] [--groups GROUP1 GROUP2 ...] [--sink-url <url>]
+```
+
+Replays the fit pipeline at simulated past timestamps and pushes the
+resulting forecast curves + accuracy summaries to the configured
+`sink.remote_write` URL with explicit historical `timestamp_ms`
+values. Use right after `helm install` so SLO / quality dashboards
+populate from day one. The window is capped by
+`safety.backfill_max_window` (default `90d`); see
+[`../operations/backfill.md`](../operations/backfill.md) for the
+resource-sizing trade-off.
+
+Exit codes: `0` on success, `1` for invalid input (over-budget
+window, no configured sink), `2` for TSDB / network failures.

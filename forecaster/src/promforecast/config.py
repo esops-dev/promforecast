@@ -152,6 +152,16 @@ class ServerConfig(BaseModel):
     # ``safety.fleet_what_if_min_interval``. Same network-level
     # access-control model as ``/-/reload`` / ``/forecast/preview``.
     expose_what_if_endpoint: bool = False
+    # ``GET /forecast/warmup`` reports per-(group, query) "what is still
+    # loading?" status for a fresh install: how many points each query
+    # has versus how many it needs, the blocking reason (min_points,
+    # missing regressor, ...), and a rough ETA to first usable forecast.
+    # Off by default — the endpoint costs one cheap probe query per
+    # configured query when called, which is fine for ad-hoc debugging
+    # but would be wasteful for any monitoring system polling it on
+    # cadence. Same network-level access-control model as
+    # ``/-/reload``. See ``docs/operations/warmup.md``.
+    expose_warmup_endpoint: bool = False
 
 
 class SafetyConfig(BaseModel):
@@ -191,6 +201,16 @@ class SafetyConfig(BaseModel):
     # interactive dashboards; setting it higher is appropriate for
     # forecasters that share an executor with high-cardinality groups.
     fleet_what_if_min_interval: Duration = timedelta(minutes=5)
+    # Hard upper bound on the backfill window passed to
+    # ``promforecast backfill --from <duration>``. Backfill walks one
+    # fit per ``server.refresh_interval`` across the requested window —
+    # at the default 1h refresh a 90d window is 2160 fits per group,
+    # comfortably in the hours of CPU range. The cap rejects accidental
+    # year-long requests at the CLI boundary rather than letting them
+    # silently kick off an overnight job; raise it explicitly only when
+    # the operator has sized the cluster for the work. See
+    # ``docs/operations/backfill.md`` for the trade-off.
+    backfill_max_window: Duration = timedelta(days=90)
 
 
 class ConformalConfig(BaseModel):

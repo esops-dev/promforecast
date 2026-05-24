@@ -11,6 +11,7 @@ import sys
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Any
 
 import structlog
 import uvicorn
@@ -18,12 +19,15 @@ from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse, PlainTextResponse
 
 from . import adapter as adapter_module
+from . import backfill as backfill_module
 from . import config as config_module
 from . import diagnose as diagnose_module
 from . import ha_cache as ha_cache_module
+from . import inspect as inspect_module
 from . import preview as preview_module
 from . import telemetry as telemetry_module
 from . import validate as validate_module
+from . import warmup as warmup_module
 from . import what_if as what_if_module
 from .cache import MemoryQueryCache, QueryCache, QueryCacheBackend, RedisQueryCache
 from .exporter import Exporter
@@ -64,6 +68,48 @@ def cli() -> None:
             tls_key=args.tls_key,
         )
         return
+
+    if args.command == "backfill":
+        rc = backfill_module.run_backfill(
+            config_path=args.config,
+            from_duration=args.from_,
+            to_timestamp=args.to,
+            group_selector=args.groups,
+            sink_url_override=args.sink_url,
+        )
+        sys.exit(rc)
+
+    if args.command == "inspect":
+        try:
+            series_filter = inspect_module.parse_series_filter(args.series_filter)
+        except inspect_module.InspectError as exc:
+            sys.stderr.write(f"error: {exc}\n")
+            sys.exit(exc.exit_code)
+        horizon_seconds = (
+            _parse_prom_duration(args.horizon, flag_name="--horizon") if args.horizon else None
+        )
+        lookback_seconds = (
+            _parse_prom_duration(args.lookback, flag_name="--lookback") if args.lookback else None
+        )
+        rc = inspect_module.run_inspect(
+            config_path=args.config,
+            query_id=args.query,
+            series_filter=series_filter,
+            horizon_seconds=horizon_seconds,
+            lookback_seconds=lookback_seconds,
+            model=args.model,
+            backtest=args.backtest,
+            json_output=args.json,
+        )
+        sys.exit(rc)
+
+    if args.command == "warmup":
+        rc = _run_warmup_cli(
+            url=args.url,
+            timeout_seconds=args.timeout,
+            json_output=args.json,
+        )
+        sys.exit(rc)
 
     if args.command == "diagnose":
         if args.diagnose_command == "duplicates":
@@ -200,6 +246,171 @@ def _build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         help="Path to the private key for ``--tls-cert``.",
+    )
+
+    backfill_p = sub.add_parser(
+        "backfill",
+        help=(
+            "Replay the fit pipeline at simulated past timestamps and push "
+            "the resulting forecast curves + accuracy summaries to the "
+            "configured remote_write sink with historical timestamps. Use "
+            "to populate the long-term TSDB so SLOs / quality dashboards "
+            "are meaningful from day one rather than only from install "
+            "time forward. See ``docs/operations/backfill.md`` for the "
+            "resource-sizing trade-off."
+        ),
+    )
+    backfill_p.add_argument(
+        "--config",
+        type=Path,
+        required=True,
+        help="Path to the forecaster YAML config (same shape the live runner uses).",
+    )
+    backfill_p.add_argument(
+        "--from",
+        dest="from_",
+        required=True,
+        help=(
+            "How far back to walk, as a Prometheus duration (e.g. ``30d``). "
+            "Capped by ``safety.backfill_max_window`` so an accidental "
+            "year-long request fails fast."
+        ),
+    )
+    backfill_p.add_argument(
+        "--to",
+        default=None,
+        help=(
+            "End timestamp for the walk. Accepts ``now`` (default) or an "
+            "ISO-8601 timestamp (``2026-05-24T12:00:00Z``)."
+        ),
+    )
+    backfill_p.add_argument(
+        "--groups",
+        nargs="+",
+        default=None,
+        help=(
+            "Optional space-separated list of group names to backfill. "
+            "Defaults to every configured group when omitted."
+        ),
+    )
+    backfill_p.add_argument(
+        "--sink-url",
+        default=None,
+        help=(
+            "Override ``sink.remote_write.url`` for the backfill push. "
+            "Useful when running the one-shot Job against a different TSDB "
+            "than the live forecaster's sink (e.g. a dedicated backfill "
+            "endpoint with a relaxed ``futureRetention``)."
+        ),
+    )
+
+    inspect_p = sub.add_parser(
+        "inspect",
+        help=(
+            "Debug a single forecast: fetch the configured series from the "
+            "TSDB, run the configured fit pipeline exactly as the live "
+            "forecaster would, and print the inputs, the fit, the forecast "
+            "curve, and optionally per-fold backtest predictions. See "
+            "``docs/operations/inspect.md`` for a debugging walkthrough."
+        ),
+    )
+    inspect_p.add_argument(
+        "--config",
+        type=Path,
+        required=True,
+        help="Path to the forecaster YAML config (the live runner's config).",
+    )
+    inspect_p.add_argument(
+        "--query",
+        required=True,
+        help=(
+            "ID of the query to inspect (matches one of ``groups[].queries[].id``). "
+            "The first match across groups wins."
+        ),
+    )
+    inspect_p.add_argument(
+        "--series-filter",
+        default=None,
+        help=(
+            "PromQL-style label selector to pick one series when the query "
+            'returns multiple frames (e.g. \'{instance="host-a",device="sda1"}\'). '
+            "Required when the query returns more than one series."
+        ),
+    )
+    inspect_p.add_argument(
+        "--horizon",
+        default=None,
+        help=(
+            "Override the forecast horizon for this run (Prometheus duration, "
+            "e.g. ``1h``). Falls back to ``defaults.horizon`` from the config."
+        ),
+    )
+    inspect_p.add_argument(
+        "--lookback",
+        default=None,
+        help=(
+            "Override the lookback window for this run (Prometheus duration, "
+            "e.g. ``14d``). Falls back to ``defaults.lookback`` from the config."
+        ),
+    )
+    inspect_p.add_argument(
+        "--model",
+        default=None,
+        help=(
+            "Override the model used for the inspector fit. Must be one of "
+            "the configured ``defaults.models`` entries; defaults to the first."
+        ),
+    )
+    inspect_p.add_argument(
+        "--backtest",
+        action="store_true",
+        help=(
+            "Also run the configured backtest on the most recent hold-out and "
+            "print per-step actuals vs. predictions with bands and MAPE/MASE. "
+            "Useful for diagnosing 'backtests well, predicts badly' scenarios."
+        ),
+    )
+    inspect_p.add_argument(
+        "--json",
+        action="store_true",
+        help=(
+            "Emit the full inspector report as JSON instead of the aligned "
+            "text table. Suitable for piping into ``jq`` or saving as a CI "
+            "artifact alongside a flaky forecast."
+        ),
+    )
+
+    warmup_p = sub.add_parser(
+        "warmup",
+        help=(
+            "Print per-(group, query) warm-up status by calling a forecaster's "
+            "/forecast/warmup endpoint. The typical operator workflow on a "
+            "fresh install: ``promforecast warmup --url http://localhost:9091`` "
+            "until every query reports status=ready."
+        ),
+    )
+    warmup_p.add_argument(
+        "--url",
+        default="http://localhost:9091",
+        help=(
+            "Base URL of the forecaster to query. Defaults to "
+            "``http://localhost:9091`` for the in-cluster port-forward "
+            "and docker-compose dev stack."
+        ),
+    )
+    warmup_p.add_argument(
+        "--timeout",
+        type=_positive_float,
+        default=30.0,
+        help="HTTP timeout for the /forecast/warmup call, in seconds.",
+    )
+    warmup_p.add_argument(
+        "--json",
+        action="store_true",
+        help=(
+            "Print the raw JSON response instead of the aligned table. Useful "
+            "for piping into ``jq`` or consuming from a CI pre-flight script."
+        ),
     )
 
     diagnose_p = sub.add_parser(
@@ -388,6 +599,88 @@ def _positive_int(value: str) -> int:
     return parsed
 
 
+def _positive_float(value: str) -> float:
+    """argparse type for the warmup / inspect CLI timeout knobs."""
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"must be a positive number; got {value!r}") from exc
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError(f"must be > 0; got {parsed}")
+    return parsed
+
+
+def _run_warmup_cli(*, url: str, timeout_seconds: float, json_output: bool) -> int:
+    """Call ``GET <url>/forecast/warmup`` and render the response.
+
+    Returns ``0`` when every query in every group reports ``ready``
+    *or* when the forecaster has no configured queries to warm up
+    (``until promforecast warmup`` loops would otherwise spin forever
+    against a freshly-installed empty config). Returns ``1`` when at
+    least one query is still warming or in error so a CI pre-flight
+    script can gate "is the install done?" on the exit code. Network
+    failures return ``2`` so they're distinguishable from "still
+    warming".
+    """
+    import json  # noqa: PLC0415
+
+    import httpx  # noqa: PLC0415
+
+    endpoint = url.rstrip("/") + "/forecast/warmup"
+    try:
+        response = httpx.get(endpoint, timeout=timeout_seconds)
+        response.raise_for_status()
+        payload = response.json()
+    except httpx.HTTPError as exc:
+        sys.stderr.write(f"error: warmup request to {endpoint!r} failed: {exc}\n")
+        return 2
+
+    if json_output:
+        sys.stdout.write(json.dumps(payload, indent=2) + "\n")
+    else:
+        report = _report_from_payload(payload)
+        sys.stdout.write(warmup_module.render_table(report))
+
+    statuses = {
+        q.get("status", "") for group in payload.get("groups", []) for q in group.get("queries", [])
+    }
+    if not statuses:
+        # Empty config — nothing to warm up. Treat as "done" rather
+        # than "still warming" so a docs-recommended ``until
+        # promforecast warmup`` loop terminates instead of spinning
+        # forever against a fresh install whose ``groups`` is empty
+        # (the operator hasn't added any queries yet, but the
+        # forecaster itself is healthy).
+        return 0
+    return 0 if statuses == {"ready"} else 1
+
+
+def _report_from_payload(payload: dict[str, Any]) -> warmup_module.WarmupReport:
+    """Reconstruct a :class:`WarmupReport` from the JSON envelope.
+
+    The HTTP body is a dict already shaped by ``WarmupReport.to_dict``;
+    this round-trip lets the CLI reuse the renderer without duplicating
+    the table formatting.
+    """
+    groups: list[warmup_module.GroupWarmupStatus] = []
+    for group in payload.get("groups", []):
+        queries = [
+            warmup_module.QueryWarmupStatus(
+                id=str(q.get("id", "")),
+                status=q.get("status", "ready"),
+                points_available=int(q.get("points_available", 0)),
+                points_needed=int(q.get("points_needed", 0)),
+                blocked_by=str(q.get("blocked_by", "none")),
+                eta_seconds=float(q.get("eta_seconds", 0.0)),
+            )
+            for q in group.get("queries", [])
+        ]
+        groups.append(
+            warmup_module.GroupWarmupStatus(name=str(group.get("name", "")), queries=queries)
+        )
+    return warmup_module.WarmupReport(groups=groups)
+
+
 def _resolve_diagnose_datasource(args: argparse.Namespace) -> str:
     """``--datasource`` wins; otherwise pull ``datasource.url`` from ``--config``.
 
@@ -535,6 +828,7 @@ def run(config_path: Path, log_level: str) -> None:
         expose_config_endpoint=cfg.server.expose_config_endpoint,
         expose_preview_endpoint=cfg.server.expose_preview_endpoint,
         expose_what_if_endpoint=cfg.server.expose_what_if_endpoint,
+        expose_warmup_endpoint=cfg.server.expose_warmup_endpoint,
         source=source,
         snapshot_cache=snapshot_cache,
         elector=elector,
@@ -610,6 +904,7 @@ def _build_app(  # noqa: PLR0915
     expose_config_endpoint: bool = False,
     expose_preview_endpoint: bool = False,
     expose_what_if_endpoint: bool = False,
+    expose_warmup_endpoint: bool = False,
     source: PromSource | None = None,
     snapshot_cache: ha_cache_module.SnapshotCache | None = None,
     elector: LeaderElector | None = None,
@@ -826,6 +1121,36 @@ def _build_app(  # noqa: PLR0915
                 )
             exporter.increment_what_if_run("admitted")
             return JSONResponse(result)
+
+    if expose_warmup_endpoint and source is None:
+        logger.warning(
+            "warmup_endpoint_disabled_no_source",
+            reason="server.expose_warmup_endpoint=true but no datasource was wired",
+        )
+    if expose_warmup_endpoint and source is not None:
+
+        @app.get("/forecast/warmup")
+        async def warmup_endpoint() -> Response:
+            """Report per-(group, query) warm-up status.
+
+            See ``docs/operations/warmup.md``. Each call issues one
+            cheap probe per configured query — non-event, non-template
+            queries get a short ``query_range`` against the configured
+            lookback so the report reflects what the runner would
+            actually see on its next refresh tick.
+            """
+            try:
+                report = await warmup_module.compute_warmup(
+                    config=runner._config,
+                    source=source,
+                )
+            except Exception as exc:
+                logger.exception("warmup_endpoint_failed")
+                return JSONResponse(
+                    {"error": "internal", "message": str(exc)},
+                    status_code=500,
+                )
+            return JSONResponse(report.to_dict())
 
     return app
 

@@ -69,6 +69,15 @@ config:
     # starve scheduled fits. Same network-level access-control model as
     # /metrics and /-/reload.
     expose_what_if_endpoint: false
+    # Off by default. Flip to true to expose `GET /forecast/warmup` which
+    # reports per-(group, query) "what is still loading?" status — useful
+    # immediately after a fresh install (or a restart that wiped the
+    # TSDB volume) so the operator can answer "why are my forecasts not
+    # showing in Grafana yet?" without log scraping. Each call costs one
+    # cheap PromQL probe per configured query; safe for ad-hoc debugging,
+    # wasteful for any monitoring system polling it on cadence. The
+    # companion CLI is `promforecast warmup --url <forecaster-url>`.
+    expose_warmup_endpoint: false
 
   safety:
     max_series_per_query: 500

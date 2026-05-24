@@ -54,7 +54,10 @@ scheduling, and serving telemetry.
 - [Scheduling](operations/scheduling.md) — per-query refresh intervals, max-concurrent-fits cap
 - [High availability](operations/ha.md) — Lease-based leader election, Redis snapshot cache
 - [Query cache](operations/cache.md) — in-memory LRU + optional Redis dedup for overlapping PromQL
-- [Telemetry](operations/telemetry.md) — internal metrics catalogue
+- [Telemetry](operations/telemetry.md) — internal metrics catalogue + per-series staleness gauge
+- [Warm-up status](operations/warmup.md) — fresh-install "what is still loading?" endpoint and CLI
+- [Forecast inspector](operations/inspect.md) — debug a single weird forecast end-to-end, with optional per-fold backtest exposure
+- [Historical backfill](operations/backfill.md) — replay the fit pipeline at past timestamps so SLO dashboards are meaningful from day one
 
 ## Guides
 

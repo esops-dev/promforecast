@@ -1,3 +1,76 @@
+# Forecaster telemetry
+
+Two layers of operator-facing observability:
+
+1. **Metrics** — always on. Per-(series, model) data-freshness, per-group
+   run state, per-fit duration, per-reason failure counters; documented
+   inline next to the family they describe (see
+   [docs/README.md](../README.md) for the per-feature index). The new
+   per-series staleness gauge is described below; the rest live next to
+   the feature that emits them.
+2. **Tracing (OpenTelemetry)** — opt-in. Spans per group / query / fit;
+   shipped via OTLP-gRPC to whatever collector you already run.
+
+## Per-series staleness
+
+`forecast_data_staleness_seconds{id, group, model, ...source_labels}`
+is a per-(series, model) gauge of seconds since the last successful
+forecast emission. It's the per-series complement to the group-level
+`forecast_last_run_timestamp_seconds`:
+
+| Signal                                          | Question it answers                          |
+|-------------------------------------------------|----------------------------------------------|
+| `forecast_last_run_timestamp_seconds{group}`    | Has *the group* refreshed recently?          |
+| `forecast_data_staleness_seconds{id, group, model}` | Is *this specific series* still being fit? |
+
+The group-level gauge keeps ticking as long as *any* series of the
+group is fit successfully, so a single series whose model crashes
+silently is invisible there. The staleness clock tracks the per-(series,
+model) emission cadence — successful fits reset it to zero, failed
+fits leave the previous timestamp alone so the gauge value grows.
+
+Cardinality: `N_series × N_models` per opted-in query — already
+counted as part of the forecast emission, so no new cardinality
+budget is required.
+
+The shipped `examples/alerts/promforecast-rules.yaml` carries a
+`ForecastSeriesStale` alert keyed on this gauge:
+
+```yaml
+- alert: ForecastSeriesStale
+  expr: forecast_data_staleness_seconds > 14400   # 4h, ≈ 4 × default refresh
+  for: 15m
+  labels:
+    severity: warning
+```
+
+Tune the threshold to four-or-so times your `server.refresh_interval`
+— short enough to catch a single missed cycle, long enough to absorb
+transient backoff. Pair with `forecast_failures_total` filtered by
+`group` + `query` for the root cause.
+
+### Never-succeeded series
+
+The gauge is **absent** until a (series, model) tuple's first
+successful fit — the clock is only started on success. A series that
+fails on its very first attempt and never succeeds therefore won't
+trip `ForecastSeriesStale` because there's no sample for the alert
+to bind to. Pair `ForecastSeriesStale` with two complementary signals
+for that case:
+
+* `forecast_failures_total{reason=~"fit_error|fit_timeout|...",group="..."} > 0`
+  — counts every per-series fit attempt that raised. Use the
+  [`/forecast/warmup`](warmup.md) endpoint on a fresh install to
+  distinguish "still warming up" from "consistently failing".
+* `forecast_series_dropped_total{reason="min_points",group="..."} > 0`
+  — counts series that didn't even get a fit attempt because the
+  TSDB doesn't have enough points yet.
+
+We picked "absent until first success" deliberately: a synthetic
+`+Inf` starting state would either fire the alert for every fresh
+install (operator surprise) or hide behind a `for: <warmup>` clause
+that masks real first-attempt failures.
+
 # OpenTelemetry tracing
 
 Opt-in distributed tracing for the full query → fit → export pipeline.  
