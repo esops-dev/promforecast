@@ -25,7 +25,7 @@ There is **no universal “good MAPE”** — it depends heavily on the signal.
 | Bursty                | `50–100 %`         | Disk I/O with occasional spikes |
 | Sparse / near-zero    | `100 % +` (or NaN) | Rare error rates |
 
-For sparse/near-zero series, MAPE becomes unreliable. Set `data_profile: intermittent` on the query to switch to MASE scoring (see [models.md](models.md)).
+For sparse/near-zero series, MAPE becomes unreliable. Set `data_profile: intermittent` on the query to switch to MASE scoring (see [`../reference/models.md`](../reference/models.md)).
 
 ## Mean quality vs. p95 MAPE — why they can disagree
 
@@ -85,7 +85,7 @@ For per-series drill-down (quality, drift, deviation, durations, errors) switch 
 
 ## See also
 
-- [telemetry.md](telemetry.md) — full list of emitted metrics and labels  
-- [conformal.md](conformal.md) — how bands are empirically calibrated  
-- [drift.md](drift.md) — `forecast_drift_score` semantics  
-- [scheduling.md](scheduling.md) — how `refresh_interval` and per-query overrides work
+- [`../operations/telemetry.md`](../operations/telemetry.md) — full list of emitted metrics and labels  
+- [`../outputs/conformal.md`](../outputs/conformal.md) — how bands are empirically calibrated  
+- [`../outputs/drift.md`](../outputs/drift.md) — `forecast_drift_score` semantics  
+- [`../operations/scheduling.md`](../operations/scheduling.md) — how `refresh_interval` and per-query overrides work

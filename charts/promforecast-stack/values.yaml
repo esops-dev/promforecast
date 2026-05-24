@@ -64,7 +64,7 @@ promforecast:
   # fail with ``no matches for kind ServiceMonitor`` on a cluster without
   # the CRD. For installs that scrape with a plain Prometheus (no
   # operator), flip this off and paste the ``metric_relabel_configs``
-  # snippet from ``docs/architecture/emission-paths.md`` into your scrape
+  # snippet from ``docs/reference/emission-paths.md`` into your scrape
   # config — the snapshot families must be dropped somewhere or the
   # dual-source trap reappears.
   serviceMonitor:

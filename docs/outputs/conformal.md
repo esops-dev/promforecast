@@ -41,6 +41,16 @@ Additive offset (in metric units) applied to each side of the band.
 Zero means the original parametric band already met its nominal coverage.  
 Emitted bands also carry the label `calibrated="true"` on `_forecast_lower` / `_forecast_upper` so dashboards can filter or color them separately.
 
+### Conditional band
+
+When `emission.conditional: true` is also on for the query, the conditional band carries its own per-fit calibration (regressors held flat at the final pre-holdout value, matching the production-time conditional inference contract). The per-(model, level) widening lands as:
+
+```
+forecast_conditional_band_calibration_offset{id, group, model, level}
+```
+
+Per-(model) calibration failures fall back to the inherited unconditional offsets and bump `forecast_conditional_calibration_failures_total{group, query, reason}` (`reason` ∈ `degenerate_holdout` | `fit_timeout` | `fit_error`). See [`../inputs/regressors.md`](../inputs/regressors.md#conditional-band-conformal-calibration).
+
 ## When conformal can’t help
 
 - **Insufficient lookback** — fewer than five points on each side of the split.
@@ -119,6 +129,6 @@ comfortably bounded.
 
 ## See also
 
-- [Models](models.md) — backtest accuracy feeds the calibrator.
-- [Input preprocessing](preprocessing.md) — outlier scrubbing runs *before* calibration to keep the hold-out clean.
+- [Models](../reference/models.md) — backtest accuracy feeds the calibrator.
+- [Input preprocessing](../inputs/preprocessing.md) — outlier scrubbing runs *before* calibration to keep the hold-out clean.
 - [Forecast drift telemetry](drift.md) — complements coverage by surfacing prediction-vs-prediction shifts.

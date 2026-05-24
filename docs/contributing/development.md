@@ -56,7 +56,7 @@ Three files must stay in sync:
 
 1. `forecaster/src/promforecast/models/<name>.py` (model wrapper).
 2. `forecaster/pyproject.toml` (entry-point registration).
-3. `docs/models.md` (user docs).
+3. `docs/reference/models.md` (user docs).
 
 CI automatically tests the full registered model set.
 

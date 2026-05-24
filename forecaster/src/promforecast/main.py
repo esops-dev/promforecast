@@ -672,7 +672,7 @@ def _build_app(
 
             Stateless: nothing about this request touches ``/metrics``,
             the snapshot, or scheduled fits. Same network-level
-            access-control model as ``/-/reload``. See ``docs/preview.md``
+            access-control model as ``/-/reload``. See ``docs/outputs/preview.md``
             for the request schema + worked examples.
             """
             try:

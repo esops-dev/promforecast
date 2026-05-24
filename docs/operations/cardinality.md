@@ -45,6 +45,7 @@ Notation:
 | Drain ETA (`le_drain`)                      | `S × M × N_drain_thresholds × (1 + L)` | Charged separately from the standard ETA |
 | Growth rate                                 | `S × M × N_windows`                    | `emission.growth_rate.enabled: true` |
 | Conditional forecast families               | `S × M × (1 + 2L)`                     | `emission.conditional: true` (may add extra fit) |
+| `forecast_conditional_band_calibration_offset` | `S × M × L`                          | `emission.conditional: true` *and* `accuracy.conformal.enabled: true` |
 | SLO error budget                            | `S × M × N_windows × (3 + L)`          | `slo:` configured (3 sibling families × N_windows, plus level fan-out on exhausted_in) |
 | Recommended maintenance windows             | `S × M × count`                        | `recommended_windows.enabled: true` |
 | Operational + preprocessing families        | ~7 per group + ~6 per query            | Mostly always on |
@@ -71,7 +72,7 @@ With default `safety.max_total_series: 5000` this would fail `--strict-cardinali
 
 ## See also
 
-- [Architecture — emission paths](../architecture/emission-paths.md)
-- [Capacity planning](../capacity.md)
-- [Conditional forecasts](../conditional-forecasts.md)
-- [Explainability](../explainability.md)
+- [Emission paths](../reference/emission-paths.md)
+- [Capacity planning](../outputs/capacity.md)
+- [Conditional forecasts](../inputs/regressors.md#conditional-forecasts)
+- [Explainability](../outputs/explainability.md)

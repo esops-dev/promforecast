@@ -5,7 +5,7 @@
     up automatically. VictoriaMetrics is registered as the default so the
     bundled dashboards land on the sink-fed copy of the forecast metrics
     (smooth curves) rather than the scraped snapshot (5-min staircase).
-    See ``docs/architecture/emission-paths.md`` for why the default matters.
+    See ``docs/reference/emission-paths.md`` for why the default matters.
 */}}
 {{- $vm := .Values.datasources.victoriaMetrics }}
 {{- $prom := .Values.datasources.prometheus }}

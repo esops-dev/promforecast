@@ -82,5 +82,5 @@ With `outliers.enabled: true, method: hampel, sensitivity: medium` the spike is 
 
 ## Interaction with conformal calibration
 
-Outlier scrubbing runs **before** conformal calibration (see [`conformal.md`](conformal.md)).  
+Outlier scrubbing runs **before** conformal calibration (see [`../outputs/conformal.md`](../outputs/conformal.md)).  
 A clean hold-out window produces tighter, more honest quantile bands.

@@ -110,7 +110,7 @@ spec:
               echo "Remediation: promforecast.serviceMonitor.enabled=true (the umbrella default)" >&2
               echo "             so the standalone chart drops the snapshot families. For an" >&2
               echo "             externally-managed Prometheus, add the metric_relabel_configs" >&2
-              echo "             snippet from docs/architecture/emission-paths.md." >&2
+              echo "             snippet from docs/reference/emission-paths.md." >&2
               echo "$dup_out" >&2
               exit 1
             fi

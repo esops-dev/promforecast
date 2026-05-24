@@ -3,7 +3,7 @@
 Two subcommands today:
 
 * ``duplicates`` — scan for the dual-source forecast labelset state described
-  in ``docs/architecture/emission-paths.md``. Catches the case where the
+  in ``docs/reference/emission-paths.md``. Catches the case where the
   scraped and sink-pushed copies are *distinguishable* by labelset shape
   (different external_labels, ``honor_labels: false`` accidentally set,
   source signals missing a ``job`` label).
@@ -63,7 +63,7 @@ _VALUE_PAIR_LEN = 2
 # ``*_time_to_threshold_seconds`` derived ETA metrics) are *not* in scope —
 # they live on /metrics only and intentionally carry source-side labels
 # like ``job="node-exporter"`` per design principle 8. See the operational-
-# metrics section of ``docs/architecture/emission-paths.md``.
+# metrics section of ``docs/reference/emission-paths.md``.
 FORECAST_METRIC_REGEX = r".+_forecast(_lower|_upper)?"
 
 # Scrape-only marker labels. A labelset family carrying *any* of these is

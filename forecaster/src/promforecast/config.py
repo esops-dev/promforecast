@@ -36,7 +36,7 @@ REGRESSOR_TYPES = ("custom", "calendar", "holidays")
 # with a one-shot ``DeprecationWarning`` nudging operators to retag. Any
 # future breaking change will ship under a fresh ``apiVersion`` with both
 # the old and new schemas accepted during a documented deprecation window
-# — see ``docs/config-schema.md`` for the migration policy.
+# — see ``docs/reference/config-schema.md`` for the migration policy.
 CURRENT_API_VERSION = "promforecast.io/v1"
 DEPRECATED_API_VERSIONS: frozenset[str] = frozenset({"promforecast.io/v1alpha1"})
 SUPPORTED_API_VERSIONS: frozenset[str] = frozenset({CURRENT_API_VERSION}) | DEPRECATED_API_VERSIONS
@@ -1149,7 +1149,7 @@ def _check_api_version(raw: dict[str, Any], *, source: str) -> dict[str, Any]:
     * ``promforecast.io/v1`` -> the stable schema; loads silently.
     * ``promforecast.io/v1alpha1`` -> deprecated alias of v1 (the schemas
       are byte-identical). Loads with a one-shot ``DeprecationWarning``
-      pointing at the migration recipe in ``docs/config-schema.md``.
+      pointing at the migration recipe in ``docs/reference/config-schema.md``.
     * Unknown ``apiVersion`` -> raise :class:`UnsupportedApiVersionError`
       with the offending value and the supported set so a typo fails
       clearly rather than bottoming out in a generic pydantic ``Literal``
@@ -1180,7 +1180,7 @@ def _check_api_version(raw: dict[str, Any], *, source: str) -> dict[str, Any]:
             f"config {source}: apiVersion {declared!r} is deprecated and will be "
             f"removed in a future major release; the v1alpha1 schema is identical "
             f"to {CURRENT_API_VERSION!r}, so changing the apiVersion field is the "
-            "only required edit. See docs/config-schema.md for the migration recipe.",
+            "only required edit. See docs/reference/config-schema.md for the migration recipe.",
             DeprecationWarning,
             stacklevel=3,
         )

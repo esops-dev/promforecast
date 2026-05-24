@@ -1,0 +1,48 @@
+name: Nightly benchmarks
+
+# Micro-benchmarks gated out of the per-PR ``pytest`` run because shared
+# CI throughput fluctuates. The runner's hot-path suffix lookup is the
+# only benchmark today (see ``forecaster/tests/perf/`` and the
+# ``benchmark`` pytest marker); this workflow opts in so a regression
+# like "lru_cache silently dropped" is caught within 24 hours instead
+# of waiting for someone to run the marker locally.
+#
+# Failure here does NOT block any merge — it surfaces as a job-level
+# failure in the Actions tab. Treat it as a heads-up signal.
+
+on:
+  schedule:
+    # 03:17 UTC — picked off the hour so the run doesn't pile onto the
+    # GitHub-wide top-of-hour scheduling spike. Daily cadence keeps the
+    # signal fresh without burning CI minutes.
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  bench:
+    name: Microbenchmarks (opt-in)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: forecaster
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.12"
+          enable-cache: true
+          cache-dependency-glob: "forecaster/pyproject.toml"
+
+      - run: uv sync --all-extras
+
+      # ``-m benchmark`` flips the marker filter set in
+      # ``forecaster/pyproject.toml`` (which defaults to
+      # ``-m 'not benchmark'``) so only the perf suite runs. Keeping the
+      # marker name in lockstep with the test module is intentional —
+      # adding a benchmark elsewhere requires the same marker.
+      - name: pytest -m benchmark
+        run: uv run pytest -m benchmark tests/perf -v

@@ -27,7 +27,7 @@ config:
   # Schema version. The forecaster routes on this string and warns when
   # it is missing. ``promforecast.io/v1`` is the stable schema;
   # ``promforecast.io/v1alpha1`` still loads (with a DeprecationWarning)
-  # for configs predating the stable cut-over. See docs/config-schema.md
+  # for configs predating the stable cut-over. See docs/reference/config-schema.md
   # for the deprecation policy.
   apiVersion: promforecast.io/v1
 

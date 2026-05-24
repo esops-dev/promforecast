@@ -62,7 +62,7 @@ scrape_configs:
     # Operational metrics (``forecast_failures_total``, ``forecast_quality_score``,
     # ``forecast_run_duration_seconds``, etc.) stay scraped — they only
     # exist on /metrics regardless of sink configuration. See
-    # docs/architecture/emission-paths.md for the dual-source trap and the
+    # docs/reference/emission-paths.md for the dual-source trap and the
     # cross-metric-join labelset asymmetry this drop preserves.
     metric_relabel_configs:
       - source_labels: [__name__]

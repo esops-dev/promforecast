@@ -42,7 +42,7 @@ External models can be added via the `promforecast.models` entry-point group (se
 | `0.95`              | 0.95  | 7.62  | 13.45 | 18.99        | 19.00        | 19        |
 | `0.90`              | 0.90  | 5.86  | 8.28  | 9.00         | 9.00         | 9         |
 
-See [`capacity.md`](capacity.md) for recommended defaults and decision flow.
+See [`../outputs/capacity.md`](../outputs/capacity.md) for recommended defaults and decision flow.
 
 ### When your series is sparse — intermittent-demand models
 
@@ -87,7 +87,7 @@ Applies to both `/metrics` and `remote_write`.
 
 ## Cold-start seasonality borrowing
 
-See [`cold-start.md`](cold-start.md). Short version: when history < `min_points`, set `cold_start.borrow_from.promql` to synthesise a `SeasonalNaive`-style forecast from peer siblings. Emits with `model="ColdStart"` and `cold_start="true"`. Quality score is capped (default 0.5).
+See [`../inputs/cold-start.md`](../inputs/cold-start.md). Short version: when history < `min_points`, set `cold_start.borrow_from.promql` to synthesise a `SeasonalNaive`-style forecast from peer siblings. Emits with `model="ColdStart"` and `cold_start="true"`. Quality score is capped (default 0.5).
 
 ## Multi-horizon accuracy
 

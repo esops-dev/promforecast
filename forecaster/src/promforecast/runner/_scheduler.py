@@ -4,6 +4,11 @@ Each group runs as a long-lived asyncio task that fits, exports, and sleeps
 for ``server.refresh_interval``. A per-group lock prevents a slow run from
 being triggered twice concurrently. Failure isolation is layered: per query,
 per series, per regressor.
+
+This module owns the :class:`Runner` orchestration class. The dataclasses,
+pure helpers, per-family emission post-processing, and budget allocation
+all live in sibling modules under ``runner/``; this file is intentionally
+narrow to the scheduler + per-fit pipeline.
 """
 
 from __future__ import annotations
@@ -11,45 +16,40 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import math
-import random
 import time
 from collections.abc import Awaitable, Callable
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING
 
 import structlog
 
-from . import band_coverage as band_coverage_mod
-from . import capacity as capacity_mod
-from . import cold_start as cold_start_mod
-from . import conformal as conformal_mod
-from . import contribution as contribution_mod
-from . import decomposition as decomposition_mod
-from . import deviation as deviation_mod
-from . import discovery as discovery_mod
-from . import drift as drift_mod
-from . import maintenance as maintenance_mod
-from . import models as model_registry
-from . import point_factory as point_factory_mod
-from . import preprocess as preprocess_mod
-from . import quality as quality_mod
-from . import regressors as regressors_mod
-from . import seasonality as seasonality_mod
-from . import slo as slo_mod
-from . import telemetry as telemetry_mod
-from .accuracy import (
+from .. import band_coverage as band_coverage_mod
+from .. import capacity as capacity_mod
+from .. import cold_start as cold_start_mod
+from .. import conformal as conformal_mod
+from .. import contribution as contribution_mod
+from .. import decomposition as decomposition_mod
+from .. import deviation as deviation_mod
+from .. import discovery as discovery_mod
+from .. import drift as drift_mod
+from .. import maintenance as maintenance_mod
+from .. import models as model_registry
+from .. import preprocess as preprocess_mod
+from .. import quality as quality_mod
+from .. import regressors as regressors_mod
+from .. import seasonality as seasonality_mod
+from .. import slo as slo_mod
+from .. import telemetry as telemetry_mod
+from ..accuracy import (
     AccuracyResult,
     HorizonSpec,
-    backtest,
     evaluate,
     horizons_from_durations,
     overall_mape,
     overall_mase,
 )
-from .config import (
-    CanaryConfig,
+from ..config import (
     GroupConfig,
     ModelSpec,
     QueryConfig,
@@ -58,367 +58,76 @@ from .config import (
     effective_season_length,
     effective_step,
 )
-from .exporter import (
-    AccuracyPoint,
+from ..exporter import (
     BandCoveragePoint,
-    CalibrationOffsetPoint,
-    ComponentDecompositionPoint,
-    ConditionalDeviationPoint,
-    ConditionalForecastPoint,
-    ContributionPoint,
-    DeviationPoint,
     DriftPoint,
-    EnsembleWeightPoint,
-    ErrorBudgetPoint,
     Exporter,
     ForecastPoint,
     GroupSnapshot,
-    GrowthRatePoint,
     InvalidMetricNameError,
     PreprocessStats,
     QualityPoint,
-    RecommendedMaintenanceWindowPoint,
-    ThresholdEtaPoint,
-    TimeToDrainPoint,
-    WillBreachPoint,
     validate_metric_name,
 )
-from .point_factory import BacktestOutcome, BandSummary, SeriesPointFactory
-from .selector import ensemble_weights, select
-from .sink import ForecastCurvePoint, ForecastSink, SinkError
-from .source import PromSource, SeriesFrame
+from ..point_factory import BacktestOutcome, SeriesPointFactory
+from ..selector import ensemble_weights, select
+from ..sink import ForecastCurvePoint, ForecastSink, SinkError
+from ..source import PromSource, SeriesFrame
+from ._budgets import _apply_canary, _apply_overflow, _compute_global_budgets
+from ._helpers import (
+    _combine_ensemble,
+    _format_band_window,
+    _pandas_freq,
+    _resolve_spec,
+    _run_backtest,
+    _run_fit,
+    _series_key_from_labels,
+)
+from ._state import (
+    ReloadResult,
+    _BacktestNeeds,
+    _CapacityInput,
+    _FitResult,
+    _inherit_prior_for_skipped_queries,
+    _merge_fit_into_ctx,
+    _RunContext,
+)
+from .emission.calibration import (
+    _apply_offsets_to_curve_points,
+    _apply_offsets_to_snapshot_points,
+    _apply_offsets_to_threshold_eta_inputs,
+)
+from .emission.conditional import _flatten_regressors_to_last_value
+from .emission.safeguards import (
+    _apply_safeguards_to_curve_points,
+    _apply_safeguards_to_forecast_frame,
+    _apply_safeguards_to_snapshot_points,
+)
 
 if TYPE_CHECKING:
     import pandas as pd
 
-    from .config import Config
-    from .models import ForecastModel
-    from .selector import SelectionResult
+    from ..config import Config
+    from ..selector import SelectionResult
 
 logger = structlog.get_logger(__name__)
 
+# Reference to the parent package; used inside the Runner class to read
+# ``SLOW_FIT_RATIO`` and ``_summarise_backtest`` dynamically so the
+# pre-split test pattern
+# ``monkeypatch.setattr(promforecast.runner, "SLOW_FIT_RATIO", ...)``
+# (and the same for ``_summarise_backtest``) continues to work after the
+# split — the patched value is picked up on the next attribute lookup.
+# The import is intentionally written as ``import promforecast.runner``
+# (not ``from . import ...``) so the binding is the package object
+# itself, whose attributes are dynamically looked up at call time. The
+# package is partial at import time but fully populated by the time any
+# Runner method runs.
+import promforecast.runner as _pkg  # noqa: E402
 
-OverflowStrategy = Literal["drop_lowest_priority", "reject", "sample"]
-
-# A fit is considered "slow" once its wall-clock crosses this fraction of
-# ``safety.fit_timeout``. We pick 0.5 (half) so the warning fires comfortably
-# before the timeout actually kills the fit - long enough that operators
-# can observe a degraded model before alerts go red, short enough that
-# noise-induced 5-10% wobble doesn't trip it.
-SLOW_FIT_RATIO = 0.5
-
-
-@dataclass
-class _CapacityInput:
-    """One emitted (model, forecast frame) tuple, deferred to post-calibration.
-
-    The forecast frame is kept by reference (not copied) so capturing it
-    is essentially free. ``selection`` is the auto-select decision that
-    produced this emission, ``None`` for explicit / ensemble component
-    rows. ``apply_calibration`` is False for the synthetic ensemble row
-    because conformal calibration is not run against ensemble outputs.
-    """
-
-    model_name: str
-    forecast: Any  # pandas.DataFrame (avoid the import in non-TYPE_CHECKING land)
-    selection: Any  # SelectionResult | None
-    apply_calibration: bool = True
-
-
-@dataclass
-class _FitResult:
-    """Per-series outputs returned by ``Runner._fit_series``."""
-
-    points: list[ForecastPoint] = field(default_factory=list)
-    accuracy: list[AccuracyPoint] = field(default_factory=list)
-    deviation: list[DeviationPoint] = field(default_factory=list)
-    quality: list[QualityPoint] = field(default_factory=list)
-    ensemble: list[EnsembleWeightPoint] = field(default_factory=list)
-    contribution: list[ContributionPoint] = field(default_factory=list)
-    # Full forecast curve (every horizon step) per emitted model. Consumed
-    # only by the ``remote_write`` sink — the snapshot exporter ignores it.
-    curve: list[ForecastCurvePoint] = field(default_factory=list)
-    # Per-model wall-clock fit time (seconds), aggregated to a single
-    # number per (query, model) by ``_RunContext`` below. Surfaces as
-    # ``forecast_fit_duration_seconds`` for fit-time observability.
-    fit_durations: dict[str, float] = field(default_factory=dict)
-    # Set of model names whose fit crossed the slow-fit threshold during
-    # this series; bumped into the per-(query, model) counter on the run
-    # context.
-    slow_fits: set[str] = field(default_factory=set)
-    # Per-(regressor_id, reason) regressor-resolution failures recorded for
-    # this series. Aggregated to (query_id, regressor_id, reason) on the
-    # run context.
-    regressor_failures: list[tuple[str, str]] = field(default_factory=list)
-    # Per-(model, level) conformal calibration offset for this series.
-    # Aggregated into ``calibration_offsets`` on the run context.
-    calibration_offsets: list[CalibrationOffsetPoint] = field(default_factory=list)
-    # Capacity-planning samples. ETAs are per-(model, threshold[, level]);
-    # growth rates are per-(model, window). Both are gauges (snapshot-style),
-    # aggregated into the run context without monotonic merging.
-    threshold_etas: list[ThresholdEtaPoint] = field(default_factory=list)
-    growth_rates: list[GrowthRatePoint] = field(default_factory=list)
-    # Per-(model, threshold[, level]) 0/1 predictive will-breach samples
-    # derived from the ETAs above. Snapshot-style; folded straight into
-    # the run context without monotonic merging.
-    will_breach: list[WillBreachPoint] = field(default_factory=list)
-    # Drain-ETA family for ``le_drain`` thresholds. Sibling of
-    # ``threshold_etas`` — separate field rather than a re-used one so
-    # the exporter's per-family rendering can preserve ``+Inf`` samples
-    # (the "queue is not draining" alert needs them to round-trip).
-    time_to_drain: list[TimeToDrainPoint] = field(default_factory=list)
-    # SLO error-budget snapshot rows (remaining, burn rate, exhausted_in).
-    # Snapshot-style; folded straight into the run context.
-    error_budget: list[ErrorBudgetPoint] = field(default_factory=list)
-    # Recommended maintenance windows — top-N lowest-load windows in the
-    # forecast horizon for this (series, model). Snapshot-style.
-    recommended_windows: list[RecommendedMaintenanceWindowPoint] = field(default_factory=list)
-    # Conditional forecast emission: snapshot + deviation + curve. All
-    # three are produced together when ``emission.conditional: true`` is
-    # on for the query. The curve flows into the optional remote_write
-    # sink alongside the unconditional curve.
-    conditional_points: list[ConditionalForecastPoint] = field(default_factory=list)
-    conditional_deviation_points: list[ConditionalDeviationPoint] = field(default_factory=list)
-    conditional_curve: list[ForecastCurvePoint] = field(default_factory=list)
-    # Component decomposition emission. Per-(series, model, component)
-    # end-of-horizon snapshot rows for /metrics + per-step curve points
-    # for the optional remote_write sink (consumed by the stacked-area
-    # explainability dashboard).
-    component_points: list[ComponentDecompositionPoint] = field(default_factory=list)
-    component_curve: list[ForecastCurvePoint] = field(default_factory=list)
-    # Per-reason conditional-fit failure counter. Bumped on every fit
-    # that times out or raises; merged into ``ctx.failures`` so the
-    # operator sees them under ``forecast_failures_total`` with a
-    # bounded ``conditional_fit_*`` reason set.
-    conditional_failures: dict[str, int] = field(default_factory=dict)
-    # ``(model_name, reason)`` skip records the runner folds into the
-    # exporter's per-(model, reason) decomposition-skipped counter.
-    decomposition_skipped: list[tuple[str, str]] = field(default_factory=list)
-    # Per-model forecast dataframes retained until after conformal
-    # calibration so the capacity helpers can compute ETAs against the
-    # *calibrated* bands (a calibration that widens a band should pull
-    # the conservative ETA earlier or later by the same offset). Cleared
-    # at the end of ``_fit_series`` so we don't keep multi-MB dataframes
-    # alive in ``_RunContext``.
-    capacity_inputs: list[_CapacityInput] = field(default_factory=list)
-    # Imputed-fraction reported by preprocessing; threaded into the quality
-    # score so heavily-imputed series score lower on the coverage dimension.
-    imputed_fraction: float = 0.0
-    # Count-aware safeguard counters: per-``kind`` increments folded
-    # into the run context's per-(query, kind) total. ``kind`` is
-    # ``negative`` (a value clipped from below zero) or ``rounded`` (a
-    # non-trivial fractional component that was rounded to integer).
-    emission_clipped: dict[str, int] = field(default_factory=dict)
-    # Cold-start: number of usable siblings the borrow query produced for
-    # this series; ``0`` when cold-start did not run.
-    cold_start_siblings: int = 0
-    # Forecast-drift gauges: one per (series, model). NaN when no prior
-    # fit was cached for the (group, query, series, model) tuple.
-    drift_points: list[DriftPoint] = field(default_factory=list)
-    # Drift alert: how many threshold crossings happened for this query
-    # in this run. The runner folds it into the per-(query) total.
-    drift_alerts: int = 0
-
-
-@dataclass(frozen=True)
-class _BacktestNeeds:
-    """Which downstream consumers want backtest data this run.
-
-    Threaded through ``_run_backtests`` so it can skip post-processing the
-    consumers don't want. The fit itself is unconditional once *any* consumer
-    is interested — the per-model fit is the dominant cost; trimming the
-    cheap MAPE/MASE evaluation or the trailing-band summary saves only a
-    fraction of that. The bitmap mostly buys clarity (callers see exactly
-    which fields they will read) and a small win when ``accuracy.evaluate: false``.
-    """
-
-    accuracy: bool  # forecast_accuracy_mape / mase samples emitted
-    selection: bool  # auto-select needs overall_mape per model
-    deviation: bool  # forecast_deviation_ratio / outside_band emitted
-    quality: bool  # forecast_quality_score (uses results AND summary)
-
-    @property
-    def any(self) -> bool:
-        return self.accuracy or self.selection or self.deviation or self.quality
-
-    @property
-    def needs_results(self) -> bool:
-        """Per-horizon AccuracyResult list is needed by accuracy / selection / quality."""
-        return self.accuracy or self.selection or self.quality
-
-    @property
-    def needs_summary(self) -> bool:
-        """Trailing (actual, yhat, bands) summary is needed by deviation / quality."""
-        return self.deviation or self.quality
-
-
-@dataclass(frozen=True)
-class ReloadResult:
-    """Summary of what changed during ``Runner.apply_config``.
-
-    Returned to the operator (e.g. via the ``/-/reload`` endpoint response)
-    so they can confirm the diff matches their intent without diffing
-    /metrics output by hand.
-    """
-
-    added: list[str] = field(default_factory=list)
-    removed: list[str] = field(default_factory=list)
-    changed: list[str] = field(default_factory=list)
-
-
-@dataclass
-class _RunContext:
-    """Mutable accumulator threaded through ``_run_query`` calls.
-
-    Group-level totals (points, drops, failures) used to live as locals in
-    ``run_group``; pulling them into a struct keeps the per-query helper a
-    method instead of a closure and lets tests inspect per-query state.
-    """
-
-    points: list[ForecastPoint] = field(default_factory=list)
-    accuracy_points: list[AccuracyPoint] = field(default_factory=list)
-    deviation_points: list[DeviationPoint] = field(default_factory=list)
-    quality_points: list[QualityPoint] = field(default_factory=list)
-    ensemble_weight_points: list[EnsembleWeightPoint] = field(default_factory=list)
-    contribution_points: list[ContributionPoint] = field(default_factory=list)
-    curve_points: list[ForecastCurvePoint] = field(default_factory=list)
-    series_count: int = 0
-    dropped: dict[str, int] = field(default_factory=dict)
-    failures: dict[str, int] = field(default_factory=dict)
-    global_remaining: int = 0
-    # Most-recent fit duration per (query_id, model_name). Multiple series
-    # under the same query keep overwriting each other intentionally — at
-    # snapshot time we want a representative most-recent number, not a sum.
-    fit_durations: dict[tuple[str, str], float] = field(default_factory=dict)
-    # Cumulative slow-fit counter per (query_id, model_name) across the
-    # series in this group run. Reset every run; the exporter merges with
-    # the previous snapshot's counter to keep a monotonic counter view.
-    slow_fits: dict[tuple[str, str], int] = field(default_factory=dict)
-    # Cumulative regressor-resolution failure counter per
-    # (query_id, regressor_id, reason). Merged with the previous snapshot
-    # in ``run_group`` so the counter stays monotonic across runs.
-    regressor_failures: dict[tuple[str, str, str], int] = field(default_factory=dict)
-    # Per-series conformal calibration offsets accumulated this run.
-    calibration_offsets: list[CalibrationOffsetPoint] = field(default_factory=list)
-    # Capacity-planning families (ETA + growth rate). Snapshot-style;
-    # only the current run's samples land on /metrics.
-    threshold_etas: list[ThresholdEtaPoint] = field(default_factory=list)
-    growth_rates: list[GrowthRatePoint] = field(default_factory=list)
-    # Will-breach predictive boolean gauges (per series/model/threshold/level).
-    will_breach_points: list[WillBreachPoint] = field(default_factory=list)
-    # Drain-ETA points (queue burn-down). Snapshot-style; preserves
-    # ``+Inf`` samples for the "queue is not draining" alert.
-    time_to_drain_points: list[TimeToDrainPoint] = field(default_factory=list)
-    # SLO error-budget snapshot rows accumulated this run.
-    error_budget_points: list[ErrorBudgetPoint] = field(default_factory=list)
-    # Recommended maintenance windows accumulated this run.
-    recommended_maintenance_window_points: list[RecommendedMaintenanceWindowPoint] = field(
-        default_factory=list
-    )
-    # Conditional forecast emission accumulators (snapshot rows +
-    # per-(model, level) deviation gauges + per-step curve for the sink).
-    conditional_points: list[ConditionalForecastPoint] = field(default_factory=list)
-    conditional_deviation_points: list[ConditionalDeviationPoint] = field(default_factory=list)
-    conditional_curve_points: list[ForecastCurvePoint] = field(default_factory=list)
-    # Per-(series, model, component) end-of-horizon decomposition rows
-    # + per-step curve for the sink.
-    component_points: list[ComponentDecompositionPoint] = field(default_factory=list)
-    component_curve_points: list[ForecastCurvePoint] = field(default_factory=list)
-    # Per-query preprocessing statistics for the most recent run.
-    preprocess_stats: dict[str, PreprocessStats] = field(default_factory=dict)
-    # Per-(query, strategy) gap-fill count for this run; merged with the
-    # previous snapshot so the counter stays monotonic.
-    gaps_filled: dict[tuple[str, str], int] = field(default_factory=dict)
-    # Per-(query, method) outlier replacement count for this run.
-    outliers_replaced: dict[tuple[str, str], int] = field(default_factory=dict)
-    # Per-query change-point detection count for this run.
-    change_points: dict[str, int] = field(default_factory=dict)
-    # Per-(query, kind) emission clipping counter for this run. Merged
-    # with the previous snapshot in ``run_group`` so the exposed counter
-    # stays monotonic across runs.
-    emission_clipped: dict[tuple[str, str], int] = field(default_factory=dict)
-    # Per-query usable-sibling count for the most recent cold-start fit.
-    # The runner prefetches the borrow query once per primary query (see
-    # ``_prefetch_cold_start_siblings``), so every cold-start fit within
-    # one run of a given query observes the same usable-sibling count —
-    # the gauge is deterministic per (group, query) regardless of which
-    # short series of the query was processed last.
-    cold_start_siblings: dict[str, int] = field(default_factory=dict)
-    # Per-(series, model) drift gauges from this run. Same shape as
-    # ``deviation_points`` — the renderer reads them directly.
-    drift_points: list[DriftPoint] = field(default_factory=list)
-    # Per-(query) drift threshold-crossing counter for this run.
-    drift_alerts: dict[str, int] = field(default_factory=dict)
-    # Per-query series count and run duration for the most recent run.
-    # Used to populate the ``query`` label on
-    # ``forecast_series_count`` and ``forecast_run_duration_seconds``.
-    series_count_per_query: dict[str, int] = field(default_factory=dict)
-    run_duration_per_query: dict[str, float] = field(default_factory=dict)
-
-
-def _compute_global_budgets(groups: list[GroupConfig], max_total_series: int) -> dict[str, int]:
-    """Static per-group share of ``max_total_series``, weighted by priority.
-
-    A static split avoids cross-group coordination at runtime: groups run on
-    independent timers and may overlap. With weights ``priority/sum(priorities)``
-    the lowest-priority groups give up budget first, which matches the intent
-    of ``series_overflow: drop_lowest_priority``.
-    """
-    if max_total_series <= 0 or not groups:
-        return {g.name: 0 for g in groups}
-    weights = {g.name: max(1, g.priority) for g in groups}
-    total_weight = sum(weights.values())
-    return {
-        name: max(0, (max_total_series * weight) // total_weight)
-        for name, weight in weights.items()
-    }
-
-
-def _apply_overflow(
-    frames: list[SeriesFrame], cap: int, strategy: OverflowStrategy
-) -> tuple[list[SeriesFrame], int]:
-    """Reduce ``frames`` to fit ``cap`` according to ``strategy``.
-
-    Returns ``(allowed, dropped_count)``. With ``cap <= 0`` everything is
-    dropped; ``reject`` drops the whole query rather than half-emitting it.
-    """
-    if cap <= 0:
-        return [], len(frames)
-    if len(frames) <= cap:
-        return frames, 0
-    if strategy == "reject":
-        return [], len(frames)
-    if strategy == "sample":
-        return random.sample(frames, cap), len(frames) - cap
-    return frames[:cap], len(frames) - cap
-
-
-def _apply_canary(
-    frames: list[SeriesFrame],
-    canary: CanaryConfig,
-) -> tuple[list[SeriesFrame], int]:
-    """Random-sample ``ceil(weight * N)`` frames when canary mode is on.
-
-    Returns ``(kept, dropped)``. ``ceil`` (not ``floor``) so a tiny
-    population doesn't round down to zero — ``weight=0.1`` on a 5-series
-    query still fits one series, which is the useful canary case. The
-    caller emits the drop count as
-    ``forecast_series_dropped_total{reason="canary"}`` so the sampling
-    is observable from /metrics.
-
-    Sampling uses :func:`random.sample` (no fixed seed) so successive runs
-    rotate through the population. A fixed seed would bias the canary to
-    the same N series forever and defeat coverage over time.
-    """
-    if not canary.enabled or not frames:
-        return frames, 0
-    if canary.weight >= 1.0:
-        return frames, 0
-    keep = max(1, math.ceil(len(frames) * canary.weight))
-    if keep >= len(frames):
-        return frames, 0
-    sampled = random.sample(frames, keep)
-    return sampled, len(frames) - keep
+__all__ = [
+    "Runner",
+]
 
 
 class Runner:
@@ -904,6 +613,7 @@ class Runner:
                     fit_durations=ctx.fit_durations,
                     slow_fits=merged_slow,
                     calibration_offsets=ctx.calibration_offsets,
+                    conditional_calibration_offsets=ctx.conditional_calibration_offsets,
                     preprocess_stats=ctx.preprocess_stats,
                     gaps_filled_cumulative=merged_gaps,
                     outliers_replaced_cumulative=merged_outliers,
@@ -1799,12 +1509,30 @@ class Runner:
         # regressors") rather than the unconditional band. For built-in
         # models that ignore the regressors parameter the conditional
         # output equals the unconditional output; the family still emits
-        # so downstream alerts have a stable schema. The pass reuses the
-        # unconditional fit's conformal offsets + count-aware safeguard
-        # toggles so the two families never disagree on calibrated band
-        # width or clipping policy.
+        # so downstream alerts have a stable schema. When conformal
+        # calibration is enabled, a fresh per-fit calibration on a
+        # held-constant-regressor holdout produces dedicated conditional
+        # offsets so the band carries its own empirical-coverage
+        # guarantee (rather than inheriting the unconditional pass's
+        # offsets, which scored residuals on a holdout where regressors
+        # *did* vary). Per-(model) failures fall back to inherited
+        # offsets and bump ``forecast_conditional_calibration_failures_total``.
         if query.emission.conditional:
             cond_clip, cond_rounder = effective_emission_safeguards(query)
+            conditional_offsets_by_model: dict[str, dict[int, float]] = {}
+            if d.accuracy.conformal.enabled and result.capacity_inputs:
+                conditional_offsets_by_model = await self._compute_conditional_conformal_offsets(
+                    df=df,
+                    group_name=group_name,
+                    query_id=query.id,
+                    emitted_inputs=list(result.capacity_inputs),
+                    model_specs=model_specs,
+                    freq=freq,
+                    levels=levels,
+                    season_length=eff_season_length,
+                    regressors=regressors_frame,
+                    holdout_fraction=d.accuracy.conformal.holdout_fraction,
+                )
             await self._emit_conditional_forecasts(
                 df=df,
                 query=query,
@@ -1820,6 +1548,7 @@ class Runner:
                 factory=factory,
                 result=result,
                 offsets_by_model=offsets_by_model,
+                conditional_offsets_by_model=conditional_offsets_by_model,
                 clip=cond_clip,
                 rounder=cond_rounder,
             )
@@ -2273,6 +2002,7 @@ class Runner:
         factory: SeriesPointFactory,
         result: _FitResult,
         offsets_by_model: dict[str, dict[int, float]],
+        conditional_offsets_by_model: dict[str, dict[int, float]],
         clip: bool,
         rounder: bool,
     ) -> None:
@@ -2280,18 +2010,27 @@ class Runner:
 
         The pass adds one fit per emitted (model, series) on top of the
         regular fit, so the cost roughly doubles the forecast budget
-        for queries that opt in. See ``docs/conditional-forecasts.md``.
+        for queries that opt in. See the "Conditional forecasts" section
+        of ``docs/inputs/regressors.md``.
 
         When ``regressors`` is None (no regressors configured), the
         held-constant frame is also None and the re-fit produces the
         same numbers as the unconditional pass — the family still emits
         so dashboards and alerts can target it unconditionally.
 
-        ``offsets_by_model`` reuses the unconditional fit's conformal
-        offsets so the conditional bands carry the same calibration
-        widening as the unconditional ones — otherwise an operator
-        comparing the two would see different empirical-coverage
-        guarantees and infer something incorrect.
+        ``conditional_offsets_by_model`` carries per-(model, level)
+        offsets from a dedicated calibration pass that held regressors
+        flat at their final pre-holdout value — matching the
+        production-time conditional inference contract. When present
+        for a model, those offsets widen the conditional band (and
+        emit a ``forecast_conditional_band_calibration_offset`` gauge
+        through ``result.conditional_calibration_offsets``). When
+        absent (calibration off, fit failed, holdout too small), the
+        runner falls back to ``offsets_by_model`` — the inherited
+        unconditional offsets that pre-v1.6.5 builds always used. The
+        fallback path is no worse than the prior behaviour but
+        ``forecast_conditional_calibration_failures_total`` ticks so an
+        operator can see when fresh calibration silently isn't running.
 
         ``clip`` / ``rounder`` mirror the count-aware safeguards applied
         to the unconditional emission, so a count-shaped query sees
@@ -2391,11 +2130,23 @@ class Runner:
                     fit_seconds=fit_seconds,
                 )
 
-            # Reuse the unconditional offsets so the conditional bands
-            # carry the same empirical-coverage guarantee. ``offsets_by_model``
-            # may not contain ``model_name`` (no calibration ran or
-            # ensemble row), in which case the helper is a no-op.
-            model_offsets = offsets_by_model.get(model_name)
+            # Prefer the fresh per-fit conditional offsets when the
+            # dedicated calibration pass produced them; otherwise fall
+            # back to the inherited unconditional offsets so the band
+            # is no worse off than the pre-v1.6.5 behaviour. When fresh
+            # offsets were computed, emit a
+            # ``forecast_conditional_band_calibration_offset`` row per
+            # (model, level) so the per-(model, level) widening
+            # applied to the conditional band specifically is visible
+            # from /metrics.
+            fresh_offsets = conditional_offsets_by_model.get(model_name)
+            if fresh_offsets:
+                model_offsets: dict[int, float] | None = fresh_offsets
+                result.conditional_calibration_offsets.extend(
+                    factory.conditional_calibration_offset_points(model_name, fresh_offsets)
+                )
+            else:
+                model_offsets = offsets_by_model.get(model_name)
             calibrated_df = _apply_offsets_to_threshold_eta_inputs(
                 cond_forecast, model_offsets, levels
             )
@@ -2406,11 +2157,25 @@ class Runner:
                 calibrated_df, levels=levels, clip=clip, rounder=rounder
             )
 
+            # Mark the conditional band rows with ``calibrated="true"``
+            # when fresh per-fit offsets were applied — matches the
+            # unconditional family's labelling so dashboards filtering
+            # on ``calibrated`` work consistently across the two
+            # families. We pass the flag instead of post-processing the
+            # rows because the conditional path applies offsets to the
+            # DataFrame *before* invoking the factory, so there's no
+            # second pass available; the unconditional path goes the
+            # other way (points first, then ``_apply_offsets_to_*``
+            # rewrites them with the label) because its offsets are
+            # computed after the per-series fits already produced
+            # snapshot rows.
+            band_calibrated = bool(fresh_offsets)
             result.conditional_points.extend(
                 factory.conditional_forecast_points(
                     forecast=adjusted_df,
                     model_name=model_name,
                     selection=ci.selection,
+                    calibrated=band_calibrated,
                 )
             )
             # Stream the per-step conditional curve into the sink list so
@@ -2420,7 +2185,10 @@ class Runner:
             # never collide on the TSDB side.
             result.conditional_curve.extend(
                 factory.conditional_forecast_curve_points(
-                    adjusted_df, model_name, selection=ci.selection
+                    adjusted_df,
+                    model_name,
+                    selection=ci.selection,
+                    calibrated=band_calibrated,
                 )
             )
             if math.isfinite(actual):
@@ -2759,7 +2527,7 @@ class Runner:
         timeout_seconds = self._config.safety.fit_timeout.total_seconds()
         if timeout_seconds <= 0:
             return
-        threshold = timeout_seconds * SLOW_FIT_RATIO
+        threshold = timeout_seconds * _pkg.SLOW_FIT_RATIO
         if fit_seconds < threshold:
             return
         result.slow_fits.add(model_name)
@@ -2859,7 +2627,9 @@ class Runner:
                 continue
             test, predictions = outcome
             if needs.needs_summary:
-                summary = _summarise_backtest(predictions=predictions, test=test, levels=levels)
+                summary = _pkg._summarise_backtest(
+                    predictions=predictions, test=test, levels=levels
+                )
                 # Deviation and quality both rely on the trailing tuple; if it
                 # can't be derived (degenerate frames) drop the model rather
                 # than emit half-populated rows downstream.
@@ -3040,6 +2810,137 @@ class Runner:
                 results[model_name] = calib.offsets
         return results
 
+    async def _compute_conditional_conformal_offsets(  # noqa: PLR0912
+        self,
+        *,
+        df: pd.DataFrame,
+        group_name: str,
+        query_id: str,
+        emitted_inputs: list[_CapacityInput],
+        model_specs: list[ModelSpec],
+        freq: str,
+        levels: list[int],
+        season_length: int,
+        regressors: pd.DataFrame | None,
+        holdout_fraction: float,
+    ) -> dict[str, dict[int, float]]:
+        """Mirror of :meth:`_compute_conformal_offsets` for the conditional band.
+
+        The only difference from the unconditional pass is the regressor
+        frame: the calibration fit's training regressors are flat-held at
+        the **final pre-holdout** value, matching the production-time
+        conditional inference contract. Computing fresh per-fit offsets
+        here means the conditional band's empirical-coverage guarantee
+        is grounded in residuals scored against the same regressor
+        regime production sees, rather than the unconditional pass's
+        residuals where regressors *did* vary across the holdout.
+
+        Per-(model) failures isolate cleanly and bump
+        ``forecast_conditional_calibration_failures_total`` with a
+        bounded ``reason``. The caller falls back to
+        ``unconditional_offsets_by_model`` for any model missing from
+        the returned dict, so the fallback path is no worse than the
+        pre-v1.6.5 behaviour.
+
+        Short-circuits to the empty dict (and bumps no failure counter)
+        when none of the emitted models actually consumes regressors —
+        the fresh fit would produce the same numbers as the unconditional
+        fit, so emitting two parallel offset gauges with identical
+        values would just be noise.
+        """
+        emitted_model_names: set[str] = set()
+        for ci in emitted_inputs:
+            if ci.model_name and ci.model_name != "ensemble":
+                emitted_model_names.add(ci.model_name)
+        if not emitted_model_names:
+            return {}
+        # If every emitted model ignores regressors, the conditional fit
+        # produces the same numbers as the unconditional fit — no point
+        # spending CPU to compute identical offsets.
+        if all(not model_registry.uses_regressors(name) for name in emitted_model_names):
+            return {}
+        split = conformal_mod.holdout_split(df, holdout_fraction=holdout_fraction)
+        if split is None:
+            self._exporter.increment_conditional_calibration_failure(
+                group_name, query_id, "degenerate_holdout"
+            )
+            return {}
+        train_df, calib_df = split
+        calib_actuals = calib_df["y"].to_numpy(dtype=float)
+        calib_steps = len(calib_df)
+        min_calib_for_quantile = 2
+        if calib_steps < min_calib_for_quantile:
+            self._exporter.increment_conditional_calibration_failure(
+                group_name, query_id, "degenerate_holdout"
+            )
+            return {}
+        # Build the held-constant regressor frame matching the
+        # production-time conditional contract: every row equals the
+        # final value of the pre-holdout window. ``None`` propagates
+        # through to a no-regressors fit for the (unusual) case where
+        # the configured regressors all resolved to nothing during the
+        # main fit.
+        train_regressors: pd.DataFrame | None
+        if regressors is not None and len(regressors) >= len(train_df):
+            train_regressors = _flatten_regressors_to_last_value(
+                regressors.iloc[: len(train_df)].reset_index(drop=True)
+            )
+        else:
+            train_regressors = None
+
+        spec_by_name = {spec.name: spec for spec in model_specs}
+        results: dict[str, dict[int, float]] = {}
+        for model_name in sorted(emitted_model_names):
+            # Models that don't consume regressors produce identical
+            # numbers either way; skip the extra fit (and skip the
+            # gauge emission so the operator isn't shown a duplicate
+            # of the unconditional widening).
+            if not model_registry.uses_regressors(model_name):
+                continue
+            spec = spec_by_name.get(model_name) or ModelSpec(name=model_name)
+            try:
+                calib_predictions = await self._fit_one(
+                    spec=spec,
+                    df=train_df,
+                    horizon=calib_steps,
+                    freq=freq,
+                    levels=levels,
+                    season_length=season_length,
+                    regressors=train_regressors,
+                )
+            except TimeoutError:
+                logger.warning(
+                    "conditional_conformal_calibration_timeout",
+                    group=group_name,
+                    query=query_id,
+                    model=model_name,
+                    timeout_s=self._config.safety.fit_timeout.total_seconds(),
+                )
+                self._exporter.increment_conditional_calibration_failure(
+                    group_name, query_id, "fit_timeout"
+                )
+                continue
+            except Exception as exc:
+                logger.warning(
+                    "conditional_conformal_calibration_fit_failed",
+                    group=group_name,
+                    query=query_id,
+                    model=model_name,
+                    error=str(exc),
+                )
+                self._exporter.increment_conditional_calibration_failure(
+                    group_name, query_id, "fit_error"
+                )
+                continue
+            calib = conformal_mod.compute_offsets(
+                calib_actuals=calib_actuals,
+                calib_predictions=calib_predictions,
+                levels=levels,
+            )
+            if calib.offsets:
+                results[model_name] = calib.offsets
+        return results
+
     async def _fit_one(
         self,
         *,
@@ -3141,694 +3042,3 @@ class Runner:
         if self._sink is not None:
             with contextlib.suppress(Exception):
                 await self._sink.aclose()
-
-
-def _run_fit(
-    model: ForecastModel,
-    df: pd.DataFrame,
-    horizon: int,
-    freq: str,
-    levels: list[int],
-    regressors: pd.DataFrame | None = None,
-) -> pd.DataFrame:
-    return model.fit_predict(
-        df=df, horizon=horizon, freq=freq, levels=levels, regressors=regressors
-    )
-
-
-# Conformal calibration is applied symmetrically to both the snapshot
-# ``ForecastPoint`` list (consumed by /metrics) and the
-# ``ForecastCurvePoint`` list (consumed by the remote_write sink). The two
-# carry the same (metric, labels, value) shape but ``ForecastCurvePoint``
-# also has a ``timestamp_ms`` field. The decision logic — "if this is a
-# lower/upper row for a calibrated (model, level), widen and label it" —
-# is shared via :func:`_calibrated_band_value`; the per-type list rebuild
-# lives in the two thin wrappers so each wrapper is straight-line code
-# without a constructor callback.
-
-
-def _calibrated_band_value(
-    metric: str,
-    labels: dict[str, str],
-    value: float,
-    offsets_by_model: dict[str, dict[int, float]],
-) -> tuple[float, bool] | None:
-    """Return ``(new_value, calibrated)`` if the point is a calibratable band, else ``None``.
-
-    ``None`` means "leave the point alone". ``(value, False)`` means the
-    offset is zero/missing for this (model, level), so the band is left as
-    the model emitted it; ``(value, True)`` means we widened and the
-    caller should add a ``calibrated="true"`` label. The yhat row (metric
-    exactly ending in ``_forecast``) is always returned as ``None`` —
-    calibration is a band adjustment, not a point-forecast adjustment.
-    """
-    model_name = labels.get("model", "")
-    offsets = offsets_by_model.get(model_name)
-    if offsets is None or metric.endswith("_forecast"):
-        return None
-    try:
-        level = int(labels.get("level", ""))
-    except ValueError:
-        return None
-    offset = offsets.get(level)
-    if offset is None or offset <= 0:
-        return None
-    if metric.endswith("_forecast_lower"):
-        return value - offset, True
-    if metric.endswith("_forecast_upper"):
-        return value + offset, True
-    return None
-
-
-def _apply_offsets_to_threshold_eta_inputs(
-    forecast: pd.DataFrame,
-    offsets: dict[int, float] | None,
-    levels: list[int],
-) -> pd.DataFrame:
-    """Return a copy of ``forecast`` with band columns shifted by the per-level offset.
-
-    The conformal calibration offset widens both sides of each band
-    symmetrically: ``yhat_upper_<level> += offset`` and
-    ``yhat_lower_<level> -= offset``. Re-applying that shift here so the
-    capacity ETA computation sees the same bands /metrics exposes keeps
-    ``time_to_threshold{level="95"}`` and ``yhat_upper{level="95"}``
-    self-consistent.
-
-    ``offsets=None`` or an empty dict is the common case (no calibration
-    ran for this model) and the frame is returned unmodified. Only
-    non-zero positive offsets actually mutate columns; a zero offset is
-    a no-op so we skip the copy.
-    """
-    if not offsets or forecast.empty:
-        return forecast
-    if not any(o > 0 for o in offsets.values()):
-        return forecast
-    out = forecast.copy()
-    for level, offset in offsets.items():
-        if offset <= 0 or level not in levels:
-            continue
-        lo_col = f"yhat_lower_{level}"
-        hi_col = f"yhat_upper_{level}"
-        if lo_col in out.columns:
-            out[lo_col] = out[lo_col].to_numpy(dtype=float) - offset
-        if hi_col in out.columns:
-            out[hi_col] = out[hi_col].to_numpy(dtype=float) + offset
-    return out
-
-
-def _apply_offsets_to_snapshot_points(
-    points: list[ForecastPoint],
-    offsets_by_model: dict[str, dict[int, float]],
-) -> list[ForecastPoint]:
-    """Widen ``ForecastPoint`` bands by the per-(model, level) offset.
-
-    Returns a freshly constructed list; the input list is not mutated.
-    """
-    if not offsets_by_model:
-        return points
-    out: list[ForecastPoint] = []
-    for point in points:
-        adjusted = _calibrated_band_value(point.metric, point.labels, point.value, offsets_by_model)
-        if adjusted is None:
-            out.append(point)
-            continue
-        new_value, calibrated = adjusted
-        new_labels = {**point.labels, "calibrated": "true"} if calibrated else point.labels
-        out.append(ForecastPoint(metric=point.metric, labels=new_labels, value=new_value))
-    return out
-
-
-def _apply_offsets_to_curve_points(
-    points: list[ForecastCurvePoint],
-    offsets_by_model: dict[str, dict[int, float]],
-) -> list[ForecastCurvePoint]:
-    """Widen ``ForecastCurvePoint`` bands by the per-(model, level) offset.
-
-    Returns a freshly constructed list; the input list is not mutated.
-    Carries the original ``timestamp_ms`` through unchanged — calibration
-    shifts the band level, not when the forecast is for.
-    """
-    if not offsets_by_model:
-        return points
-    out: list[ForecastCurvePoint] = []
-    for point in points:
-        adjusted = _calibrated_band_value(point.metric, point.labels, point.value, offsets_by_model)
-        if adjusted is None:
-            out.append(point)
-            continue
-        new_value, calibrated = adjusted
-        new_labels = {**point.labels, "calibrated": "true"} if calibrated else point.labels
-        out.append(
-            ForecastCurvePoint(
-                metric=point.metric,
-                labels=new_labels,
-                value=new_value,
-                timestamp_ms=point.timestamp_ms,
-            )
-        )
-    return out
-
-
-# Count-aware emission safeguards.
-#
-# When a query's ``emission.clip_non_negative`` is True every emitted
-# forecast / band value is clamped at zero from below; when its
-# ``emission.round_to_integer`` is True every value is rounded to the
-# nearest integer. Both are applied symmetrically to the snapshot
-# ``ForecastPoint`` list (consumed by /metrics) and to the
-# ``ForecastCurvePoint`` list (consumed by the remote_write sink) so
-# scrape and push see the same numbers.
-#
-# Counter semantics live in :func:`_classify_emission_correction` —
-# ``kind="negative"`` ticks only when the raw value was actually below
-# zero (a real model-output anomaly worth surfacing), and
-# ``kind="rounded"`` ticks only when the fractional component was at
-# least ``_ROUND_COUNTER_TRIGGER`` (so the counter doesn't blow up on
-# every continuous emission that happens to be slightly non-integer).
-
-_ROUND_COUNTER_TRIGGER = 0.05
-
-
-def _classify_emission_correction(
-    raw: float,
-    *,
-    clip: bool,
-    rounder: bool,
-) -> tuple[float, list[str]]:
-    """Return ``(adjusted_value, kinds)`` after applying the safeguards.
-
-    ``kinds`` is a list of bounded tokens ``["negative", "rounded"]``
-    that the caller folds into the per-query emission-clipped counter.
-    Each entry is recorded *once per emission* (a value that is both
-    negative and rounded triggers both counters); a value that didn't
-    need correction produces an empty list and contributes no counter
-    bumps.
-
-    Non-finite values pass through unmodified — clipping or rounding a
-    NaN would surface the silent transformation as a confusing
-    /metrics line later.
-    """
-    if not math.isfinite(raw):
-        return raw, []
-    value = raw
-    kinds: list[str] = []
-    if clip and value < 0.0:
-        value = 0.0
-        kinds.append("negative")
-    if rounder:
-        rounded = float(round(value))
-        if abs(value - rounded) >= _ROUND_COUNTER_TRIGGER:
-            kinds.append("rounded")
-        value = rounded
-    return value, kinds
-
-
-def _apply_safeguards_to_snapshot_points(
-    points: list[ForecastPoint],
-    *,
-    clip: bool,
-    rounder: bool,
-    counter: dict[str, int],
-) -> list[ForecastPoint]:
-    """Apply count-aware safeguards to ``ForecastPoint``s and bump ``counter``.
-
-    Returns a freshly constructed list; the input list is not mutated.
-    ``counter`` is updated in-place with ``kind -> count`` so the
-    runner can fold it into the per-(query, kind) total without
-    threading a second return value.
-    """
-    if not (clip or rounder):
-        return points
-    out: list[ForecastPoint] = []
-    for point in points:
-        new_value, kinds = _classify_emission_correction(point.value, clip=clip, rounder=rounder)
-        for kind in kinds:
-            counter[kind] = counter.get(kind, 0) + 1
-        if kinds or new_value != point.value:
-            out.append(ForecastPoint(metric=point.metric, labels=point.labels, value=new_value))
-        else:
-            out.append(point)
-    return out
-
-
-def _apply_safeguards_to_curve_points(
-    points: list[ForecastCurvePoint],
-    *,
-    clip: bool,
-    rounder: bool,
-) -> list[ForecastCurvePoint]:
-    """Apply count-aware safeguards to ``ForecastCurvePoint``s.
-
-    Counter bumps live with the snapshot pass — the runner emits both
-    families from the same fit and counting twice would double-bump
-    the operator-facing total. The curve pass therefore only mutates
-    values; it does not touch the counter.
-    """
-    if not (clip or rounder):
-        return points
-    out: list[ForecastCurvePoint] = []
-    for point in points:
-        new_value, _ = _classify_emission_correction(point.value, clip=clip, rounder=rounder)
-        if new_value != point.value:
-            out.append(
-                ForecastCurvePoint(
-                    metric=point.metric,
-                    labels=point.labels,
-                    value=new_value,
-                    timestamp_ms=point.timestamp_ms,
-                )
-            )
-        else:
-            out.append(point)
-    return out
-
-
-def _merge_fit_into_ctx(ctx: _RunContext, fit_result: _FitResult, query_id: str) -> None:
-    """Splice a ``_FitResult`` into the per-group ``_RunContext``.
-
-    Pulled out of ``_run_query`` so that hot path stays readable; keeps the
-    point-list extends and per-(query, model) counter bumps in one place.
-    """
-    ctx.points.extend(fit_result.points)
-    ctx.accuracy_points.extend(fit_result.accuracy)
-    ctx.deviation_points.extend(fit_result.deviation)
-    ctx.quality_points.extend(fit_result.quality)
-    ctx.ensemble_weight_points.extend(fit_result.ensemble)
-    ctx.contribution_points.extend(fit_result.contribution)
-    ctx.curve_points.extend(fit_result.curve)
-    ctx.calibration_offsets.extend(fit_result.calibration_offsets)
-    ctx.threshold_etas.extend(fit_result.threshold_etas)
-    ctx.growth_rates.extend(fit_result.growth_rates)
-    ctx.will_breach_points.extend(fit_result.will_breach)
-    ctx.time_to_drain_points.extend(fit_result.time_to_drain)
-    ctx.error_budget_points.extend(fit_result.error_budget)
-    ctx.recommended_maintenance_window_points.extend(fit_result.recommended_windows)
-    ctx.conditional_points.extend(fit_result.conditional_points)
-    ctx.conditional_deviation_points.extend(fit_result.conditional_deviation_points)
-    ctx.conditional_curve_points.extend(fit_result.conditional_curve)
-    ctx.component_points.extend(fit_result.component_points)
-    ctx.component_curve_points.extend(fit_result.component_curve)
-    for reason, count in fit_result.conditional_failures.items():
-        ctx.failures[reason] = ctx.failures.get(reason, 0) + count
-    for model_name, fit_seconds in fit_result.fit_durations.items():
-        ctx.fit_durations[(query_id, model_name)] = fit_seconds
-    for model_name in fit_result.slow_fits:
-        key = (query_id, model_name)
-        ctx.slow_fits[key] = ctx.slow_fits.get(key, 0) + 1
-    for regressor_id, reason in fit_result.regressor_failures:
-        rkey = (query_id, regressor_id, reason)
-        ctx.regressor_failures[rkey] = ctx.regressor_failures.get(rkey, 0) + 1
-    for kind, count in fit_result.emission_clipped.items():
-        ekey = (query_id, kind)
-        ctx.emission_clipped[ekey] = ctx.emission_clipped.get(ekey, 0) + count
-    if fit_result.cold_start_siblings > 0:
-        ctx.cold_start_siblings[query_id] = fit_result.cold_start_siblings
-    ctx.drift_points.extend(fit_result.drift_points)
-    if fit_result.drift_alerts:
-        ctx.drift_alerts[query_id] = ctx.drift_alerts.get(query_id, 0) + fit_result.drift_alerts
-
-
-def _inherit_prior_for_skipped_queries(  # noqa: PLR0912
-    ctx: _RunContext,
-    prior: GroupSnapshot,
-    *,
-    run_query_ids: set[str],
-) -> None:
-    """Preload ``ctx`` with prior-snapshot data for queries skipped this tick.
-
-    With per-query refresh intervals, ``run_group`` may run only a
-    subset of the group's queries on any given tick. Without this
-    preload the snapshot would lose every other query's last-known
-    forecast / accuracy / deviation rows the next time the partial
-    snapshot is published. Counter-style fields (slow_fits, gaps_filled,
-    ...) are already merged with the prior via the explicit
-    counter-merge logic in :meth:`Runner.run_group`; here we only need
-    to copy snapshot-style (gauge / list) data.
-
-    ``run_query_ids`` is the set of query IDs that *will* run this
-    tick; everything else gets its prior data inherited. ``curve_points``
-    are intentionally *not* inherited because they drive the remote_write
-    sink — pushing previously-fit curves every refresh would duplicate
-    data in the TSDB.
-    """
-    # Point lists keyed by query-id label.
-    for point in prior.accuracy_points:
-        if point.labels.get("id") not in run_query_ids:
-            ctx.accuracy_points.append(point)
-    for dpoint in prior.deviation_points:
-        if dpoint.labels.get("id") not in run_query_ids:
-            ctx.deviation_points.append(dpoint)
-    for qpoint in prior.quality_points:
-        if qpoint.labels.get("id") not in run_query_ids:
-            ctx.quality_points.append(qpoint)
-    for epoint in prior.ensemble_weights:
-        if epoint.labels.get("id") not in run_query_ids:
-            ctx.ensemble_weight_points.append(epoint)
-    for cpoint in prior.calibration_offsets:
-        if cpoint.labels.get("id") not in run_query_ids:
-            ctx.calibration_offsets.append(cpoint)
-    for drift_point in prior.drift_points:
-        if drift_point.labels.get("id") not in run_query_ids:
-            ctx.drift_points.append(drift_point)
-    # Point lists keyed by metric name (which encodes the query id).
-    for fpoint in prior.points:
-        q_id = _query_id_from_metric(fpoint.metric)
-        if q_id not in run_query_ids:
-            ctx.points.append(fpoint)
-    for contribution_point in prior.contribution_points:
-        if _query_id_from_metric(contribution_point.metric) not in run_query_ids:
-            ctx.contribution_points.append(contribution_point)
-    for tpoint in prior.threshold_etas:
-        if _query_id_from_metric(tpoint.metric) not in run_query_ids:
-            ctx.threshold_etas.append(tpoint)
-    for gpoint in prior.growth_rates:
-        if _query_id_from_metric(gpoint.metric) not in run_query_ids:
-            ctx.growth_rates.append(gpoint)
-    for wbpoint in prior.will_breach_points:
-        if _query_id_from_metric(wbpoint.metric) not in run_query_ids:
-            ctx.will_breach_points.append(wbpoint)
-    for drain_point in prior.time_to_drain_points:
-        if _query_id_from_metric(drain_point.metric) not in run_query_ids:
-            ctx.time_to_drain_points.append(drain_point)
-    for ebpoint in prior.error_budget_points:
-        if _query_id_from_metric(ebpoint.metric) not in run_query_ids:
-            ctx.error_budget_points.append(ebpoint)
-    # ``forecast_recommended_maintenance_window`` is a global metric
-    # name (no per-id prefix); use the ``id`` label to scope inheritance.
-    for rwpoint in prior.recommended_maintenance_window_points:
-        if rwpoint.labels.get("id") not in run_query_ids:
-            ctx.recommended_maintenance_window_points.append(rwpoint)
-    for cfpoint in prior.conditional_points:
-        if _query_id_from_metric(cfpoint.metric) not in run_query_ids:
-            ctx.conditional_points.append(cfpoint)
-    for cdpoint in prior.conditional_deviation_points:
-        if cdpoint.labels.get("id") not in run_query_ids:
-            ctx.conditional_deviation_points.append(cdpoint)
-    for compoint in prior.component_points:
-        if _query_id_from_metric(compoint.metric) not in run_query_ids:
-            ctx.component_points.append(compoint)
-    # Per-(query, model) and per-query dicts that aren't counters.
-    for (q_id, model_name), fit_seconds in prior.fit_durations.items():
-        if q_id not in run_query_ids:
-            ctx.fit_durations[(q_id, model_name)] = fit_seconds
-    for q_id, stats in prior.preprocess_stats.items():
-        if q_id not in run_query_ids:
-            # ``PreprocessStats`` is mutable (the runner mutates it
-            # in-place when accumulating per-query stats). Copying
-            # defensively here prevents a future writer on the new ctx
-            # from mutating the prior snapshot mid-render: a follower
-            # serving ``/metrics`` would otherwise see torn state.
-            ctx.preprocess_stats[q_id] = PreprocessStats(
-                gaps_filled=dict(stats.gaps_filled),
-                max_gap_seconds=stats.max_gap_seconds,
-                outliers_replaced=dict(stats.outliers_replaced),
-                change_points=stats.change_points,
-                effective_lookback_seconds=stats.effective_lookback_seconds,
-            )
-    for q_id, count in prior.cold_start_siblings.items():
-        if q_id not in run_query_ids:
-            ctx.cold_start_siblings[q_id] = count
-    for q_id, dur in prior.run_duration_per_query.items():
-        if q_id not in run_query_ids:
-            ctx.run_duration_per_query[q_id] = dur
-    for q_id, count in prior.series_count_per_query.items():
-        if q_id not in run_query_ids:
-            ctx.series_count_per_query[q_id] = count
-
-
-def _apply_safeguards_to_forecast_frame(
-    forecast: pd.DataFrame,
-    *,
-    levels: list[int],
-    clip: bool,
-    rounder: bool,
-) -> pd.DataFrame:
-    """Return a copy of ``forecast`` with count-aware safeguards applied.
-
-    Used by the conditional emission path so the snapshot points, the
-    sink curve, and the deviation gauges built from the same frame all
-    see the same clipped/rounded values. Counter bumps live with the
-    unconditional pass — the conditional emission re-uses the same fit
-    semantics and counting twice would double-charge the per-(query,
-    kind) total.
-
-    Uses numpy vectorisation so a typical horizon (288 rows by 5 columns
-    at default 2 levels) is one pass per column instead of 1440
-    Python-level float conversions.
-    """
-    if forecast.empty or not (clip or rounder):
-        return forecast
-    import numpy as np  # noqa: PLC0415
-    import pandas as pd  # noqa: PLC0415
-
-    out = forecast.copy()
-    cols = ["yhat"] + [
-        col for level in levels for col in (f"yhat_lower_{level}", f"yhat_upper_{level}")
-    ]
-    for col in cols:
-        if col not in out.columns:
-            continue
-        # Coerce to float so clip / round have well-defined semantics
-        # against pandas extension-array columns. ``errors="coerce"``
-        # turns non-numeric entries into NaN, which both numpy ops
-        # tolerate and propagate — matching the Python-loop version's
-        # behaviour of passing such entries through unchanged.
-        arr = pd.to_numeric(out[col], errors="coerce").to_numpy(dtype=float)
-        # Pre-record the NaN mask so non-finite inputs round-trip
-        # unchanged: ``np.round`` of NaN is NaN already, but clipping
-        # would turn NaN into 0.0 under naive ``np.maximum`` semantics —
-        # we restore NaN at the end so the contract matches the scalar
-        # ``_classify_emission_correction`` path.
-        nan_mask = ~np.isfinite(arr)
-        if clip:
-            # ``np.maximum`` preserves the input shape and dtype (unlike
-            # ``np.where`` whose typed return is multidim) — the column
-            # is 1-D so this is the right primitive here.
-            arr = np.maximum(arr, 0.0)
-        if rounder:
-            arr = np.round(arr)
-        if nan_mask.any():
-            arr[nan_mask] = np.nan
-        out[col] = arr
-    return out
-
-
-def _flatten_regressors_to_last_value(
-    regressors: pd.DataFrame | None,
-) -> pd.DataFrame | None:
-    """Return a copy of ``regressors`` whose every row equals the last row.
-
-    Implements the "held at current value" semantics of the conditional
-    forecast: each regressor column is replaced with a constant series
-    equal to its most recent in-sample value. Calendar features (which
-    legitimately vary per timestamp) are preserved through the same
-    flattening — the conditional contract is "imagine current state
-    continued unchanged", which by construction freezes the calendar as
-    well. Returns ``None`` when no regressors were configured so the
-    caller skips the re-fit's regressor argument cleanly.
-
-    Uses scalar broadcast (``flat[col] = scalar``) instead of building a
-    Python list per column so a wide regressor frame doesn't materialise
-    N copies of the same value through the heap. pandas treats the
-    scalar assignment as a constant broadcast and writes a single typed
-    array.
-    """
-    if regressors is None or regressors.empty:
-        return regressors
-    import pandas as pd  # noqa: PLC0415
-
-    last_row = regressors.iloc[-1]
-    flat = pd.DataFrame(index=regressors.index)
-    for col in regressors.columns:
-        if col == "ds":
-            flat[col] = regressors[col].to_numpy()
-            continue
-        # Scalar broadcast: pandas writes a constant array of the right
-        # dtype without allocating a Python list of N references.
-        flat[col] = last_row[col]
-    return flat
-
-
-def _series_key_from_labels(labels: dict[str, str]) -> str:
-    """Stable per-series key derived from the label set.
-
-    Used to address per-series state in the drift cache and band-coverage
-    tracker. Skips ``__name__`` (Prometheus's reserved metric-name
-    pseudo-label) so two queries that return the same labelset on a
-    different metric share state appropriately — both forecast the same
-    underlying signal.
-
-    The key is ``"k1=v1,k2=v2"`` with sorted keys so equal label
-    dictionaries produce the same key regardless of iteration order.
-    """
-    items = sorted((k, v) for k, v in labels.items() if k != "__name__")
-    return ",".join(f"{k}={v}" for k, v in items)
-
-
-def _format_band_window(window: timedelta) -> str:
-    """Render a ``timedelta`` window as a Prometheus-style label."""
-    return point_factory_mod.format_window(window.total_seconds())
-
-
-# Suffixes that the runner / point_factory emits on forecast-derived
-# metrics. ``_query_id_from_metric`` matches the longest one first so an
-# id like ``api_forecast_count`` (a legal Prometheus identifier) is not
-# mis-routed by an internal ``_forecast`` substring.
-_FORECAST_METRIC_SUFFIXES: tuple[str, ...] = (
-    "_forecast_contribution_ratio",
-    "_forecast_time_to_threshold_seconds",
-    "_forecast_time_to_drain_seconds",
-    "_forecast_error_budget_remaining_seconds",
-    "_forecast_error_budget_exhausted_in_seconds",
-    "_forecast_error_budget_burn_rate",
-    "_forecast_growth_rate",
-    "_forecast_will_breach",
-    "_forecast_conditional_lower",
-    "_forecast_conditional_upper",
-    "_forecast_conditional",
-    "_forecast_component",
-    "_forecast_lower",
-    "_forecast_upper",
-    "_forecast",
-)
-
-
-def _query_id_from_metric(metric_name: str) -> str:
-    """Pull the query ``id`` back out of a forecast metric name.
-
-    Matches the known emission suffix set rather than ``rfind("_forecast")``
-    so a query id that legitimately contains the word ``forecast`` (e.g.
-    ``api_forecast_count``) round-trips correctly.
-    """
-    for suffix in _FORECAST_METRIC_SUFFIXES:
-        if metric_name.endswith(suffix):
-            stem = metric_name[: -len(suffix)]
-            if stem:
-                return stem
-    return ""
-
-
-def _resolve_spec(specs: list[ModelSpec], name: str) -> ModelSpec:
-    """Look up a configured ``ModelSpec`` by name; defaults to params=``{}``.
-
-    The fallback model is allowed to live outside ``defaults.models`` (a
-    SeasonalNaive safety net for an AutoARIMA-only setup is the canonical
-    case). We synthesise an empty-params spec so the fallback runs with
-    stock model defaults rather than failing the lookup.
-    """
-    for spec in specs:
-        if spec.name == name:
-            return spec
-    return ModelSpec(name=name)
-
-
-def _combine_ensemble(
-    component_forecasts: dict[str, pd.DataFrame],
-    weights: dict[str, float],
-    levels: list[int],
-) -> pd.DataFrame:
-    """Build a single forecast frame from inverse-MAPE-weighted components.
-
-    Aligns on ``unique_id`` + ``ds``. Each numeric column is the weighted
-    sum across components present at that row; missing columns (a model
-    that didn't emit a level we requested) contribute weight 0 so the
-    ensemble doesn't quietly inherit one component's missing band.
-    """
-    import pandas as pd  # noqa: PLC0415
-
-    base_cols = ["unique_id", "ds"]
-    value_cols = ["yhat"] + [
-        f"yhat_{kind}_{level}" for kind in ("lower", "upper") for level in levels
-    ]
-
-    import numpy as np  # noqa: PLC0415
-
-    accumulator: pd.DataFrame | None = None
-    weight_accumulator: dict[str, np.ndarray[Any, Any]] | None = None
-    for name, weight in weights.items():
-        df = component_forecasts.get(name)
-        if df is None or df.empty:
-            continue
-        if accumulator is None or weight_accumulator is None:
-            accumulator = df[base_cols].reset_index(drop=True).copy()
-            weight_accumulator = {col: np.zeros(len(df), dtype=float) for col in value_cols}
-            for col in value_cols:
-                accumulator[col] = 0.0
-        for col in value_cols:
-            if col not in df.columns:
-                continue
-            # Switch to numpy arrays for the accumulation: pandas would
-            # try to align on the (matching) index every iteration, which
-            # both wastes work and confuses pandas-stubs about the
-            # resulting dtype.
-            current = accumulator[col].to_numpy(dtype=float)
-            accumulator[col] = current + df[col].to_numpy(dtype=float) * weight
-            weight_accumulator[col] = weight_accumulator[col] + weight
-    if accumulator is None or weight_accumulator is None:
-        # No usable components — return an empty frame the caller can detect.
-        return pd.DataFrame(columns=[*base_cols, *value_cols])
-    # Convert weight sums back to plain Series for the divide-by-weight step;
-    # rows where total weight is 0 retain NaN rather than dividing by zero.
-    for col in value_cols:
-        denom = pd.Series(weight_accumulator[col])
-        accumulator[col] = accumulator[col] / denom.where(denom > 0, other=float("nan"))
-    return accumulator
-
-
-def _run_backtest(
-    model: ForecastModel,
-    df: pd.DataFrame,
-    horizon_steps: int,
-    freq: str,
-    levels: list[int],
-    regressors: pd.DataFrame | None = None,
-) -> tuple[pd.DataFrame, pd.DataFrame] | None:
-    return backtest(
-        model=model,
-        df=df,
-        horizon_steps=horizon_steps,
-        freq=freq,
-        levels=levels,
-        regressors=regressors,
-    )
-
-
-def _pandas_freq(step: timedelta) -> str:
-    seconds = int(step.total_seconds())
-    if seconds % 3600 == 0:
-        return f"{seconds // 3600}h"
-    if seconds % 60 == 0:
-        return f"{seconds // 60}min"
-    return f"{seconds}s"
-
-
-def _summarise_backtest(
-    predictions: pd.DataFrame,
-    test: pd.DataFrame,
-    levels: list[int],
-) -> tuple[float, float, dict[int, BandSummary]] | None:
-    """Extract the trailing (actual, yhat, per-level band) tuple, or None.
-
-    Returns ``None`` if either frame is empty or missing the ``y``/``yhat``
-    columns; non-finite cells are tolerated and surface downstream as NaN.
-    """
-    if predictions.empty or test.empty:
-        return None
-    try:
-        last_actual = float(test["y"].iloc[-1])
-        last_yhat = float(predictions["yhat"].iloc[-1])
-    except (KeyError, IndexError, ValueError):
-        return None
-    bands: dict[int, BandSummary] = {}
-    for level in levels:
-        lo_col = f"yhat_lower_{level}"
-        hi_col = f"yhat_upper_{level}"
-        if lo_col not in predictions.columns or hi_col not in predictions.columns:
-            continue
-        try:
-            lower = float(predictions[lo_col].iloc[-1])
-            upper = float(predictions[hi_col].iloc[-1])
-        except (ValueError, IndexError):
-            continue
-        bands[level] = BandSummary(lower=lower, upper=upper)
-    return last_actual, last_yhat, bands

@@ -34,6 +34,7 @@ __all__ = [
     "BandCoveragePoint",
     "CalibrationOffsetPoint",
     "ComponentDecompositionPoint",
+    "ConditionalCalibrationOffsetPoint",
     "ConditionalDeviationPoint",
     "ConditionalForecastPoint",
     "ContributionPoint",
@@ -323,6 +324,22 @@ class CalibrationOffsetPoint:
     offset: float
 
 
+@dataclass(frozen=True)
+class ConditionalCalibrationOffsetPoint:
+    """Conditional-band variant of :class:`CalibrationOffsetPoint`.
+
+    Rendered as
+    ``forecast_conditional_band_calibration_offset{id, group, model, level}``
+    so an operator alerting on ``forecast_conditional_deviation_outside_band``
+    can see exactly how much widening the conditional band received from its
+    own calibration pass (not the unconditional pass). Emitted only when
+    both ``accuracy.conformal.enabled`` and ``emission.conditional`` are on.
+    """
+
+    labels: dict[str, str]
+    offset: float
+
+
 @dataclass
 class PreprocessStats:
     """Per-(group, query) preprocessing telemetry.
@@ -437,6 +454,15 @@ class GroupSnapshot:
     # /metrics; series that disappear from the config disappear from the
     # exposition until they reappear.
     calibration_offsets: list[CalibrationOffsetPoint] = field(default_factory=list)
+    # Per-(series, model, level) conditional-band conformal offsets.
+    # Same shape as ``calibration_offsets`` but derived from a calibration
+    # fit whose regressors are held flat at their final pre-holdout value
+    # — matching the production-time conditional inference contract. The
+    # parallel family lets operators eyeball whether the conditional band's
+    # widening differs from the unconditional's at the same (model, level).
+    conditional_calibration_offsets: list[ConditionalCalibrationOffsetPoint] = field(
+        default_factory=list
+    )
     # Per-(query) preprocessing statistics for the most recent run.
     # Counters (gaps_filled, outliers_replaced, change_points) are merged
     # with the previous snapshot so the exposed counter never decreases;
@@ -539,6 +565,15 @@ class Exporter:
         # their deployment; a flat-zero counter means every conditional
         # emission is paying the refit cost.
         self._conditional_aliased: dict[tuple[str, str, str], int] = {}
+        # Per-(group, query, reason) conditional-calibration failure counter.
+        # Bumped whenever the fresh per-fit conformal calibration pass for
+        # the conditional band fails (degenerate holdout, fit timeout, fit
+        # error) and the runner falls back to the inherited unconditional
+        # offsets. The fallback path is no worse than the pre-v1.6.5
+        # behaviour, but operators want to know when fresh calibration
+        # *didn't* run — a sustained tick rate signals the conditional
+        # band is silently relying on inherited offsets.
+        self._conditional_calibration_failures: dict[tuple[str, str, str], int] = {}
         # Per-(group, query, source) season_length auto-detection counter.
         # ``source`` is bounded to {detected, snapped, fallback, too_short}
         # so cardinality is small and predictable. Useful for alerting on
@@ -699,6 +734,25 @@ class Exporter:
             key = (group, query, model)
             self._conditional_aliased[key] = self._conditional_aliased.get(key, 0) + 1
 
+    def increment_conditional_calibration_failure(
+        self,
+        group: str,
+        query: str,
+        reason: str,
+    ) -> None:
+        """Bump the per-(group, query, reason) conditional-calibration failure counter.
+
+        ``reason`` is one of ``degenerate_holdout``, ``fit_timeout``,
+        ``fit_error`` — the bounded set produced by
+        :meth:`Runner._compute_conditional_conformal_offsets`. Any other
+        token would inflate cardinality; callers must use the bounded set.
+        """
+        with self._lock:
+            key = (group, query, reason)
+            self._conditional_calibration_failures[key] = (
+                self._conditional_calibration_failures.get(key, 0) + 1
+            )
+
     def increment_decomposition_skipped(
         self,
         group: str,
@@ -791,6 +845,12 @@ class Exporter:
         with self._lock:
             return dict(self._conditional_aliased)
 
+    def _conditional_calibration_failures_state(
+        self,
+    ) -> dict[tuple[str, str, str], int]:
+        with self._lock:
+            return dict(self._conditional_calibration_failures)
+
     def _season_length_state(self) -> dict[tuple[str, str, str], int]:
         with self._lock:
             return dict(self._season_length_detections)
@@ -815,6 +875,9 @@ class _SnapshotCollector:
         season_length_state = self._exporter._season_length_state()
         decomposition_skipped_state = self._exporter._decomposition_skipped_state()
         conditional_aliased_state = self._exporter._conditional_aliased_state()
+        conditional_calibration_failures_state = (
+            self._exporter._conditional_calibration_failures_state()
+        )
         yield from _forecast_families(groups)
         yield from _conditional_forecast_families(groups)
         yield from _conditional_deviation_families(groups)
@@ -831,6 +894,10 @@ class _SnapshotCollector:
         yield from _recommended_window_families(groups)
         yield from _growth_rate_families(groups)
         yield from _calibration_families(groups)
+        yield from _conditional_calibration_families(groups)
+        yield from _conditional_calibration_failures_families(
+            conditional_calibration_failures_state
+        )
         yield from _preprocess_families(groups)
         yield from _emission_clipped_families(groups)
         yield from _cold_start_siblings_families(groups)
@@ -1685,6 +1752,58 @@ def _calibration_families(
         value_fn=lambda p: p.offset,
         skip_fn=lambda p: not math.isfinite(p.offset),
     )
+
+
+def _conditional_calibration_families(
+    groups: list[GroupSnapshot],
+) -> Iterator[GaugeMetricFamily]:
+    """Render ``forecast_conditional_band_calibration_offset`` gauges.
+
+    Mirrors :func:`_calibration_families` but for the conditional emission
+    family. Emitted only when at least one series produced a non-empty
+    conditional offset list — a deployment with no query opting into both
+    ``accuracy.conformal.enabled`` and ``emission.conditional`` produces
+    no samples and the family is omitted entirely.
+    """
+    points = [p for snap in groups for p in snap.conditional_calibration_offsets]
+    yield from _emit_gauge_family(
+        points,
+        "forecast_conditional_band_calibration_offset",
+        "Additive correction applied to the conditional forecast band by "
+        "split-conformal calibration on a holdout where regressors are held "
+        "flat at their final pre-holdout value. Positive values widen each "
+        "side of the conditional band; 0 means the parametric band already "
+        "empirically covered its nominal level under conditional inference.",
+        value_fn=lambda p: p.offset,
+        skip_fn=lambda p: not math.isfinite(p.offset),
+    )
+
+
+def _conditional_calibration_failures_families(
+    state: dict[tuple[str, str, str], int],
+) -> Iterator[CounterMetricFamily]:
+    """Render ``forecast_conditional_calibration_failures_total{group, query, reason}``.
+
+    Bumped every time the runner falls back from a fresh per-fit
+    conditional-band calibration to the inherited unconditional offsets.
+    ``reason`` is bounded to the set produced by
+    :meth:`Runner._compute_conditional_conformal_offsets`
+    (``degenerate_holdout``, ``fit_timeout``, ``fit_error``).
+    """
+    if not state:
+        return
+    counter = CounterMetricFamily(
+        "forecast_conditional_calibration_failures",
+        "Number of times the conditional-band conformal calibration fit "
+        "could not produce fresh offsets and the runner fell back to the "
+        "inherited unconditional offsets. The fallback path is no worse "
+        "than the pre-v1.6.5 behaviour, but a sustained tick rate means "
+        "fresh calibration is silently not running.",
+        labels=["group", "query", "reason"],
+    )
+    for (group, query, reason), count in state.items():
+        counter.add_metric([group, query, reason], float(count))
+    yield counter
 
 
 def _preprocess_families(
