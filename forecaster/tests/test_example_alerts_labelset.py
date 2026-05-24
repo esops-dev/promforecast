@@ -292,6 +292,31 @@ FIXTURE: dict[str, list[dict[str, str]]] = {
         )
         for r in (1, 2, 3)
     ],
+    "forecast_deploy_risk_score": [
+        _with(
+            _SNAPSHOT_OP_LABELS,
+            service="payments",
+            deployment_id="payments-1715000000",
+            contributing_signals="2",
+        ),
+        _with(
+            _SNAPSHOT_OP_LABELS,
+            service="search",
+            deployment_id="search-1715000100",
+            contributing_signals="3",
+        ),
+    ],
+    "forecast_incident_recurrence_score": [
+        _with(
+            _SNAPSHOT_OP_LABELS,
+            group="incidents",
+            id="pagerduty_incidents_total",
+            day_of_week=str(d),
+            hour_of_day=str(h),
+        )
+        for d in (0, 1, 2)
+        for h in (0, 12, 23)
+    ],
 }
 
 # ---------------------------------------------------------------------------

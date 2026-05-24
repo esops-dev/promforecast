@@ -1,0 +1,94 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "promforecast-metrics-adapter.fullname" . }}
+  labels:
+    {{- include "promforecast-metrics-adapter.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "promforecast-metrics-adapter.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "promforecast-metrics-adapter.selectorLabels" . | nindent 8 }}
+      annotations:
+        # Re-trigger pod rollout when the config or the cert
+        # changes — Helm's checksum/config + checksum/secret
+        # annotations are the standard pattern. The TLS material
+        # helper looks up the chart-managed Secret on upgrade so the
+        # cert is *stable* across `helm upgrade` and this checksum
+        # only flips on a real rotation (initial install, the Secret
+        # being deleted out-of-band, or ``existingSecret`` swapped to
+        # different material) — uvicorn loads ssl_certfile once at
+        # boot and never reloads, so the rolling restart is the only
+        # way to pick up a new cert.
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        checksum/tls: {{ include "promforecast-metrics-adapter.tlsMaterial" . | sha256sum }}
+    spec:
+      serviceAccountName: {{ include "promforecast-metrics-adapter.serviceAccountName" . }}
+      securityContext:
+        {{- toYaml .Values.securityContext | nindent 8 }}
+      containers:
+        - name: adapter
+          image: {{ include "promforecast-metrics-adapter.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - adapter
+            - --config=/etc/promforecast-adapter/adapter.yaml
+            - --tls-cert=/var/run/promforecast-adapter/tls.crt
+            - --tls-key=/var/run/promforecast-adapter/tls.key
+          ports:
+            - name: https
+              containerPort: 6443
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: https
+              scheme: HTTPS
+            initialDelaySeconds: {{ .Values.probes.readiness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.readiness.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.readiness.timeoutSeconds }}
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: https
+              scheme: HTTPS
+            initialDelaySeconds: {{ .Values.probes.liveness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.liveness.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.liveness.timeoutSeconds }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/promforecast-adapter
+              readOnly: true
+            - name: tls
+              mountPath: /var/run/promforecast-adapter
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "promforecast-metrics-adapter.fullname" . }}
+        - name: tls
+          secret:
+            secretName: {{ include "promforecast-metrics-adapter.tlsSecretName" . }}
+            items:
+              - key: tls.crt
+                path: tls.crt
+              - key: tls.key
+                path: tls.key
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

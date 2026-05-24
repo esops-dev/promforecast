@@ -48,6 +48,8 @@ Notation:
 | `forecast_conditional_band_calibration_offset` | `S × M × L`                          | `emission.conditional: true` *and* `accuracy.conformal.enabled: true` |
 | SLO error budget                            | `S × M × N_windows × (3 + L)`          | `slo:` configured (3 sibling families × N_windows, plus level fan-out on exhausted_in) |
 | Recommended maintenance windows             | `S × M × count`                        | `recommended_windows.enabled: true` |
+| `forecast_deploy_risk_score`                | `max_active_deploys` per service       | One row per active deploy while inside `active_window`; bounded per service by `deploy_signals[].max_active_deploys`. Charged against the *global* budget, not the per-query series cap. |
+| `forecast_incident_recurrence_score`        | `168` per opted-in query               | Fixed 7 days × 24 hours grid per query with `data_profile: events`. Independent of `S` — the heatmap is the aggregate across whatever the counter PromQL fans out into. |
 | Operational + preprocessing families        | ~7 per group + ~6 per query            | Mostly always on |
 
 ## Working example

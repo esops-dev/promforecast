@@ -404,3 +404,46 @@ spec:
               above 4h. The queue is being worked off, but the
               backlog is too large to clear before downstream SLAs
               are at risk. Add consumer capacity or shed load.
+
+    # ----------------------------------------------------------------
+    # Deploy-anchored risk score alerts.
+    # ----------------------------------------------------------------
+    # These rules assume the ``deploy_signals:`` top-level config
+    # block is populated with at least one service. The forecaster
+    # emits ``forecast_deploy_risk_score{deployment_id, service,
+    # contributing_signals}`` per active deploy; an empty
+    # ``deploy_signals`` produces no series and the alerts stay
+    # quiet. ``contributing_signals >= 2`` keeps the alert from
+    # firing on single-signal blips.
+    - name: promforecast.deploy.examples
+      interval: 1m
+      rules:
+        - alert: DeployHighRisk
+          expr: |
+            forecast_deploy_risk_score{contributing_signals!~"0|1"} > 0.5
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Deploy {{ $labels.deployment_id }} on {{ $labels.service }} shows elevated risk"
+            description: |
+              The composite of |forecast_deviation_ratio| across the
+              configured signals for {{ $labels.service }} exceeded
+              0.5 for 5m after a deploy. Consider rolling back if
+              the deviation persists or worsens — see DeployCriticalRisk.
+
+        - alert: DeployCriticalRisk
+          expr: |
+            forecast_deploy_risk_score{contributing_signals!~"0|1"} > 1.0
+          for: 2m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Deploy {{ $labels.deployment_id }} on {{ $labels.service }} is materially degrading signals"
+            description: |
+              The composite of |forecast_deviation_ratio| across the
+              configured signals for {{ $labels.service }} exceeded
+              1.0 for 2m — at least one signal is a full band-width
+              outside its forecast. Roll back unless the deploy is
+              expected to shift the metric (in which case retrain
+              the model with the new regime).

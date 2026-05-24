@@ -16,11 +16,11 @@ These meta-tests fail loudly when:
 * a registered entry points at a field that no longer exists on either
   :class:`GroupSnapshot` or :class:`_RunContext`.
 
-Without this guard, the registry-driven dispatch the v1.6.5 refactor
-introduced trades the pre-split hand-coded copy block for a different
-silent-regression vector: a missing registry line drops the family
-from partial-tick exposition until the next full run. Catching it at
-test time (and naming the offending field) is the lowest-cost defence.
+Without this guard, the registry-driven dispatch trades the older
+hand-coded copy block for a different silent-regression vector: a
+missing registry line drops the family from partial-tick exposition
+until the next full run. Catching it at test time (and naming the
+offending field) is the lowest-cost defence.
 """
 
 from __future__ import annotations

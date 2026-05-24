@@ -39,7 +39,7 @@ _MIN_SPEEDUP = 1.1
 
 
 def _linear_scan_reference(metric_name: str) -> str:
-    """Reference implementation: the pre-v1.6.5 linear ``endswith`` scan."""
+    """Reference implementation: the original linear ``endswith`` scan."""
     for suffix in _FORECAST_METRIC_SUFFIXES:
         if metric_name.endswith(suffix):
             stem = metric_name[: -len(suffix)]

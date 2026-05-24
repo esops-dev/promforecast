@@ -37,7 +37,11 @@ metrics, calibration, explainability, and ad-hoc what-if endpoints.
 - [Explainability (decomposition)](outputs/explainability.md) — trend / seasonal / level / residual split of the forecast curve
 - [Forecast drift](outputs/drift.md) — prediction-vs-prediction shift telemetry
 - [Forecast preview](outputs/preview.md) — opt-in ad-hoc what-if endpoint
+- [Fleet capacity what-if](outputs/what-if-fleet.md) — multi-service stress-test endpoint that ranks projected breaches under a hypothetical traffic multiplier
+- [Deploy risk score](outputs/deploy-safety.md) — deploy-anchored composite of deviation across golden signals; pair with Argo Rollouts / Flagger as a rollback gate
+- [Recurring incident patterns](outputs/incident-patterns.md) — 7 x 24 heatmap of when incidents tend to land; for queries with `data_profile: events`
 - [Canary forecasts](outputs/canary.md)
+- [Predictive autoscaling](predictive-autoscaling.md) — Kubernetes custom-metrics adapter that exposes forecast metrics to HorizontalPodAutoscaler for scaling on the projected load curve
 
 ## Operations
 

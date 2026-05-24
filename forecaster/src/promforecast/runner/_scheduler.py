@@ -30,9 +30,11 @@ from .. import cold_start as cold_start_mod
 from .. import conformal as conformal_mod
 from .. import contribution as contribution_mod
 from .. import decomposition as decomposition_mod
+from .. import deploy_risk as deploy_risk_mod
 from .. import deviation as deviation_mod
 from .. import discovery as discovery_mod
 from .. import drift as drift_mod
+from .. import incident_pattern as incident_pattern_mod
 from .. import maintenance as maintenance_mod
 from .. import models as model_registry
 from .. import preprocess as preprocess_mod
@@ -41,6 +43,7 @@ from .. import regressors as regressors_mod
 from .. import seasonality as seasonality_mod
 from .. import slo as slo_mod
 from .. import telemetry as telemetry_mod
+from .. import what_if as what_if_mod
 from ..accuracy import (
     AccuracyResult,
     HorizonSpec,
@@ -50,6 +53,7 @@ from ..accuracy import (
     overall_mase,
 )
 from ..config import (
+    DeploySignalsConfig,
     GroupConfig,
     ModelSpec,
     QueryConfig,
@@ -60,10 +64,12 @@ from ..config import (
 )
 from ..exporter import (
     BandCoveragePoint,
+    DeployRiskPoint,
     DriftPoint,
     Exporter,
     ForecastPoint,
     GroupSnapshot,
+    IncidentRecurrencePoint,
     InvalidMetricNameError,
     PreprocessStats,
     QualityPoint,
@@ -130,6 +136,108 @@ __all__ = [
 ]
 
 
+# Number of rows the incident-recurrence heatmap emits per opted-in
+# (data_profile: events) query. Sourced from
+# :mod:`promforecast.incident_pattern`'s fixed 7-days x 24-hours grid.
+# Held as a module-level constant rather than recomputed on the hot
+# path because event-query emission charges it against the global
+# series budget every refresh.
+_INCIDENT_RECURRENCE_ROWS = 7 * 24
+
+
+def _build_deploy_tracker(config: Config) -> deploy_risk_mod.DeployTracker:
+    """Construct a :class:`DeployTracker` with per-service caps from config.
+
+    Each ``deploy_signals[].max_active_deploys`` becomes the per-service
+    cap; services not in the config fall back to a default of 16 (the
+    pre-config-aware behaviour, kept so an event recorded for a
+    just-removed service still gets a sensible bound while the reload
+    settles). Returning a fresh tracker on every call lets the reload
+    path drop in-flight active deploys cleanly — see
+    ``apply_config`` for the trade-off.
+    """
+    if not config.deploy_signals:
+        return deploy_risk_mod.DeployTracker(max_per_service=16)
+    caps = {entry.service: entry.max_active_deploys for entry in config.deploy_signals}
+    return deploy_risk_mod.DeployTracker(max_per_service=caps, default_max=16)
+
+
+def _sum_counter_series(
+    frames: list[SeriesFrame],
+) -> tuple[list[datetime], list[float]]:
+    """Sum a multi-series counter response into one aggregate series.
+
+    Used by the event-pattern path to fold per-(severity, team) counter
+    fan-outs into a single per-step aggregate before bucketing. The
+    timestamps come from the first frame; any frame whose timestamps
+    don't match (different scrape cadence per series, for example) is
+    dropped — the resulting aggregate is only meaningful when every
+    contributor shares the same time index.
+
+    Returns empty lists when ``frames`` is empty or no two frames
+    agree on timestamps.
+    """
+    if not frames:
+        return [], []
+    primary = frames[0]
+    timestamps = list(primary.timestamps)
+    if not timestamps:
+        return [], []
+    n = len(timestamps)
+    aggregate = [0.0] * n
+    for frame in frames:
+        if frame.timestamps != primary.timestamps:
+            continue
+        if len(frame.values) != n:
+            continue
+        for i, value in enumerate(frame.values):
+            if math.isfinite(value):
+                aggregate[i] += float(value)
+    return timestamps, aggregate
+
+
+def _aggregate_regressor_values(
+    frames: list[SeriesFrame],
+) -> tuple[list[float], list[float]]:
+    """Collapse a multi-series regressor response to (values, timestamps).
+
+    Used by the deploy-anchored risk path to inspect an anchor
+    regressor's recent values. The reduction is a per-step mean
+    across the returned series, matching the regressors module's
+    own prefetch reduction so the runner sees the same number
+    sequence the actual fit would have used.
+
+    Returns empty lists when ``frames`` is empty or when the leading
+    frame has no samples. The leading frame's timestamps anchor the
+    output; other frames whose lengths don't match are silently
+    dropped from the mean (their misaligned cadence would otherwise
+    poison every row). The all-NaN case is *not* filtered here —
+    the detector rejects NaN rows row-by-row instead.
+    """
+    if not frames:
+        return [], []
+    primary = frames[0]
+    if not primary.values or not primary.timestamps:
+        return [], []
+    timestamps = [ts.timestamp() for ts in primary.timestamps]
+    # Fast path: a single returned series — by far the common case
+    # for an anchor regressor — avoids the per-row mean allocation.
+    if len(frames) == 1:
+        return [float(v) for v in primary.values], timestamps
+    expected_len = len(primary.values)
+    aligned = [
+        [float(v) for v in frame.values] for frame in frames if len(frame.values) == expected_len
+    ]
+    # ``aligned`` always contains at least the primary frame (it
+    # matches its own length), so no empty-aligned guard is needed.
+    n = expected_len
+    means: list[float] = []
+    for i in range(n):
+        samples = [series[i] for series in aligned if math.isfinite(series[i])]
+        means.append(sum(samples) / len(samples) if samples else math.nan)
+    return means, timestamps
+
+
 class Runner:
     """Schedules and executes per-group forecast runs.
 
@@ -170,6 +278,23 @@ class Runner:
         # the Runner so the rolling state survives across runs without
         # leaking into the exporter's lock surface.
         self._band_coverage = band_coverage_mod.BandCoverageTracker()
+        # Deploy-anchored risk score tracker. Keyed by service; bounded
+        # per service so a runaway pipeline can't blow cardinality.
+        # The cap is sourced from ``deploy_signals[].max_active_deploys``
+        # so an operator can tune per-service overlap (a chatty internal
+        # service may legitimately overlap deploys more than a stable
+        # infrastructure tier). When ``deploy_signals`` is empty the
+        # tracker stays harmlessly idle.
+        self._deploy_tracker = _build_deploy_tracker(config)
+        # Fleet what-if throttle. Lives here (rather than in the FastAPI
+        # closure where it was originally) so ``apply_config`` can
+        # update ``min_interval`` on reload without the operator
+        # needing a process restart. ``main._build_app`` reads it via
+        # ``self._what_if_throttle`` so the endpoint and the runner
+        # share one instance.
+        self._what_if_throttle = what_if_mod.WhatIfThrottle(
+            min_interval_seconds=config.safety.fleet_what_if_min_interval.total_seconds(),
+        )
         # Concurrent-fits semaphore. Per-query refresh schedules can
         # synchronise multiple groups onto the same tick; without a global
         # cap a burst of cheap queries could saturate the executor pool.
@@ -290,6 +415,20 @@ class Runner:
             self._locks = {g.name: asyncio.Lock() for g in new_config.groups}
             self._exporter.retain_groups(set(new_by_name))
             self._exporter.retain_discovery_groups(set(new_by_name))
+            self._exporter.retain_incident_recurrence_groups(set(new_by_name))
+            # Per-query cleanup for the incident-recurrence heatmap:
+            # the group-level retain above handles whole-group removal,
+            # but a reload that drops a single ``data_profile: events``
+            # query from a still-present group needs a per-query
+            # sweep too, otherwise its 168 rows linger on /metrics.
+            self._exporter.retain_incident_recurrence_queries(
+                {
+                    (group.name, query.id)
+                    for group in new_config.groups
+                    for query in group.queries
+                    if query.data_profile == "events"
+                }
+            )
 
             # Reload may have changed ``safety.max_concurrent_fits``; rebuild
             # the semaphore so the new cap takes effect for upcoming fits.
@@ -300,6 +439,33 @@ class Runner:
             live_pairs = {(g.name, q.id) for g in new_config.groups for q in g.queries}
             self._drift_cache.prune_to(live_pairs)
             self._band_coverage.forget(live_pairs)
+            # Rebuild the deploy tracker against the new spec set. The
+            # rebuild deliberately drops every in-flight active deploy —
+            # a reload mid-rollout starts the next risk-score emission
+            # from a clean slate, which is the documented trade-off
+            # (the alternative would be reconciling per-service caps
+            # against possibly-shrunken specs and trying to preserve
+            # deployment ids whose ``service`` is still in the new
+            # config, code we don't yet need).
+            #
+            # Always clear the gauge state too, not only when the new
+            # ``deploy_signals`` list is empty. A partial reload that
+            # drops one service from a multi-service list also needs
+            # the scrape view cleared — otherwise the dropped
+            # service's last-known scores linger on /metrics until
+            # the next group refresh re-publishes (which may be
+            # minutes away, and never if no groups remain that
+            # touch any anchor). The next ``_publish_deploy_risk_scores``
+            # call repopulates from the rebuilt tracker.
+            self._deploy_tracker = _build_deploy_tracker(new_config)
+            self._exporter.replace_deploy_risk_scores([])
+            # Hot-reload the what-if throttle interval. The next-allowed
+            # timestamp inside the throttle is preserved so a reload
+            # can't be used to bypass an in-flight throttle window;
+            # the new interval applies to subsequent calls only.
+            self._what_if_throttle.update_min_interval(
+                new_config.safety.fleet_what_if_min_interval.total_seconds(),
+            )
             for group in new_config.groups:
                 self._spawn_group_loop(group)
 
@@ -684,6 +850,210 @@ class Runner:
                     self._exporter.increment_remote_write_failure(group.name, "unexpected")
                     del exc  # logged via exception(); avoid unused-name lint
 
+            # Update deploy-anchored risk scores when this group's
+            # queries include any anchor referenced by ``deploy_signals``.
+            # Best-effort: a fetch failure is logged but never crashes
+            # the run.
+            try:
+                await self._refresh_deploy_risk(group, run_query_ids)
+            except Exception:
+                log.exception("deploy_risk_refresh_failed")
+
+    async def _refresh_deploy_risk(
+        self,
+        group: GroupConfig,
+        run_query_ids: set[str],
+    ) -> None:
+        """Detect deploys from anchor regressors and emit risk scores.
+
+        Cheap per-call: only the anchor queries whose query just ran
+        this tick are polled. Re-firing on every subsequent fit is
+        prevented by two layers — the detector
+        (:func:`deploy_risk.detect_deploy_from_regressor`) returns
+        ``observed=False`` while the regressor stays above the
+        threshold (it requires a fresh ``previous <= threshold ->
+        leading > threshold`` transition on the leading pair), and
+        :meth:`DeployTracker.record` dedups on
+        ``(service, deployment_id)`` so a transient blip that
+        produces the same wall-clock ``deployment_id`` twice
+        collapses to one event. The function does **not** keep a
+        per-(group, query, regressor) memo across refreshes — the
+        edge check is computed locally from the query_range window
+        each tick.
+
+        Refresh-cadence caveat: detection only catches deploys whose
+        transition lands inside the *last two samples* of the
+        anchor's lookback window. For the common case where
+        ``refresh_interval ≈ step`` this is fine (each tick brings
+        in one new sample and the leading pair compares old vs.
+        new). Configurations where ``refresh_interval`` is much
+        larger than the regressor's step can under-detect because
+        the transition gets stranded mid-window — operators with
+        that shape should add a per-(group, query, regressor) memo
+        as a follow-up.
+
+        The function is deliberately defensive — every failure mode
+        (regressor fetch failure, missing regressor row, signal
+        deviation lookup miss) degrades gracefully. The worst case is
+        "no deploy detected this cycle"; the runner's main loop is
+        unaffected.
+        """
+        deploy_specs = self._config.deploy_signals
+        if not deploy_specs:
+            return
+        relevant_specs = [
+            spec
+            for spec in deploy_specs
+            if spec.anchor.type == "regressor"
+            and any(q.id == spec.anchor.query and q.id in run_query_ids for q in group.queries)
+        ]
+        if relevant_specs:
+            await self._detect_deploys_for_specs(group, relevant_specs)
+        # Score recomputation always runs (even when no new deploy was
+        # observed this tick) so an active deploy whose signals are now
+        # updated by a different group's run sees its score refresh.
+        self._publish_deploy_risk_scores()
+
+    async def _detect_deploys_for_specs(
+        self,
+        group: GroupConfig,
+        specs: list[DeploySignalsConfig],
+    ) -> None:
+        """Poll each relevant spec's anchor regressor and register fresh deploys."""
+        # Fetch each anchor regressor's recent values via a small
+        # query_range. The lookback is intentionally narrow (one hour
+        # at the configured step) — we only need the leading-pair to
+        # decide "transitioned across threshold".
+        end = datetime.now(tz=UTC)
+        for spec in specs:
+            query = next((q for q in group.queries if q.id == spec.anchor.query), None)
+            if query is None:
+                continue
+            regressor = next(
+                (r for r in query.regressors if r.id == spec.anchor.regressor_id),
+                None,
+            )
+            if regressor is None or not regressor.promql:
+                # Calendar / holidays regressors don't have a PromQL —
+                # using them as anchors is not meaningful and was
+                # rejected at config load, but guard here too.
+                continue
+            eff_step = effective_step(query, self._config.defaults)
+            step_seconds = max(1, int(eff_step.total_seconds()))
+            # Two hours of lookback gives us a transition window
+            # regardless of refresh cadence; the detector only needs
+            # the leading pair.
+            start = end - timedelta(hours=2)
+            try:
+                frames = await self._source.query_range(regressor.promql, start, end, step_seconds)
+            except Exception:
+                logger.exception(
+                    "deploy_anchor_query_failed",
+                    group=group.name,
+                    service=spec.service,
+                    regressor=regressor.id,
+                )
+                continue
+            if not frames:
+                continue
+            # Aggregate across returned series via mean — same shape
+            # as the regressor module's own prefetch reduction.
+            values, timestamps = _aggregate_regressor_values(frames)
+            observed, ts = deploy_risk_mod.detect_deploy_from_regressor(
+                values=values,
+                timestamps_unix=timestamps,
+                threshold=spec.anchor.threshold,
+            )
+            if not observed or ts is None:
+                continue
+            event = deploy_risk_mod.DeployEvent(
+                deployment_id=deploy_risk_mod.derive_deployment_id(spec.service, ts),
+                service=spec.service,
+                observed_at_seconds=time.monotonic(),
+                active_window_seconds=deploy_risk_mod.active_window_seconds(spec.active_window),
+            )
+            self._deploy_tracker.record(event)
+            logger.info(
+                "deploy_detected",
+                service=spec.service,
+                deployment_id=event.deployment_id,
+                anchor_query=spec.anchor.query,
+                anchor_regressor=regressor.id,
+            )
+
+    def _publish_deploy_risk_scores(self) -> None:
+        """Recompute scores from the live snapshot and push to the exporter."""
+        deploy_specs = self._config.deploy_signals
+        if not deploy_specs:
+            return
+        signals_by_service: dict[str, list[deploy_risk_mod.SignalSpec]] = {
+            spec.service: [
+                deploy_risk_mod.SignalSpec(query_id=s.query, weight=s.weight) for s in spec.signals
+            ]
+            for spec in deploy_specs
+        }
+        active = self._deploy_tracker.active()
+        if not active:
+            # No active deploys — clear the gauge so an expired deploy
+            # disappears from /metrics immediately.
+            self._exporter.replace_deploy_risk_scores([])
+            return
+        # Build a per-service deviation lookup against the most recent
+        # exporter snapshot. The lookup returns the absolute deviation
+        # ratio averaged across every (series, model, level) row for
+        # the named query — operators read the composite as a
+        # service-level score, not a per-(series, model) one.
+        lookup = self._build_deviation_lookup()
+        scores = deploy_risk_mod.compute_deploy_risk_scores(
+            deploys=active,
+            signals_by_service=signals_by_service,
+            deviation_lookup=lookup,
+        )
+        points = [
+            DeployRiskPoint(
+                labels={
+                    "service": score.service,
+                    "deployment_id": score.deployment_id,
+                    "contributing_signals": str(score.contributing_signals),
+                },
+                score=score.score,
+            )
+            for score in scores
+        ]
+        self._exporter.replace_deploy_risk_scores(points)
+
+    def _build_deviation_lookup(self) -> deploy_risk_mod.DeviationLookup:
+        """Return a callable that maps (service, query_id) to mean |ratio|.
+
+        The exporter's per-group snapshots carry the deviation points;
+        we collapse them across (model, level, series) per query id by
+        taking the mean of the absolute ratios. Non-finite ratios are
+        ignored (so a degenerate band doesn't poison the composite).
+        """
+        # Build the index eagerly so multiple lookups per call don't
+        # re-iterate the same snapshot. Keyed by query id only —
+        # ``service`` is ignored because the deviation labelset has no
+        # service label; routing happens at the spec level (via
+        # ``signals_by_service``) instead.
+        by_query: dict[str, list[float]] = {}
+        for group_name in (g.name for g in self._config.groups):
+            snap = self._exporter.snapshot_for(group_name)
+            if snap is None:
+                continue
+            for dp in snap.deviation_points:
+                qid = dp.labels.get("id", "")
+                if not qid or not math.isfinite(dp.ratio):
+                    continue
+                by_query.setdefault(qid, []).append(abs(dp.ratio))
+
+        def lookup(service: str, query_id: str) -> float:
+            samples = by_query.get(query_id)
+            if not samples:
+                return float("nan")
+            return sum(samples) / len(samples)
+
+        return lookup
+
     async def _run_query(
         self,
         query: QueryConfig,
@@ -708,6 +1078,15 @@ class Runner:
         # for a failing query and dashboards would see a stale value
         # inherited from a prior successful run.
         ctx.series_count_per_query.setdefault(query.id, 0)
+        # Event-profile queries take a separate code path: no forecast
+        # curve, no per-step model fit. Instead the runner reads the
+        # configured counter, derives per-(day_of_week, hour_of_day)
+        # arrival intensities, and emits a heatmap-shaped
+        # ``forecast_incident_recurrence_score`` family. The query never
+        # touches statsforecast.
+        if query.data_profile == "events":
+            await self._run_event_pattern_query(query, group, ctx, qlog)
+            return
         frames = await self._discover_and_fetch(query, group, ctx, qlog)
         if frames is None:
             return
@@ -1208,6 +1587,94 @@ class Runner:
             horizon=horizon,
         )
         return True
+
+    async def _run_event_pattern_query(
+        self,
+        query: QueryConfig,
+        group: GroupConfig,
+        ctx: _RunContext,
+        qlog: structlog.stdlib.BoundLogger,
+    ) -> None:
+        """Run the recurring-incident-pattern path for a ``data_profile: events`` query.
+
+        Fetches the configured counter over the standard lookback,
+        sums the per-step deltas across any returned series (when the
+        query fans out across labels), buckets the events by
+        (day_of_week, hour_of_day), and publishes the resulting 7x24
+        grid to the exporter as ``forecast_incident_recurrence_score``.
+
+        Failures isolate per-query — a query that fails here doesn't
+        affect the rest of the group; ``forecast_failures_total{reason="query_error"}``
+        is bumped instead.
+
+        No backtest, no model fit, no per-step forecast curve — the
+        event path is entirely separate from the continuous-forecast
+        pipeline. The query never lands rows in the ``points``,
+        ``deviation_points``, etc. accumulators on the context.
+        """
+        eff_step = effective_step(query, self._config.defaults)
+        step_seconds = max(1, int(eff_step.total_seconds()))
+        end = datetime.now(tz=UTC)
+        start = end - self._config.defaults.lookback
+        try:
+            frames = await self._source.query_range(query.promql, start, end, step_seconds)
+        except Exception:
+            qlog.exception("event_query_failed")
+            ctx.failures["query_error"] = ctx.failures.get("query_error", 0) + 1
+            return
+        if not frames:
+            qlog.info("event_query_returned_no_series")
+            self._exporter.replace_incident_recurrence_for_query(
+                group=group.name, query=query.id, points=[]
+            )
+            return
+        # Sum across every returned series: incident counters are
+        # often fanned out per (severity, team, service) and the
+        # operator wants the aggregate heatmap, not per-series ones.
+        # Per-series heatmaps via a label passthrough are a
+        # documented follow-up; today the shipped shape is
+        # aggregate-only.
+        timestamps, values = _sum_counter_series(frames)
+        buckets = incident_pattern_mod.compute_recurrence(timestamps=timestamps, values=values)
+        # Label set mirrors the other forecast families: ``id`` is the
+        # query id (matching every other ``<id>_forecast*`` family in
+        # this repo and the sibling promanomaly project so dashboards
+        # can ``and on (id, group)`` across both), ``group`` the group
+        # name. Bucket coordinates ride on (day_of_week, hour_of_day).
+        points = [
+            IncidentRecurrencePoint(
+                labels={
+                    "group": group.name,
+                    "id": query.id,
+                    "day_of_week": str(bucket.day_of_week),
+                    "hour_of_day": str(bucket.hour_of_day),
+                },
+                score=bucket.score,
+            )
+            for bucket in buckets
+        ]
+        self._exporter.replace_incident_recurrence_for_query(
+            group=group.name, query=query.id, points=points
+        )
+        # Charge the 168 emitted heatmap rows against the global
+        # series budget so an operator with many event queries can't
+        # silently blow ``safety.max_total_series``. The series-count
+        # gauges report the source-side count (1 — the aggregate),
+        # so we keep the gauge value at 1 and apply the multiplier
+        # only to the budget. See validate.py for the matching
+        # cardinality-estimator multiplier.
+        budget_charge = _INCIDENT_RECURRENCE_ROWS
+        ctx.series_count += 1
+        ctx.series_count_per_query[query.id] = 1
+        if ctx.global_remaining > 0:
+            ctx.global_remaining = max(0, ctx.global_remaining - budget_charge)
+        qlog.info(
+            "event_pattern_emitted",
+            buckets=len(points),
+            non_zero=sum(1 for p in points if p.score > 0),
+            frames=len(frames),
+            budget_charged=budget_charge,
+        )
 
     async def _discover_and_fetch(
         self,
@@ -2027,8 +2494,8 @@ class Runner:
         through ``result.conditional_calibration_offsets``). When
         absent (calibration off, fit failed, holdout too small), the
         runner falls back to ``offsets_by_model`` — the inherited
-        unconditional offsets that pre-v1.6.5 builds always used. The
-        fallback path is no worse than the prior behaviour but
+        unconditional offsets used before fresh per-fit calibration
+        was added. The fallback path is no worse than that behaviour but
         ``forecast_conditional_calibration_failures_total`` ticks so an
         operator can see when fresh calibration silently isn't running.
 
@@ -2133,8 +2600,8 @@ class Runner:
             # Prefer the fresh per-fit conditional offsets when the
             # dedicated calibration pass produced them; otherwise fall
             # back to the inherited unconditional offsets so the band
-            # is no worse off than the pre-v1.6.5 behaviour. When fresh
-            # offsets were computed, emit a
+            # is no worse off than the pre-fresh-calibration behaviour.
+            # When fresh offsets were computed, emit a
             # ``forecast_conditional_band_calibration_offset`` row per
             # (model, level) so the per-(model, level) widening
             # applied to the conditional band specifically is visible
@@ -2840,7 +3307,7 @@ class Runner:
         bounded ``reason``. The caller falls back to
         ``unconditional_offsets_by_model`` for any model missing from
         the returned dict, so the fallback path is no worse than the
-        pre-v1.6.5 behaviour.
+        pre-fresh-calibration behaviour.
 
         Short-circuits to the empty dict (and bumps no failure counter)
         when none of the emitted models actually consumes regressors —

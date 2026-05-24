@@ -206,7 +206,7 @@ def test_cardinality_estimate_counts_conditional_calibration_when_conformal_on()
     ``forecast_conditional_band_calibration_offset`` row when both
     ``accuracy.conformal.enabled`` and ``emission.conditional`` are
     true; ``promforecast validate`` must account for it or the
-    estimate under-reports the post-v1.6.5 footprint.
+    estimate under-reports the fresh-calibration footprint.
     """
     from datetime import timedelta  # noqa: PLC0415
 
@@ -272,8 +272,8 @@ def test_cardinality_estimate_counts_conditional_calibration_when_conformal_on()
     on = _estimate_cardinality(_build(conformal_enabled=True))
     # With conformal on, the unconditional calibration gauge appears
     # for every emitted (series, model, level) too — that's the
-    # pre-v1.6.5 line — *and* the conditional family picks up the
-    # matching new gauge.
+    # pre-fresh-calibration line — *and* the conditional family picks
+    # up the matching new gauge.
     assert on.calibration_lines == series_cap * models * levels  # unconditional
     assert on.conditional_lines == snapshot_rows + deviation_rows + calibration_rows
     # Delta between off and on for the conditional family is exactly

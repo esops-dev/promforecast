@@ -1,0 +1,53 @@
+{{- if .Values.rbac.create }}
+# Two bindings ship by default; nothing else. The kube-controller-manager
+# (which runs the HPA control loop) already holds permission on the
+# metrics aggregate APIs via the cluster's built-in
+# ``system:kube-controller-manager`` ClusterRole, and the API aggregator
+# forwards its identity through to this adapter after the
+# ``system:auth-delegator`` handshake below, so no extra ``metrics-reader``
+# ClusterRole / binding is needed for HPA to function. Workloads outside
+# the controller manager that need direct access to
+# ``external.metrics.k8s.io`` / ``custom.metrics.k8s.io`` (custom
+# controllers, Argo Rollouts AnalysisRuns) should bind their own
+# ServiceAccount to a ClusterRole they manage — keeping that policy
+# choice in the operator's hands rather than burying a non-obvious
+# default in this chart.
+#
+# The adapter is fronted by the Kubernetes API aggregator, which
+# forwards already-authenticated requests through. To validate the
+# forwarded tokens we bind the standard ``system:auth-delegator``
+# ClusterRole — the convention every custom-metrics adapter follows.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "promforecast-metrics-adapter.fullname" . }}-auth-delegator
+  labels:
+    {{- include "promforecast-metrics-adapter.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:auth-delegator
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "promforecast-metrics-adapter.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+---
+# RoleBinding to extension-apiserver-authentication-reader so the
+# adapter can read the front-proxy CA from kube-system — required
+# for validating the aggregator's request signatures.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "promforecast-metrics-adapter.fullname" . }}-auth-reader
+  namespace: kube-system
+  labels:
+    {{- include "promforecast-metrics-adapter.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: extension-apiserver-authentication-reader
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "promforecast-metrics-adapter.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}
