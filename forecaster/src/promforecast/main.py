@@ -14,15 +14,17 @@ from pathlib import Path
 
 import structlog
 import uvicorn
-from fastapi import FastAPI, Response
+from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse, PlainTextResponse
 
+from . import adapter as adapter_module
 from . import config as config_module
 from . import diagnose as diagnose_module
 from . import ha_cache as ha_cache_module
 from . import preview as preview_module
 from . import telemetry as telemetry_module
 from . import validate as validate_module
+from . import what_if as what_if_module
 from .cache import MemoryQueryCache, QueryCache, QueryCacheBackend, RedisQueryCache
 from .exporter import Exporter
 from .leader import KubernetesLeaseClient, LeaderElector, LeaderElectorConfig, default_identity
@@ -54,6 +56,14 @@ def cli() -> None:
             strict_cardinality=args.strict_cardinality,
         )
         sys.exit(rc)
+
+    if args.command == "adapter":
+        adapter_module.run(
+            config_path=args.config,
+            tls_cert=args.tls_cert,
+            tls_key=args.tls_key,
+        )
+        return
 
     if args.command == "diagnose":
         if args.diagnose_command == "duplicates":
@@ -155,6 +165,41 @@ def _build_parser() -> argparse.ArgumentParser:
             "Use in CI to reject configs whose opt-in emission would blow "
             "the global series cap. See docs/operations/cardinality.md."
         ),
+    )
+
+    adapter_p = sub.add_parser(
+        "adapter",
+        help=(
+            "Run the Kubernetes custom-metrics adapter. Implements the "
+            "external.metrics.k8s.io/v1beta1 and custom.metrics.k8s.io/v1beta1 "
+            "APIs so HPAs can scale on forecast metrics. Fronted by the K8s API "
+            "aggregator via an APIService (the chart ships the manifests)."
+        ),
+    )
+    adapter_p.add_argument(
+        "--config",
+        type=Path,
+        required=True,
+        help=(
+            "Path to the adapter YAML config (mounted from a ConfigMap in the "
+            "standard install). See docs/predictive-autoscaling.md for the schema."
+        ),
+    )
+    adapter_p.add_argument(
+        "--tls-cert",
+        type=Path,
+        default=None,
+        help=(
+            "Path to the TLS cert the adapter serves under. Required by the "
+            "K8s API aggregator. The chart generates a self-signed cert at "
+            "install time and mounts it into the pod."
+        ),
+    )
+    adapter_p.add_argument(
+        "--tls-key",
+        type=Path,
+        default=None,
+        help="Path to the private key for ``--tls-cert``.",
     )
 
     diagnose_p = sub.add_parser(
@@ -489,6 +534,7 @@ def run(config_path: Path, log_level: str) -> None:
         reload_enabled=cfg.server.reload.enabled,
         expose_config_endpoint=cfg.server.expose_config_endpoint,
         expose_preview_endpoint=cfg.server.expose_preview_endpoint,
+        expose_what_if_endpoint=cfg.server.expose_what_if_endpoint,
         source=source,
         snapshot_cache=snapshot_cache,
         elector=elector,
@@ -554,7 +600,7 @@ async def _lifespan_factory(
             tracer.shutdown()
 
 
-def _build_app(
+def _build_app(  # noqa: PLR0915
     exporter: Exporter,
     runner: Runner,
     reloader: ConfigReloader,
@@ -563,6 +609,7 @@ def _build_app(
     reload_enabled: bool,
     expose_config_endpoint: bool = False,
     expose_preview_endpoint: bool = False,
+    expose_what_if_endpoint: bool = False,
     source: PromSource | None = None,
     snapshot_cache: ha_cache_module.SnapshotCache | None = None,
     elector: LeaderElector | None = None,
@@ -664,7 +711,6 @@ def _build_app(
             reason="server.expose_preview_endpoint=true but no datasource was wired",
         )
     if expose_preview_endpoint and source is not None:
-        from fastapi import Request  # noqa: PLC0415
 
         @app.post("/forecast/preview")
         async def preview_endpoint(req: Request) -> Response:
@@ -701,6 +747,84 @@ def _build_app(
                     {"error": exc.reason, "message": str(exc)},
                     status_code=exc.status_code,
                 )
+            return JSONResponse(result)
+
+    if expose_what_if_endpoint and source is None:
+        logger.warning(
+            "what_if_endpoint_disabled_no_source",
+            reason="server.expose_what_if_endpoint=true but no datasource was wired",
+        )
+    if expose_what_if_endpoint and source is not None:
+        # The throttle lives on the runner so ``apply_config`` can
+        # hot-reload ``safety.fleet_what_if_min_interval`` without
+        # the operator needing a process restart. Reading via the
+        # runner attribute (rather than capturing a local) means
+        # the closure always sees the up-to-date throttle.
+
+        @app.post("/forecast/what-if/fleet")
+        async def what_if_endpoint(req: Request) -> Response:
+            """Run the fleet what-if and return a ranked JSON report.
+
+            Throttled by ``safety.fleet_what_if_min_interval`` so a tight
+            polling loop can't starve the scheduled fits. A throttle
+            denial returns ``429`` with the precise ``Retry-After``
+            seconds in the header so a polling client can back off
+            without guesswork. See ``docs/outputs/what-if-fleet.md``.
+            """
+            try:
+                payload = await req.json()
+            except Exception as exc:
+                exporter.increment_what_if_run("invalid_body")
+                return JSONResponse(
+                    {"error": "invalid_body", "message": f"bad JSON: {exc}"},
+                    status_code=400,
+                )
+            try:
+                request = what_if_module.parse_fleet_request(payload)
+            except what_if_module.WhatIfError as exc:
+                exporter.increment_what_if_run("invalid_body")
+                return JSONResponse(
+                    {"error": exc.reason, "message": str(exc)},
+                    status_code=exc.status_code,
+                )
+            try:
+                result = await what_if_module.run_fleet_what_if(
+                    config=runner._config,
+                    source=source,
+                    request=request,
+                    served_by=default_identity(),
+                    throttle=runner._what_if_throttle,
+                )
+            except what_if_module.WhatIfThrottledError as exc:
+                exporter.increment_what_if_run("throttled")
+                return JSONResponse(
+                    {
+                        "error": "throttled",
+                        "message": str(exc),
+                        "retry_after_seconds": exc.retry_after_seconds,
+                    },
+                    status_code=429,
+                    headers={"Retry-After": str(max(1, int(exc.retry_after_seconds)))},
+                )
+            except what_if_module.WhatIfError as exc:
+                exporter.increment_what_if_run("error")
+                return JSONResponse(
+                    {"error": exc.reason, "message": str(exc)},
+                    status_code=exc.status_code,
+                )
+            except Exception as exc:
+                # Any uncaught exception still increments the
+                # ``error`` outcome so the counter family's outcomes
+                # sum to the total invocation count; without this
+                # branch an unexpected raise bypasses the counter and
+                # dashboards under-report polling.
+                logger.exception("what_if_endpoint_unexpected")
+                exporter.increment_what_if_run("error")
+                return JSONResponse(
+                    {"error": "internal", "message": str(exc)},
+                    status_code=500,
+                )
+            exporter.increment_what_if_run("admitted")
             return JSONResponse(result)
 
     return app

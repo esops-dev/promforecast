@@ -272,6 +272,61 @@
             "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "blue" } }, { "id": "custom.lineWidth", "value": 0 } ] }
         ]
       }
+    },
+    {
+      "type": "table",
+      "id": 30,
+      "title": "Fleet capacity stress test — ranked by projected breach",
+      "description": "Ranks every threshold-bearing series by the projected time-to-threshold under *current* load. Pair with `POST /forecast/what-if/fleet` (opt-in via server.expose_what_if_endpoint) to compute the same ranking under a hypothetical traffic multiplier (`{\"traffic_multiplier\": 1.5, \"horizon\": \"90d\"}`) — the endpoint returns the same shape, but with the multiplier applied. The throttle is set by safety.fleet_what_if_min_interval (5m default).",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 9, "w": 24, "x": 0, "y": 27 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sort({__name__=~\".+_forecast_time_to_threshold_seconds\"})",
+          "format": "table",
+          "instant": true,
+          "legendFormat": "{{__name__}} {{name}}"
+        }
+      ],
+      "transformations": [
+        { "id": "organize",
+          "options": {
+            "excludeByName": { "Time": true, "job": true, "instance": true, "cluster": true, "replica": true },
+            "renameByName": {
+              "Value": "time_to_threshold_seconds",
+              "__name__": "metric",
+              "name": "threshold",
+              "group": "group",
+              "id": "query",
+              "model": "model",
+              "severity": "severity"
+            }
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": { "align": "left" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "yellow", "value": 3600 },
+              { "color": "green", "value": 86400 }
+            ]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "time_to_threshold_seconds" },
+            "properties": [
+              { "id": "unit", "value": "s" },
+              { "id": "custom.cellOptions", "value": { "type": "color-text" } }
+            ]
+          }
+        ]
+      }
     }
   ]
 }

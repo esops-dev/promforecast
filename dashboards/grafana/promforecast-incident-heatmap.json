@@ -1,0 +1,149 @@
+{
+  "title": "promforecast — Incident recurrence heatmap",
+  "uid": "promforecast-incident-heatmap",
+  "description": "Per-(day_of_week, hour_of_day) intensity of recurring incidents for queries opted into `data_profile: events`. Score normalised against the average non-empty bucket; values > 1.0 indicate above-average concentration in that bucket. Pair the heatmap with the interpretation guide in docs/outputs/incident-patterns.md — high score + low variance = preemptive action warranted; high score + high variance = pattern is trending up.",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "tags": ["promforecast", "incidents", "patterns"],
+  "timezone": "",
+  "time": { "from": "now-30d", "to": "now" },
+  "refresh": "1h",
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": { "text": "VictoriaMetrics", "value": "victoriametrics" }
+      },
+      {
+        "name": "group",
+        "label": "Group",
+        "type": "query",
+        "datasource": { "type": "prometheus", "uid": "${datasource}" },
+        "query": "label_values(forecast_incident_recurrence_score, group)",
+        "refresh": 2,
+        "includeAll": false,
+        "multi": false
+      },
+      {
+        "name": "query",
+        "label": "Query",
+        "type": "query",
+        "datasource": { "type": "prometheus", "uid": "${datasource}" },
+        "query": "label_values(forecast_incident_recurrence_score{group=\"$group\"}, id)",
+        "refresh": 2,
+        "includeAll": false,
+        "multi": false
+      }
+    ]
+  },
+  "panels": [
+    {
+      "type": "heatmap",
+      "id": 1,
+      "title": "Incident recurrence intensity — $query ($group)",
+      "description": "Each cell is one (day_of_week, hour_of_day) bucket. Score = bucket event count / mean non-empty bucket count. > 1.0 (warm colour) means this bucket sees more incidents than average. Read columns to find time-of-day patterns; read rows to find day-of-week patterns.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 14, "w": 24, "x": 0, "y": 0 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "forecast_incident_recurrence_score{group=\"$group\", id=\"$query\"}",
+          "instant": true,
+          "format": "heatmap"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "scaleDistribution": { "type": "linear" }
+          },
+          "color": { "mode": "continuous-RdYlGr" },
+          "min": 0,
+          "decimals": 2
+        },
+        "overrides": []
+      },
+      "options": {
+        "calculate": false,
+        "yAxis": { "axisLabel": "day_of_week (UTC; 0=Mon, 6=Sun)" },
+        "color": { "mode": "scheme", "scheme": "RdYlGn", "reverse": true, "steps": 64 },
+        "exemplars": { "color": "rgba(255,0,0,0.7)" },
+        "cellGap": 1,
+        "showValue": "never",
+        "tooltip": { "show": true, "yHistogram": false }
+      }
+    },
+    {
+      "type": "stat",
+      "id": 2,
+      "title": "Top bucket — $query",
+      "description": "The single most-concentrated (day_of_week, hour_of_day) bucket. Pair with the heatmap to focus on the highest-risk window.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 5, "w": 8, "x": 0, "y": 14 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "topk(1, forecast_incident_recurrence_score{group=\"$group\", id=\"$query\"})",
+          "instant": true,
+          "legendFormat": "Day {{day_of_week}} Hour {{hour_of_day}}"
+        }
+      ],
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "orientation": "horizontal",
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value_and_name"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "decimals": 2,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 1.0 },
+              { "color": "orange", "value": 2.0 },
+              { "color": "red", "value": 4.0 }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "stat",
+      "id": 3,
+      "title": "Active buckets",
+      "description": "How many of the 168 (day, hour) buckets had at least one observed incident. A small count means activity is concentrated (worth preemptive action); a large count means activity is diffuse.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 5, "w": 8, "x": 8, "y": 14 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "count(forecast_incident_recurrence_score{group=\"$group\", id=\"$query\"} > 0)",
+          "instant": true,
+          "legendFormat": "non-zero buckets"
+        }
+      ],
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "orientation": "horizontal",
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value_and_name"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0
+        },
+        "overrides": []
+      }
+    }
+  ]
+}

@@ -60,6 +60,15 @@ config:
     # exec`. The endpoint is unauthenticated like /metrics, so only
     # enable it when the metrics port is on a trusted network.
     expose_config_endpoint: false
+    # Off by default. Flip to true to expose `POST /forecast/what-if/fleet`
+    # which runs the preview machinery across every query whose
+    # `thresholds:` define a capacity ceiling and returns a ranked list
+    # of services projected to breach soonest under a hypothetical
+    # traffic multiplier. The endpoint is throttled by
+    # `safety.fleet_what_if_min_interval` so polling dashboards can't
+    # starve scheduled fits. Same network-level access-control model as
+    # /metrics and /-/reload.
+    expose_what_if_endpoint: false
 
   safety:
     max_series_per_query: 500
@@ -67,6 +76,13 @@ config:
     series_overflow: drop_lowest_priority
     fit_timeout: 60s
     query_timeout: 30s
+    # Minimum interval between successive fleet what-if runs. The
+    # endpoint refits every threshold-bearing query against the
+    # requested traffic multiplier; a single invocation is O(minutes)
+    # on a medium config so unthrottled access would starve scheduled
+    # fits. The default of 5m matches a typical `refresh_interval`.
+    # Has no effect unless `server.expose_what_if_endpoint` is true.
+    fleet_what_if_min_interval: 5m
 
   defaults:
     lookback: 14d

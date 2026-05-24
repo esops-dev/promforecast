@@ -61,8 +61,10 @@ chart-deps: ## Resolve umbrella subchart dependencies.
 chart-lint: chart-deps ## helm lint + kubeconform on rendered manifests.
 	helm lint $(CHART_DIR)/promforecast
 	helm lint $(CHART_DIR)/promforecast-stack
-	helm template $(CHART_DIR)/promforecast       | kubeconform -strict -summary -ignore-missing-schemas
-	helm template $(CHART_DIR)/promforecast-stack | kubeconform -strict -summary -ignore-missing-schemas
+	helm lint $(CHART_DIR)/promforecast-metrics-adapter
+	helm template $(CHART_DIR)/promforecast                   | kubeconform -strict -summary -ignore-missing-schemas
+	helm template $(CHART_DIR)/promforecast-stack             | kubeconform -strict -summary -ignore-missing-schemas
+	helm template $(CHART_DIR)/promforecast-metrics-adapter   | kubeconform -strict -summary -ignore-missing-schemas
 	helm template $(CHART_DIR)/promforecast-stack \
 	    --set dashboards.enabled=true \
 	    --set prometheusRules.enabled=true \

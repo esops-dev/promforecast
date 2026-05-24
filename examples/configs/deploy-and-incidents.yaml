@@ -1,0 +1,113 @@
+# Example forecaster config exercising the two predictive-ops emission
+# families:
+#
+# 1. ``deploy_signals:`` — per-service composite risk score anchored at
+#    each rollout. Pair with the ``DeployHighRisk`` / ``DeployCriticalRisk``
+#    example alerts in examples/alerts/promforecast-rules.yaml.
+#
+# 2. ``data_profile: events`` — incident-pattern detection. The runner
+#    routes the query to the 7×24 recurrence heatmap path instead of
+#    fitting a forecast curve. Pair with the
+#    ``promforecast-incident-heatmap`` Grafana dashboard.
+#
+# Both families are off unless explicitly configured. Adapt the metric
+# names and label selectors to your environment.
+
+apiVersion: promforecast.io/v1
+
+datasource:
+  url: http://victoriametrics:8428/
+
+# All queries below aggregate to ~1 series per service via ``sum by``.
+# Lower the per-query cap accordingly so ``promforecast validate``'s
+# cardinality estimate reflects reality rather than the worst case
+# ``safety.max_series_per_query`` default (500). Operators with
+# higher fan-out (per-pod / per-instance breakdowns) should raise this.
+safety:
+  max_series_per_query: 10
+
+defaults:
+  lookback: 14d
+  step: 5m
+  horizon: 6h
+  models: [AutoARIMA, SeasonalNaive]
+  season_length: 288
+  accuracy:
+    evaluate: false
+    auto_select: true
+    fallback_model: SeasonalNaive
+
+groups:
+  - name: deploy_safety
+    priority: 1
+    queries:
+      # Latency (p95). Used by the deploy-risk composite below.
+      - id: payments_p95_latency_seconds
+        promql: |
+          histogram_quantile(
+            0.95,
+            sum by (service, le) (rate(http_request_duration_seconds_bucket{service="payments"}[5m]))
+          )
+        regressors:
+          # The ``deploys`` regressor below is what the deploy-risk
+          # block anchors against. ``changes(...)`` ticks once per
+          # rollout that bumps the observed generation.
+          - id: deploys
+            promql: |
+              changes(kube_deployment_status_observed_generation{deployment="payments"}[5m])
+
+      # Error rate. Second contributor to the composite.
+      - id: payments_5xx_per_second
+        promql: |
+          sum by (service) (rate(http_requests_total{service="payments", status=~"5.."}[5m]))
+
+      # Saturation proxy (CPU). Third contributor.
+      - id: payments_cpu_seconds_rate
+        promql: |
+          sum by (service) (rate(container_cpu_usage_seconds_total{pod=~"payments-.*"}[5m]))
+
+  - name: incidents
+    priority: 2
+    queries:
+      # PagerDuty incidents bucketed into a 7×24 recurrence heatmap.
+      # Counter resets (target restart) are dropped to zero — see
+      # promforecast.incident_pattern.counter_to_event_counts.
+      - id: pagerduty_incidents_total
+        promql: pagerduty_incidents_total{service=~"payments|checkout|search"}
+        data_profile: events
+
+      # Alertmanager critical notifications, same treatment. Pairs
+      # well with the heatmap dashboard's ``query`` template selector.
+      - id: alertmanager_critical_notifications
+        promql: alertmanager_notifications_total{severity="critical"}
+        data_profile: events
+
+# ----------------------------------------------------------------------
+# Per-service deploy-anchored risk composite.
+#
+# Cardinality: ``max_active_deploys`` rows per service while at least
+# one deploy is inside its ``active_window``. Outside the window the
+# rows disappear from /metrics — the gauge is silent at steady state.
+#
+# Weights are conventionally latency >= traffic >= errors >= saturation
+# (latency moves first under a bad deploy); operators tune per service.
+# ----------------------------------------------------------------------
+deploy_signals:
+  - service: payments
+    anchor:
+      type: regressor
+      query: payments_p95_latency_seconds
+      regressor_id: deploys
+      threshold: 0
+    signals:
+      - query: payments_p95_latency_seconds
+        weight: 2.0
+      - query: payments_5xx_per_second
+        weight: 1.5
+      - query: payments_cpu_seconds_rate
+        weight: 1.0
+    # How long after a detected rollout the gauge stays live.
+    # 30 minutes is the conventional window for Argo Rollouts / Flagger
+    # analysis runs; tune to your rollout duration.
+    active_window: 30m
+    max_active_deploys: 4

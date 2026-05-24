@@ -1,0 +1,24 @@
+apiVersion: v2
+name: promforecast-metrics-adapter
+description: Kubernetes custom-metrics adapter that exposes promforecast forecast metrics for HorizontalPodAutoscaler.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+kubeVersion: ">=1.27.0-0"
+home: https://github.com/esops-dev/promforecast
+sources:
+  - https://github.com/esops-dev/promforecast
+keywords:
+  - prometheus
+  - forecasting
+  - kubernetes
+  - autoscaling
+  - hpa
+  - custom-metrics
+maintainers:
+  - name: esops-dev
+    url: https://github.com/esops-dev
+icon: https://raw.githubusercontent.com/esops-dev/promforecast/main/docs/assets/logo.png
+annotations:
+  artifacthub.io/license: Apache-2.0
+  artifacthub.io/category: monitoring

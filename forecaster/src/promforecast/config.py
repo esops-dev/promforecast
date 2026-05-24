@@ -144,6 +144,14 @@ class ServerConfig(BaseModel):
     # ``/-/reload``: rely on NetworkPolicy and service exposure. Off by
     # default; flip on to support what-if dashboards.
     expose_preview_endpoint: bool = False
+    # ``POST /forecast/what-if/fleet`` runs the preview machinery across
+    # every configured query whose ``thresholds:`` define a capacity
+    # ceiling and ranks the predicted-soonest breaches. CPU-heavy
+    # (O(minutes) rather than O(seconds) like the single-query preview)
+    # so it's separately opt-in and rate-limited by
+    # ``safety.fleet_what_if_min_interval``. Same network-level
+    # access-control model as ``/-/reload`` / ``/forecast/preview``.
+    expose_what_if_endpoint: bool = False
 
 
 class SafetyConfig(BaseModel):
@@ -172,6 +180,17 @@ class SafetyConfig(BaseModel):
     # forecaster doesn't open more parallel fits than it has TSDB read
     # slots.
     max_concurrent_fits: int = Field(default=8, ge=1)
+    # Minimum interval between successive fleet what-if runs. The
+    # multi-service stress test refits every configured query whose
+    # ``thresholds:`` define a capacity ceiling against a hypothetical
+    # traffic multiplier — a single invocation is O(minutes) on a
+    # medium-sized config, so unthrottled access could starve scheduled
+    # fits. The default of 5 minutes matches the typical scheduled
+    # ``refresh_interval`` so a what-if call can't push the snapshot off
+    # cadence. Setting this lower trades scheduling headroom for
+    # interactive dashboards; setting it higher is appropriate for
+    # forecasters that share an executor with high-cardinality groups.
+    fleet_what_if_min_interval: Duration = timedelta(minutes=5)
 
 
 class ConformalConfig(BaseModel):
@@ -689,12 +708,19 @@ class QueryConfig(BaseModel):
     * ``thresholds``: named ETA thresholds (see :class:`ThresholdConfig`).
     * ``emission``: per-query emission toggles (see :class:`QueryEmissionConfig`).
     * ``data_profile``: optional hint about the metric's shape
-      (``intermittent`` | ``count`` | ``continuous``). The selector
+      (``intermittent`` | ``count`` | ``continuous`` | ``events``). The selector
       uses MASE-based ranking for ``intermittent`` series so auto-select
       can prefer the dedicated intermittent-demand methods; ``count``
       flips the emission safeguards (``clip_non_negative``,
       ``round_to_integer``) to default-on when the operator hasn't
-      explicitly chosen.
+      explicitly chosen. ``events`` routes the query to the
+      incident-pattern detection path (see
+      :mod:`promforecast.incident_pattern`) rather than the
+      continuous-forecast path — the query's PromQL is expected to
+      return a counter that ticks on each discrete event (e.g.
+      ``pagerduty_incidents_total``) and the forecaster emits a
+      ``forecast_incident_recurrence_score`` heatmap per
+      (day_of_week, hour_of_day) bucket instead of a forecast curve.
     * ``cold_start``: opt-in cold-start sibling borrowing (see
       :class:`ColdStartConfig`).
     """
@@ -709,7 +735,7 @@ class QueryConfig(BaseModel):
     discover: list[DiscoveryVariable] = Field(default_factory=list)
     thresholds: list[ThresholdConfig] = Field(default_factory=list)
     emission: QueryEmissionConfig = Field(default_factory=QueryEmissionConfig)
-    data_profile: Literal["intermittent", "count", "continuous"] | None = None
+    data_profile: Literal["intermittent", "count", "continuous", "events"] | None = None
     cold_start: ColdStartConfig = Field(default_factory=ColdStartConfig)
     # Per-query SLO error-budget forecasting. ``None`` (default) skips
     # the family entirely; set the block to opt in. See :class:`SLOConfig`.
@@ -1064,6 +1090,74 @@ class QueryCacheConfig(BaseModel):
     redis_password: str = ""
 
 
+class DeployAnchorConfig(BaseModel):
+    """Where to look for "a deploy just happened" events.
+
+    Only ``regressor`` is accepted today: the runner inspects the
+    named regressor on the named query and registers a deploy whenever
+    the regressor's most recent value transitions from <= ``threshold``
+    to > ``threshold``. Pair this with a counter regressor like
+    ``changes(kube_deployment_status_observed_generation[1h])`` or a
+    hand-emitted ``deploys_total`` from a CI pipeline.
+
+    Change-point detection as an anchor source (using the existing
+    detector against the metric itself rather than an explicit
+    regressor) is tracked as a follow-up — until that lands the
+    schema rejects it at parse time so a config can't pass
+    ``helm install`` and then fail the forecaster on boot.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["regressor"] = "regressor"
+    query: str
+    regressor_id: str | None = None
+    # The regressor value must be *strictly greater than* this to
+    # trigger a deploy; the previous row must have been *<=*. The
+    # default of 0 matches the typical "counter ticks above zero"
+    # convention; non-zero thresholds are useful when the regressor
+    # itself is noisy (e.g. ``rate(...)`` over a wide window).
+    threshold: float = 0.0
+
+
+class DeploySignalConfig(BaseModel):
+    """One of the golden signals contributing to a deploy's risk score."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    query: str
+    # Weight applied to this signal's absolute deviation ratio before
+    # the weighted-mean composite. The conventional shape is
+    # latency >= traffic >= errors >= saturation; operators tune
+    # these to the service's specific failure modes.
+    weight: float = Field(default=1.0, gt=0.0)
+
+
+class DeploySignalsConfig(BaseModel):
+    """One service's deploy-risk composite definition.
+
+    Per service: an anchor (how deploys are detected), a list of
+    golden-signal queries with weights, the active window (how long
+    a deploy stays "fresh" for emission), and a bound on concurrent
+    active deploys.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    service: str
+    anchor: DeployAnchorConfig
+    signals: list[DeploySignalConfig]
+    # How long after detection the deploy is considered "active" and
+    # its risk score is emitted. After the window elapses the gauge
+    # disappears; operators read this as "rollout window closed,
+    # back to steady-state monitoring".
+    active_window: Duration = timedelta(minutes=30)
+    # Bound on simultaneously-active deploys per service. Prevents an
+    # abnormal deploy pipeline (a flapping Argo Rollouts loop) from
+    # blowing the per-(deployment_id, service) cardinality budget.
+    max_active_deploys: int = Field(default=8, ge=1)
+
+
 class Config(BaseModel):
     # ``populate_by_name=True`` lets in-Python construction use ``api_version``
     # while YAML keeps the Kubernetes-idiomatic ``apiVersion`` spelling.
@@ -1098,6 +1192,12 @@ class Config(BaseModel):
     query_cache: QueryCacheConfig = QueryCacheConfig()
     telemetry: TelemetryConfig = Field(default_factory=TelemetryConfig)
     groups: list[GroupConfig]
+    # Per-service deploy-anchored risk composites. Off by default
+    # (empty list); each entry binds an anchor (regressor with a
+    # "deploy happened" semantic) to a weighted set of golden-signal
+    # queries. The runner emits ``forecast_deploy_risk_score`` per
+    # active deploy. See :class:`DeploySignalsConfig`.
+    deploy_signals: list[DeploySignalsConfig] = Field(default_factory=list)
 
 
 def load(path: str | Path) -> Config:
@@ -1137,7 +1237,57 @@ def load(path: str | Path) -> Config:
             _validate_query_overrides(group_name=group.name, query=query)
             for reg in query.regressors:
                 _validate_regressor(group_name=group.name, query_id=query.id, reg=reg)
+    _validate_deploy_signals(config)
     return config
+
+
+def _validate_deploy_signals(config: Config) -> None:
+    """Cross-reference every ``deploy_signals`` entry against the live queries.
+
+    Each entry's ``anchor.query`` and every ``signals[].query`` must
+    resolve to a configured query id; an unknown id is a typo that
+    would otherwise silently emit a zero-row gauge forever. The
+    anchor regressor must exist on the referenced query. Unsupported
+    anchor ``type`` values fail at pydantic-parse time (see
+    :class:`DeployAnchorConfig`).
+    """
+    if not config.deploy_signals:
+        return
+    queries_by_id: dict[str, QueryConfig] = {q.id: q for g in config.groups for q in g.queries}
+    seen_services: set[str] = set()
+    for entry in config.deploy_signals:
+        label = f"deploy_signals[{entry.service}]"
+        if not entry.service:
+            raise ValueError(f"{label}: service must be non-empty")
+        if entry.service in seen_services:
+            raise ValueError(
+                f"deploy_signals: service {entry.service!r} appears twice; "
+                "each service must be defined exactly once"
+            )
+        seen_services.add(entry.service)
+        if not entry.signals:
+            raise ValueError(f"{label}.signals: must contain at least one signal")
+        anchor_query = queries_by_id.get(entry.anchor.query)
+        if anchor_query is None:
+            raise ValueError(
+                f"{label}.anchor.query={entry.anchor.query!r} does not "
+                "match any configured query id"
+            )
+        if entry.anchor.regressor_id is None:
+            raise ValueError(f"{label}.anchor.regressor_id is required when anchor.type=regressor")
+        anchor_reg_ids = {r.id for r in anchor_query.regressors}
+        if entry.anchor.regressor_id not in anchor_reg_ids:
+            raise ValueError(
+                f"{label}.anchor.regressor_id={entry.anchor.regressor_id!r} "
+                f"is not configured on query {entry.anchor.query!r} "
+                f"(configured regressors: {sorted(anchor_reg_ids) or 'none'})"
+            )
+        for signal in entry.signals:
+            if signal.query not in queries_by_id:
+                raise ValueError(
+                    f"{label}.signals: query {signal.query!r} does not "
+                    "match any configured query id"
+                )
 
 
 def _check_api_version(raw: dict[str, Any], *, source: str) -> dict[str, Any]:
@@ -1249,6 +1399,7 @@ def _validate_query_overrides(*, group_name: str, query: QueryConfig) -> None:  
                 "QueueNotDraining-style alert on forecast_time_to_drain_seconds instead."
             )
     _validate_cold_start(label=label, query=query)
+    _validate_events_profile(label=label, query=query)
     growth = query.emission.growth_rate
     if growth.enabled:
         if not growth.windows:
@@ -1355,6 +1506,52 @@ def _validate_cold_start(*, label: str, query: QueryConfig) -> None:
             "meaningful prior for intermittent series. Remove one of the "
             "two — the runner would otherwise silently fall through to "
             "the standard min_points drop on every refresh."
+        )
+
+
+def _validate_events_profile(*, label: str, query: QueryConfig) -> None:
+    """Reject query options that the ``data_profile: events`` path ignores.
+
+    Event queries take a separate runtime path that emits only the
+    incident-recurrence heatmap — no forecast curve, no model fit,
+    no per-step bands. The following config options would be
+    silently dropped on an events query, so we fail fast at load
+    time rather than letting an operator wonder why the configured
+    threshold never fires.
+
+    The rejected options share the trait that they all only make
+    sense for a continuous forecast: thresholds (need a forecast
+    curve to project against), regressors (no fit consumes them),
+    SLO blocks (need a rate forecast), recommended-windows (need a
+    horizon-spanning forecast), cold-start (event series don't fit
+    the sibling-borrowing shape), and the deviation / growth-rate /
+    conditional emission toggles.
+    """
+    if query.data_profile != "events":
+        return
+    rejected: list[str] = []
+    if query.thresholds:
+        rejected.append("thresholds")
+    if query.regressors:
+        rejected.append("regressors")
+    if query.slo is not None:
+        rejected.append("slo")
+    if query.recommended_windows.enabled:
+        rejected.append("recommended_windows")
+    if query.cold_start.borrow_from is not None:
+        rejected.append("cold_start.borrow_from")
+    if query.emission.conditional:
+        rejected.append("emission.conditional")
+    if query.emission.decompose:
+        rejected.append("emission.decompose")
+    if query.emission.growth_rate.enabled:
+        rejected.append("emission.growth_rate")
+    if rejected:
+        raise ValueError(
+            f"{label}: data_profile: events does not support "
+            f"{', '.join(rejected)}; the event-pattern path emits only the "
+            "incident-recurrence heatmap (no forecast curve, no model fit). "
+            "Remove the rejected options or change the data_profile."
         )
 
 

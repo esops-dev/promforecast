@@ -1,0 +1,146 @@
+# promforecast-metrics-adapter — Helm values.
+#
+# The adapter implements the Kubernetes custom-metrics API contracts
+# (external.metrics.k8s.io/v1beta1 and custom.metrics.k8s.io/v1beta1) so
+# HorizontalPodAutoscaler can scale on promforecast forecast metrics.
+# Forecasts are still produced by the main `promforecast` chart and
+# stored in VictoriaMetrics via the sink; this adapter is a thin
+# read-side translator between HPA and PromQL.
+
+image:
+  repository: ghcr.io/esops-dev/promforecast
+  # tag: ""               # Defaults to the chart's appVersion when empty.
+  pullPolicy: IfNotPresent
+
+# Single replica is the default. The adapter is stateless and a
+# restart is invisible to HPA (which retries on 503), so HA-style
+# multiple replicas are valid but rarely necessary. Use `replicaCount:
+# >1` only for shops with strict per-pod availability requirements.
+replicaCount: 1
+
+# Promforecast datasource URL the adapter reads from.
+#
+# IMPORTANT — OVERRIDE THIS unless you installed the umbrella chart
+# (``promforecast-stack``) into the ``monitoring`` namespace under the
+# release name ``promforecast-stack``. The default hardcodes both
+# pieces because Helm ``values.yaml`` cannot reference
+# ``.Release.Namespace``; if either differs in your install (a
+# ``monitoring-system`` namespace, a ``pf`` release name, an
+# externally-managed VictoriaMetrics) the adapter will resolve the
+# wrong service and every HPA poll returns 503.
+#
+# Conventional overrides:
+#   --set datasourceUrl=http://vm.observability.svc.cluster.local:8428
+#   --set datasourceUrl=http://victoria-metrics-cluster-vmselect.vm:8481/select/0/prometheus
+datasourceUrl: "http://promforecast-stack-victoria-metrics-single-server.monitoring.svc.cluster.local:8428"
+
+# Metric mappings — the meat of the chart. Each entry exposes one
+# forecast metric to HPA. Use the `external.metrics.k8s.io` API for
+# service-level forecasts (the common case); pair the configured
+# PromQL with `$namespace` / `$pod` placeholders if you want HPA's
+# namespace / labelSelector arguments to filter the query.
+#
+# Conventional pattern: define one external metric per service +
+# signal pair (e.g. payments-rps-forecast,
+# payments-p95-latency-forecast). HPA references the metric by name.
+metrics: []
+  # - externalMetricName: rps-forecast
+  #   promql: 'sum by (namespace)(http_requests_rate_forecast{namespace="$namespace"})'
+  #   namespaced: true
+
+# K8s API aggregator requires the adapter to serve TLS — the chart
+# generates a self-signed cert at install time and registers its CA
+# bundle with the APIService. cert-manager is not required.
+tls:
+  # When false the chart does not generate a cert; the operator
+  # provides one via the existingSecret reference instead. Useful
+  # in shops that already run cert-manager and want a managed cert.
+  generate: true
+  existingSecret: ""
+  # Validity of the self-signed cert in days. The chart re-generates
+  # the cert on each `helm upgrade` if `generate: true`, so a long
+  # validity is appropriate.
+  validityDays: 3650
+
+apiService:
+  # Whether to register an APIService for the external and custom
+  # metrics groups. Disable only if the cluster already has another
+  # metrics adapter registered (e.g. prometheus-adapter) and you're
+  # running this one alongside under a different group.
+  enabled: true
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    cpu: 500m
+    memory: 256Mi
+
+# Liveness / readiness probes against the adapter's /healthz
+# endpoint. Tight readiness keeps HPA from polling a not-yet-ready
+# replica during a rollout.
+probes:
+  readiness:
+    initialDelaySeconds: 5
+    periodSeconds: 10
+    timeoutSeconds: 3
+  liveness:
+    initialDelaySeconds: 30
+    periodSeconds: 30
+    timeoutSeconds: 5
+
+service:
+  type: ClusterIP
+  port: 443
+  # The adapter listens on 6443 by convention (custom-metrics
+  # adapters share that port across implementations). The chart's
+  # service maps 443 -> 6443 so APIService consumers reach a
+  # standard HTTPS port.
+  targetPort: 6443
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+# Pod security context. The adapter doesn't need anything special
+# — runs as a non-root user, no privileged operations.
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+
+# NetworkPolicy — by default we don't ship one because the adapter
+# needs the K8s API aggregator (kube-apiserver) to reach it on its
+# TLS port, and that traffic is from arbitrary cluster IPs depending
+# on how kube-apiserver is deployed. Operators who want a
+# NetworkPolicy should pin it to their cluster's apiserver pod
+# selector or CIDR.
+#
+# IMPORTANT — authentication model. The adapter trusts the K8s API
+# aggregator to authenticate clients before forwarding requests; it
+# does NOT independently verify the forwarded identity via
+# TokenReview / SubjectAccessReview. Direct connections to the
+# Service:port that bypass the aggregator (in-cluster `curl` from
+# another pod, `kubectl port-forward`, a misconfigured ingress) read
+# the configured metrics without authentication. In multi-tenant
+# clusters pair this chart with a NetworkPolicy that restricts
+# ingress to the kube-apiserver only (cluster-specific selector;
+# omitted from defaults because the right selector is per-cluster).
+
+# RBAC scope — needed to authenticate clients via TokenReview/
+# SubjectAccessReview when the API aggregator forwards an
+# authenticated request through to us. The chart binds the
+# system:auth-delegator ClusterRole (the standard custom-metrics
+# adapter requirement).
+rbac:
+  create: true
+
+nameOverride: ""
+fullnameOverride: ""
+
+nodeSelector: {}
+tolerations: []
+affinity: {}

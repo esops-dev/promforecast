@@ -86,6 +86,13 @@ class CardinalityEstimate:
     # Recommended maintenance window rows — bounded by ``count`` per
     # opted-in query.
     recommended_window_lines: int
+    # Deploy-anchored risk score rows. Per service, bounded by the
+    # configured ``max_active_deploys`` cap — a worst-case upper
+    # bound on simultaneously active deploys.
+    deploy_risk_lines: int
+    # Incident recurrence heatmap — fixed 7 (days) * 24 (hours) per
+    # opted-in query with ``data_profile: events``.
+    incident_recurrence_lines: int
     operational_lines: int
 
     @property
@@ -109,11 +116,13 @@ class CardinalityEstimate:
             + self.band_coverage_lines
             + self.slo_lines
             + self.recommended_window_lines
+            + self.deploy_risk_lines
+            + self.incident_recurrence_lines
             + self.operational_lines
         )
 
 
-def run_validate(
+def run_validate(  # noqa: PLR0915
     config_path: Path,
     *,
     dry_run: bool = False,
@@ -181,6 +190,8 @@ def run_validate(
     write(f"  band coverage      {estimate.band_coverage_lines:>8}")
     write(f"  slo lines          {estimate.slo_lines:>8}")
     write(f"  recommended wins   {estimate.recommended_window_lines:>8}")
+    write(f"  deploy risk lines  {estimate.deploy_risk_lines:>8}")
+    write(f"  incident recur     {estimate.incident_recurrence_lines:>8}")
     write(f"  operational lines  {estimate.operational_lines:>8}")
     write(f"  total              {estimate.total:>8}")
     rc = _handle_cardinality_overshoot(
@@ -465,6 +476,21 @@ def _estimate_cardinality(cfg: Config) -> CardinalityEstimate:  # noqa: PLR0912,
                 continue
             recommended_window_lines += series_cap * emitted_models * q.recommended_windows.count
 
+    # Deploy-anchored risk: one row per (service, active deploy)
+    # bounded by ``max_active_deploys``. The label set adds
+    # ``contributing_signals`` so each row is distinct even when two
+    # deploys collide on the same service.
+    deploy_risk_lines = sum(entry.max_active_deploys for entry in cfg.deploy_signals)
+
+    # Incident recurrence heatmap: 7 days * 24 hours per opted-in
+    # query (queries with ``data_profile: events``).
+    incident_recurrence_lines = 0
+    event_buckets = 7 * 24
+    for group in cfg.groups:
+        for q in group.queries:
+            if q.data_profile == "events":
+                incident_recurrence_lines += event_buckets
+
     # Operational: 7 gauges + N reasons per group; we ballpark 7 per group.
     # The runner also emits per-(group, query) rows of
     # ``forecast_query_run_duration_seconds`` and
@@ -496,6 +522,8 @@ def _estimate_cardinality(cfg: Config) -> CardinalityEstimate:  # noqa: PLR0912,
         band_coverage_lines=band_coverage_lines,
         slo_lines=slo_lines,
         recommended_window_lines=recommended_window_lines,
+        deploy_risk_lines=deploy_risk_lines,
+        incident_recurrence_lines=incident_recurrence_lines,
         operational_lines=operational_lines,
     )
 

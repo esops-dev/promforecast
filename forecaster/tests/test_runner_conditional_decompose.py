@@ -613,13 +613,13 @@ async def test_conditional_calibration_gauge_emits_when_both_features_on(
 ) -> None:
     """``forecast_conditional_band_calibration_offset`` must land for opted-in queries.
 
-    Pre-v1.6.5 the conditional band reused the unconditional offsets,
-    so there was no separate gauge to expose the per-(model, level)
-    widening the conditional band actually received. The v1.6.5 story
-    introduces the dedicated calibration pass; verify the gauge family
-    shows up on /metrics whenever both ``accuracy.conformal.enabled``
-    and ``emission.conditional`` are on for the query and at least one
-    emitted model is regressor-aware.
+    Before the dedicated calibration pass landed, the conditional band
+    reused the unconditional offsets, so there was no separate gauge to
+    expose the per-(model, level) widening the conditional band actually
+    received. The fresh calibration pass introduces that gauge; verify
+    the family shows up on /metrics whenever both
+    ``accuracy.conformal.enabled`` and ``emission.conditional`` are on
+    for the query and at least one emitted model is regressor-aware.
     """
     from promforecast import models as model_registry  # noqa: PLC0415
 
@@ -677,7 +677,7 @@ async def test_conditional_calibration_offsets_can_differ_from_unconditional(
 ) -> None:
     """The fresh conditional pass must produce its own offsets, not a copy of the unconditional.
 
-    The point of the v1.6.5 conditional-band calibration is that the
+    The point of the conditional-band calibration is that the
     holdout residuals are scored under flat-held regressors —
     matching the production-time conditional inference contract —
     rather than under the actual regressor trajectory the
@@ -763,10 +763,10 @@ async def test_conditional_calibration_offsets_can_differ_from_unconditional(
     # The fresh conditional pass must produce its own offsets — at
     # least one (model, level) pair must carry a value distinct from
     # the unconditional reading. Otherwise the new gauge family
-    # would just duplicate the unconditional one and the v1.6.5
-    # story's contract is silently broken. Compare per-(model, level)
-    # rather than across all rows so a coincidental match at one
-    # level doesn't mask a real divergence at another.
+    # would just duplicate the unconditional one and the
+    # fresh-calibration contract is silently broken. Compare
+    # per-(model, level) rather than across all rows so a coincidental
+    # match at one level doesn't mask a real divergence at another.
     def _key_and_value(line: str, marker: str) -> tuple[str, float]:
         """Strip the gauge name and metric value to leave just the labelset for keying."""
         head, _, _value_part = line.partition(" ")
@@ -1280,7 +1280,7 @@ async def test_conditional_calibration_offsets_inherit_on_skipped_query(
 ) -> None:
     """``forecast_conditional_band_calibration_offset`` rows must survive a partial tick.
 
-    The v1.6.5 story registers the conditional calibration offsets in
+    The conditional calibration offsets are registered in
     ``_INHERITANCE_REGISTRY`` so per-query refresh cadences don't drop
     them off /metrics when the opted-in query is skipped on a tick. The
     registry entry is easy to drop in a future refactor; this test pins

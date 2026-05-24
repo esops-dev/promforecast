@@ -1,0 +1,91 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "$id": "https://promforecast.io/schemas/metrics-adapter.values.v1.schema.json",
+  "title": "promforecast-metrics-adapter Helm values (v1)",
+  "description": "Schema for the Kubernetes custom-metrics adapter that exposes promforecast forecast metrics to HorizontalPodAutoscaler.",
+  "type": "object",
+  "additionalProperties": true,
+  "properties": {
+    "image": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "repository": { "type": "string", "minLength": 1 },
+        "tag": { "type": "string" },
+        "pullPolicy": {
+          "type": "string",
+          "enum": ["Always", "IfNotPresent", "Never"]
+        }
+      },
+      "required": ["repository"]
+    },
+    "replicaCount": { "type": "integer", "minimum": 1 },
+    "datasourceUrl": { "type": "string", "minLength": 1 },
+    "metrics": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "externalMetricName": {
+            "type": "string",
+            "pattern": "^[a-z0-9]([a-z0-9-]*[a-z0-9])?$"
+          },
+          "promql": { "type": "string", "minLength": 1 },
+          "namespaced": { "type": "boolean" }
+        },
+        "required": ["externalMetricName", "promql"]
+      }
+    },
+    "tls": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "generate": { "type": "boolean" },
+        "existingSecret": { "type": "string" },
+        "validityDays": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "apiService": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" }
+      }
+    },
+    "resources": { "type": "object" },
+    "probes": { "type": "object" },
+    "service": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": { "type": "string", "enum": ["ClusterIP", "NodePort", "LoadBalancer"] },
+        "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "targetPort": { "type": "integer", "minimum": 1, "maximum": 65535 }
+      }
+    },
+    "serviceAccount": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "create": { "type": "boolean" },
+        "name": { "type": "string" },
+        "annotations": { "type": "object" }
+      }
+    },
+    "securityContext": { "type": "object" },
+    "rbac": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "create": { "type": "boolean" }
+      }
+    },
+    "nameOverride": { "type": "string" },
+    "fullnameOverride": { "type": "string" },
+    "nodeSelector": { "type": "object" },
+    "tolerations": { "type": "array" },
+    "affinity": { "type": "object" }
+  },
+  "required": ["image", "datasourceUrl"]
+}

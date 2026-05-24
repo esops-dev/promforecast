@@ -521,9 +521,9 @@ class SeriesPointFactory:
         # Column-oriented iteration: ``iterrows`` materialises one Series
         # per row (~10x slower than indexing numpy arrays). For a typical
         # 288-step horizon with two confidence levels the helper yields
-        # ~1440 points per series-model; the conditional emission family
-        # added in v1.6.5 doubles that, so the per-step assembly cost is
-        # worth keeping out of Python's Series-construction path.
+        # ~1440 points per series-model, and the conditional emission
+        # family doubles that, so the per-step assembly cost is worth
+        # keeping out of Python's Series-construction path.
         ds_normalised = pd.to_datetime(forecast["ds"], errors="coerce")
         ds_ns = ds_normalised.astype("int64").to_numpy()
         # ``NaT`` becomes the int64 sentinel ``-9223372036854775808``; mask

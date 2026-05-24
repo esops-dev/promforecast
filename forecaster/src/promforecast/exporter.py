@@ -38,6 +38,7 @@ __all__ = [
     "ConditionalDeviationPoint",
     "ConditionalForecastPoint",
     "ContributionPoint",
+    "DeployRiskPoint",
     "DeviationPoint",
     "DriftPoint",
     "EnsembleWeightPoint",
@@ -46,6 +47,7 @@ __all__ = [
     "ForecastPoint",
     "GroupSnapshot",
     "GrowthRatePoint",
+    "IncidentRecurrencePoint",
     "InvalidMetricNameError",
     "PreprocessStats",
     "QualityPoint",
@@ -340,6 +342,42 @@ class ConditionalCalibrationOffsetPoint:
     offset: float
 
 
+@dataclass(frozen=True)
+class DeployRiskPoint:
+    """One ``forecast_deploy_risk_score`` sample.
+
+    Emitted per active deploy (per ``deploy_signals[].service``
+    entry, while the deploy is inside its ``active_window``). The
+    metric is a global gauge (no per-id prefix) — the
+    ``deployment_id`` and ``service`` labels are how dashboards and
+    alerts scope. ``contributing_signals`` is the count of golden
+    signals that produced a finite deviation this cycle; alerts
+    typically gate on ``contributing_signals >= 2`` to avoid firing
+    on a single-signal blip.
+    """
+
+    labels: dict[str, str]
+    score: float
+
+
+@dataclass(frozen=True)
+class IncidentRecurrencePoint:
+    """One ``forecast_incident_recurrence_score`` sample.
+
+    Emitted per (day_of_week, hour_of_day) bucket for queries that
+    opt into ``data_profile: events``. The score is a normalised
+    intensity in [0, 1] reflecting how concentrated incident
+    arrivals are in that bucket relative to the average bucket over
+    the lookback window. A high score with low variance means
+    "incidents reliably happen in this window"; a high score with
+    high variance means "the bucket is trending up". Dashboards
+    render the per-(day, hour) values as a 7 x 24 heatmap.
+    """
+
+    labels: dict[str, str]
+    score: float
+
+
 @dataclass
 class PreprocessStats:
     """Per-(group, query) preprocessing telemetry.
@@ -546,6 +584,19 @@ class Exporter:
         # Per-(group, query) expansion count (gauge): how many concrete
         # PromQL fetches the most recent run derived from this template.
         self._discovery_expansions: dict[tuple[str, str], int] = {}
+        # Per-outcome fleet what-if counter.
+        # ``outcome`` is one of {admitted, throttled, error, invalid_body}.
+        # Operators chart ``rate(forecast_what_if_runs_total{outcome="admitted"}[5m])``
+        # to see polling frequency and gate on ``... outcome="throttled"``
+        # to spot a dashboard configured to poll faster than the throttle
+        # allows. Always emitted (even at zero) so dashboards render a
+        # series from boot.
+        self._what_if_runs: dict[str, int] = {
+            "admitted": 0,
+            "throttled": 0,
+            "error": 0,
+            "invalid_body": 0,
+        }
         # Per-(group, query, model, reason) decomposition-skipped counter.
         # Bumped when ``emission.decompose: true`` is set on a query but
         # the chosen model does not decompose cleanly. The ``reason`` set
@@ -569,10 +620,11 @@ class Exporter:
         # Bumped whenever the fresh per-fit conformal calibration pass for
         # the conditional band fails (degenerate holdout, fit timeout, fit
         # error) and the runner falls back to the inherited unconditional
-        # offsets. The fallback path is no worse than the pre-v1.6.5
-        # behaviour, but operators want to know when fresh calibration
-        # *didn't* run — a sustained tick rate signals the conditional
-        # band is silently relying on inherited offsets.
+        # offsets. The fallback path is no worse than the
+        # pre-fresh-calibration behaviour, but operators want to know
+        # when fresh calibration *didn't* run — a sustained tick rate
+        # signals the conditional band is silently relying on
+        # inherited offsets.
         self._conditional_calibration_failures: dict[tuple[str, str, str], int] = {}
         # Per-(group, query, source) season_length auto-detection counter.
         # ``source`` is bounded to {detected, snapped, fallback, too_short}
@@ -580,6 +632,20 @@ class Exporter:
         # "the detector is always falling back on this query" without
         # scraping per-series logs.
         self._season_length_detections: dict[tuple[str, str, str], int] = {}
+        # Deploy-anchored composite risk scores. Keyed by
+        # ``(service, deployment_id)`` for fast replace-on-update; the
+        # value carries the score and the count of contributing signals.
+        # Snapshot-style: only active deploys appear; an expired
+        # deploy is removed via :meth:`replace_deploy_risk_scores`.
+        # State lives on the exporter (rather than per-group snapshot)
+        # because the ``deploy_signals`` block is config-top-level and
+        # references queries across groups.
+        self._deploy_risk_scores: dict[tuple[str, str], DeployRiskPoint] = {}
+        # Per-(group, query, day_of_week, hour_of_day) incident
+        # recurrence score. Snapshot-style: only the current refresh
+        # cycle's scores are emitted. Bounded cardinality:
+        # 7 days * 24 hours = 168 rows per opted-in (group, query).
+        self._incident_recurrence: dict[tuple[str, str, str, str], IncidentRecurrencePoint] = {}
         self._registry = CollectorRegistry()
         self._registry.register(_SnapshotCollector(self))
 
@@ -683,6 +749,20 @@ class Exporter:
         """Bump a query-cache counter for ``kind`` (hit | miss | error)."""
         with self._lock:
             self._query_cache_events[kind] = self._query_cache_events.get(kind, 0) + 1
+
+    def increment_what_if_run(self, outcome: str) -> None:
+        """Bump the fleet what-if outcome counter.
+
+        ``outcome`` is bounded to the four values seeded in
+        ``__init__`` (admitted | throttled | error | invalid_body).
+        Out-of-set values are collapsed to ``error`` so a future
+        code path that passes an unbounded string can't blow the
+        label cardinality of this counter.
+        """
+        if outcome not in self._what_if_runs:
+            outcome = "error"
+        with self._lock:
+            self._what_if_runs[outcome] = self._what_if_runs.get(outcome, 0) + 1
 
     def record_discovery(
         self,
@@ -831,6 +911,10 @@ class Exporter:
         with self._lock:
             return dict(self._query_cache_events)
 
+    def _what_if_runs_state(self) -> dict[str, int]:
+        with self._lock:
+            return dict(self._what_if_runs)
+
     def _discovery_state(
         self,
     ) -> tuple[dict[tuple[str, str], int], dict[tuple[str, str, str, str], int]]:
@@ -855,6 +939,88 @@ class Exporter:
         with self._lock:
             return dict(self._season_length_detections)
 
+    def replace_deploy_risk_scores(self, points: list[DeployRiskPoint]) -> None:
+        """Atomically replace the active-deploy gauge state.
+
+        Whole-state replacement (rather than per-point upsert) keeps
+        expiry trivial — an active deploy that was emitted last cycle
+        but is no longer in ``points`` simply disappears from /metrics
+        without a separate "drop" call. Each point's labels carry the
+        ``service`` and ``deployment_id`` discriminators.
+
+        Fast-path: when both the new ``points`` list and the current
+        state are empty the call is a no-op — the runner calls this on
+        every group fit even at steady state with no active deploys,
+        and taking the exporter lock for an empty replace contends
+        with the scrape path for nothing.
+        """
+        new_state: dict[tuple[str, str], DeployRiskPoint] = {}
+        for point in points:
+            service = point.labels.get("service", "")
+            deployment_id = point.labels.get("deployment_id", "")
+            new_state[(service, deployment_id)] = point
+        if not new_state and not self._deploy_risk_scores:
+            return
+        with self._lock:
+            self._deploy_risk_scores = new_state
+
+    def _deploy_risk_state(self) -> list[DeployRiskPoint]:
+        with self._lock:
+            return list(self._deploy_risk_scores.values())
+
+    def replace_incident_recurrence_for_query(
+        self,
+        *,
+        group: str,
+        query: str,
+        points: list[IncidentRecurrencePoint],
+    ) -> None:
+        """Replace the incident-recurrence heatmap for one (group, query).
+
+        Whole-(group, query) replacement so a query that's been
+        re-fit publishes its full 7x24 grid at once. Other queries'
+        rows are preserved — a multi-query event-pattern config
+        doesn't lose every query's heatmap when one query refreshes.
+        """
+        with self._lock:
+            self._incident_recurrence = {
+                key: point
+                for key, point in self._incident_recurrence.items()
+                if not (key[0] == group and key[1] == query)
+            }
+            for point in points:
+                day = point.labels.get("day_of_week", "")
+                hour = point.labels.get("hour_of_day", "")
+                self._incident_recurrence[(group, query, day, hour)] = point
+
+    def _incident_recurrence_state(self) -> list[IncidentRecurrencePoint]:
+        with self._lock:
+            return list(self._incident_recurrence.values())
+
+    def retain_incident_recurrence_groups(self, names: set[str]) -> None:
+        """Drop heatmap rows for groups removed by a reload."""
+        with self._lock:
+            self._incident_recurrence = {
+                key: point for key, point in self._incident_recurrence.items() if key[0] in names
+            }
+
+    def retain_incident_recurrence_queries(self, live_pairs: set[tuple[str, str]]) -> None:
+        """Drop heatmap rows for (group, query) pairs no longer in config.
+
+        Per-query cleanup so a reload that removes a ``data_profile:
+        events`` query from a *still-present* group also clears the
+        heatmap (the group-level
+        :meth:`retain_incident_recurrence_groups` only handles whole-
+        group removal). Without this the 168 stale rows would linger
+        on /metrics until process restart.
+        """
+        with self._lock:
+            self._incident_recurrence = {
+                key: point
+                for key, point in self._incident_recurrence.items()
+                if (key[0], key[1]) in live_pairs
+            }
+
 
 class _SnapshotCollector:
     """prometheus_client Collector that streams metrics from an Exporter snapshot."""
@@ -862,7 +1028,7 @@ class _SnapshotCollector:
     def __init__(self, exporter: Exporter) -> None:
         self._exporter = exporter
 
-    def collect(self) -> Iterator[GaugeMetricFamily | CounterMetricFamily]:
+    def collect(self) -> Iterator[GaugeMetricFamily | CounterMetricFamily]:  # noqa: PLR0915
         groups = self._exporter._snapshot()
         reload_state = self._exporter._reload_state()
         remote_write_state = self._exporter._remote_write_state()
@@ -871,6 +1037,7 @@ class _SnapshotCollector:
         config_hash = self._exporter._config_hash_state()
         leader_state = self._exporter._leader_state()
         cache_state = self._exporter._query_cache_state()
+        what_if_runs_state = self._exporter._what_if_runs_state()
         discovery_state = self._exporter._discovery_state()
         season_length_state = self._exporter._season_length_state()
         decomposition_skipped_state = self._exporter._decomposition_skipped_state()
@@ -878,6 +1045,8 @@ class _SnapshotCollector:
         conditional_calibration_failures_state = (
             self._exporter._conditional_calibration_failures_state()
         )
+        deploy_risk_state = self._exporter._deploy_risk_state()
+        incident_recurrence_state = self._exporter._incident_recurrence_state()
         yield from _forecast_families(groups)
         yield from _conditional_forecast_families(groups)
         yield from _conditional_deviation_families(groups)
@@ -911,10 +1080,13 @@ class _SnapshotCollector:
         yield from _source_retries_families(source_retries)
         yield from _leader_families(leader_state)
         yield from _query_cache_families(cache_state)
+        yield from _what_if_runs_families(what_if_runs_state)
         yield from _discovery_families(discovery_state)
         yield from _season_length_families(season_length_state)
         yield from _decomposition_skipped_families(decomposition_skipped_state)
         yield from _conditional_aliased_families(conditional_aliased_state)
+        yield from _deploy_risk_families(deploy_risk_state)
+        yield from _incident_recurrence_families(incident_recurrence_state)
 
 
 def _emit_gauge_family(
@@ -1674,6 +1846,28 @@ def _query_cache_families(
     yield counter
 
 
+def _what_if_runs_families(
+    state: dict[str, int],
+) -> Iterator[CounterMetricFamily]:
+    """Render the ``forecast_what_if_runs_total`` counter.
+
+    Bumped once per ``POST /forecast/what-if/fleet`` call, labelled by
+    ``outcome`` (admitted | throttled | error | invalid_body). Always
+    emitted with a zero baseline so dashboards can chart polling
+    frequency from process boot without waiting for the first call.
+    Operators alert on a sustained throttled rate to spot a
+    dashboard polling faster than ``safety.fleet_what_if_min_interval``.
+    """
+    counter = CounterMetricFamily(
+        "forecast_what_if_runs",
+        "POST /forecast/what-if/fleet call count, by outcome.",
+        labels=["outcome"],
+    )
+    for outcome in ("admitted", "throttled", "error", "invalid_body"):
+        counter.add_metric([outcome], float(state.get(outcome, 0)))
+    yield counter
+
+
 def _discovery_families(
     state: tuple[dict[tuple[str, str], int], dict[tuple[str, str, str, str], int]],
 ) -> Iterator[GaugeMetricFamily | CounterMetricFamily]:
@@ -1796,8 +1990,8 @@ def _conditional_calibration_failures_families(
         "forecast_conditional_calibration_failures",
         "Number of times the conditional-band conformal calibration fit "
         "could not produce fresh offsets and the runner fell back to the "
-        "inherited unconditional offsets. The fallback path is no worse "
-        "than the pre-v1.6.5 behaviour, but a sustained tick rate means "
+        "inherited unconditional offsets. The fallback path matches the "
+        "pre-fresh-calibration behaviour, but a sustained tick rate means "
         "fresh calibration is silently not running.",
         labels=["group", "query", "reason"],
     )
@@ -2041,3 +2235,47 @@ def _cold_start_siblings_families(
             have = True
     if have:
         yield family
+
+
+def _deploy_risk_families(
+    points: list[DeployRiskPoint],
+) -> Iterator[GaugeMetricFamily]:
+    """Render ``forecast_deploy_risk_score{deployment_id, service}``.
+
+    Emitted only while at least one deploy is inside its
+    ``active_window``; an empty list yields nothing so /metrics stays
+    quiet between rollouts. Each point also carries the
+    ``contributing_signals`` label so alerts can gate on a minimum
+    coverage (e.g. ``contributing_signals >= 2``) and avoid firing on
+    a single-signal blip.
+    """
+    yield from _emit_gauge_family(
+        points,
+        "forecast_deploy_risk_score",
+        "Weighted-mean composite of |forecast_deviation_ratio| across the "
+        "configured deploy_signals for the named service while a deploy is "
+        "inside its active_window. Higher = more risk.",
+        value_fn=lambda p: p.score,
+        skip_fn=lambda p: not math.isfinite(p.score),
+    )
+
+
+def _incident_recurrence_families(
+    points: list[IncidentRecurrencePoint],
+) -> Iterator[GaugeMetricFamily]:
+    """Render ``forecast_incident_recurrence_score{group, id, day_of_week, hour_of_day}``.
+
+    Emitted only for queries that opt into ``data_profile: events``.
+    The score is the per-bucket arrival rate normalised by the
+    average bucket rate over the lookback, so 1.0 means "average"
+    and values > 1 mean concentrated activity in that bucket.
+    """
+    yield from _emit_gauge_family(
+        points,
+        "forecast_incident_recurrence_score",
+        "Per-(day_of_week, hour_of_day) incident arrival intensity, "
+        "normalised to the lookback's average bucket rate. Values > 1 mean "
+        "the bucket sees more incidents than average.",
+        value_fn=lambda p: p.score,
+        skip_fn=lambda p: not math.isfinite(p.score),
+    )
