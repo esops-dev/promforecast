@@ -71,6 +71,15 @@ _EXCLUDED_FROM_INHERITANCE: dict[str, str] = {
         "BandCoveragePoint rows are rebuilt from the persistent "
         "BandCoverageTracker on every tick, not inherited."
     ),
+    # Config-derived: rebuilt every run from the current group config
+    # (via ``_build_threshold_action_cost_points``). Inheriting the prior
+    # snapshot would mean a threshold removed from YAML keeps emitting
+    # its cost row forever — the opposite of "tied to the threshold's
+    # lifecycle".
+    "threshold_action_cost_points": (
+        "ThresholdActionCostPoint rows are derived from live config "
+        "on every run; inheritance would defeat the lifecycle semantics."
+    ),
 }
 
 

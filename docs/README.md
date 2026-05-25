@@ -54,16 +54,39 @@ scheduling, and serving telemetry.
 - [Scheduling](operations/scheduling.md) — per-query refresh intervals, max-concurrent-fits cap
 - [High availability](operations/ha.md) — Lease-based leader election, Redis snapshot cache
 - [Query cache](operations/cache.md) — in-memory LRU + optional Redis dedup for overlapping PromQL
-- [Telemetry](operations/telemetry.md) — internal metrics catalogue + per-series staleness gauge
+- [Telemetry](operations/telemetry.md) — internal metrics catalogue + per-series staleness + self-observability (fit success ratio, regressor stability, per-group CPU/memory)
 - [Warm-up status](operations/warmup.md) — fresh-install "what is still loading?" endpoint and CLI
 - [Forecast inspector](operations/inspect.md) — debug a single weird forecast end-to-end, with optional per-fold backtest exposure
 - [Historical backfill](operations/backfill.md) — replay the fit pipeline at past timestamps so SLO dashboards are meaningful from day one
+- [Quality score](operations/quality-score.md) — composite reliability gauge, per-horizon segmentation, and which horizon to gate alerts on
+- [Forecast stability](operations/forecast-stability.md) — `forecast_revision_magnitude` and `forecast_model_disagreement` for catching a thrashing model or a configured model set that can't agree on the future
+- [Validate CLI](operations/validate.md) — `promforecast validate` modes: cardinality estimate, `--strict-cardinality` CI gate, `--estimate-cost` runtime budget, `--dry-run` sample fit
+- [Degraded-mode operations](operations/degraded-modes.md) — failure-mode matrix covering datasource read failure, sink write failure, partial group failure, sustained fit timeout, and stale snapshot
+- [Hyperparameter auto-tuning](operations/auto-tuning.md) — weekly recommendation CronJob that surfaces alternative `season_length` / model choices when the current config has drifted
+- [Right-sizing recommendations](operations/right-sizing.md) — per-workload limit/request recommendations from the forecast peak, gated by quality score, optional savings-pct sibling
+- [Drift change-correlation explainer](operations/drift-explained.md) — structured log + per-(group, query, primary_suspect) counter that turns a drift alert into "start your investigation on this regressor"
+
+## Governance
+
+Aggregations and reporting views over the forecaster's own output.
+
+- [Service-level health composite](governance/forecast-health.md) — per-(service, environment) aggregate of `forecast_quality_score` for executive dashboards
+
+## Cookbook
+
+Copy-pasteable recipes for the common Prometheus metric families.
+Each recipe ships a working YAML snippet, a recommended model + rationale,
+the cardinality footprint, and example alerts.
+
+- [Cookbook index](cookbook/README.md) — index of all recipes
 
 ## Guides
 
 Cross-cutting explanations that don't fit cleanly under one feature.
 
 - [Reading the numbers](guides/reading-the-numbers.md) — how to interpret quality and accuracy in practice (mean vs p95, horizon paradox, "wait three cycles", when to actually worry)
+- [Production-readiness checklist](production-checklist.md) — sizing table, three reference architectures, and the boxes worth ticking off before flipping production traffic to a new install
+- [Multi-cluster reference architectures](architecture/multi-cluster.md) — three patterns for deployments spanning multiple Kubernetes clusters, with sample chart values and cardinality / network trade-offs
 
 ## Contributing
 

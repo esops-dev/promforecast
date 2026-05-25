@@ -1,6 +1,13 @@
 # Default values for promforecast.
 # Single-replica by default. Multi-replica HA mode requires
 # `highAvailability.enabled: true` and a Redis backend.
+#
+# Before going live, walk the production-readiness checklist:
+# https://github.com/esops-dev/promforecast/blob/main/docs/production-checklist.md
+# — covers sizing tables, three reference architectures, and the
+# pre-flight items (sink + scrape-drop, alerts, dashboards, backfill,
+# cost estimate, quality-score gate on predictive autoscaling) that
+# turn a fresh install into a production-ready one.
 
 image:
   repository: ghcr.io/esops-dev/promforecast

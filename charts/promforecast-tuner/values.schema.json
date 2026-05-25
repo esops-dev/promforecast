@@ -1,0 +1,84 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/esops-dev/promforecast/charts/promforecast-tuner/v1",
+  "title": "promforecast-tuner Helm values",
+  "description": "Schema for the promforecast-tuner sub-chart values. Surfaces the knobs that drive the weekly hyperparameter-recommendation CronJob; the tuner reuses the live forecaster's container image so image / resource shapes mirror the main chart.",
+  "type": "object",
+  "additionalProperties": true,
+  "properties": {
+    "image": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "repository": { "type": "string", "minLength": 1 },
+        "tag": { "type": ["string", "null"] },
+        "pullPolicy": { "type": "string", "enum": ["Always", "IfNotPresent", "Never"] }
+      },
+      "required": ["repository"]
+    },
+    "enabled": { "type": "boolean" },
+    "schedule": {
+      "type": "string",
+      "description": "Cron expression for the CronJob. Defaults to weekly (Sunday 02:00 UTC)."
+    },
+    "configMap": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "key": { "type": "string", "minLength": 1 }
+      },
+      "required": ["name", "key"]
+    },
+    "sinkUrlOverride": { "type": "string" },
+    "minImprovementPct": { "type": "number", "minimum": 0 },
+    "lookback": {
+      "type": ["string", "null"],
+      "description": "Prometheus duration override for the lookback (e.g. ``14d``)."
+    },
+    "groups": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "resources": { "type": "object" },
+    "concurrencyPolicy": {
+      "type": "string",
+      "enum": ["Allow", "Forbid", "Replace"]
+    },
+    "startingDeadlineSeconds": { "type": "integer", "minimum": 0 },
+    "successfulJobsHistoryLimit": { "type": "integer", "minimum": 0 },
+    "failedJobsHistoryLimit": { "type": "integer", "minimum": 0 },
+    "activeDeadlineSeconds": { "type": "integer", "minimum": 1 },
+    "backoffLimit": { "type": "integer", "minimum": 0 },
+    "restartPolicy": {
+      "type": "string",
+      "enum": ["OnFailure", "Never"]
+    },
+    "serviceAccount": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "create": { "type": "boolean" },
+        "name": { "type": "string" },
+        "annotations": { "type": "object" }
+      },
+      "required": ["create"]
+    },
+    "securityContext": { "type": "object" },
+    "nameOverride": { "type": "string" },
+    "fullnameOverride": { "type": "string" },
+    "nodeSelector": { "type": "object" },
+    "tolerations": { "type": "array" },
+    "affinity": { "type": "object" },
+    "extraEnv": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "name": { "type": "string", "minLength": 1 }
+        },
+        "required": ["name"]
+      }
+    }
+  }
+}

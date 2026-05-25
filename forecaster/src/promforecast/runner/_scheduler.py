@@ -20,7 +20,7 @@ import time
 from collections.abc import Awaitable, Callable
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import structlog
 
@@ -34,12 +34,16 @@ from .. import deploy_risk as deploy_risk_mod
 from .. import deviation as deviation_mod
 from .. import discovery as discovery_mod
 from .. import drift as drift_mod
+from .. import drift_explainer as drift_explainer_mod
+from .. import health as health_mod
 from .. import incident_pattern as incident_pattern_mod
 from .. import maintenance as maintenance_mod
 from .. import models as model_registry
 from .. import preprocess as preprocess_mod
 from .. import quality as quality_mod
 from .. import regressors as regressors_mod
+from .. import revision as revision_mod
+from .. import right_sizing as right_sizing_mod
 from .. import seasonality as seasonality_mod
 from .. import slo as slo_mod
 from .. import telemetry as telemetry_mod
@@ -57,6 +61,7 @@ from ..config import (
     GroupConfig,
     ModelSpec,
     QueryConfig,
+    ResourceSizingWorkloadConfig,
     effective_emission_safeguards,
     effective_refresh_interval,
     effective_season_length,
@@ -71,8 +76,13 @@ from ..exporter import (
     GroupSnapshot,
     IncidentRecurrencePoint,
     InvalidMetricNameError,
+    ModelDisagreementPoint,
     PreprocessStats,
     QualityPoint,
+    ResourceSizingPoint,
+    RevisionPoint,
+    ServiceHealthScorePoint,
+    ThresholdActionCostPoint,
     validate_metric_name,
 )
 from ..point_factory import BacktestOutcome, SeriesPointFactory
@@ -81,9 +91,13 @@ from ..sink import ForecastCurvePoint, ForecastSink, SinkError
 from ..source import PromSource, SeriesFrame
 from ._budgets import _apply_canary, _apply_overflow, _compute_global_budgets
 from ._helpers import (
+    _coefficient_of_variation,
     _combine_ensemble,
+    _estimate_group_memory_bytes,
+    _extract_per_horizon_yhat,
     _format_band_window,
     _pandas_freq,
+    _query_id_from_metric,
     _resolve_spec,
     _run_backtest,
     _run_fit,
@@ -143,6 +157,11 @@ __all__ = [
 # path because event-query emission charges it against the global
 # series budget every refresh.
 _INCIDENT_RECURRENCE_ROWS = 7 * 24
+
+# Minimum number of distinct emitted models required to compute the
+# per-(series, horizon) model-disagreement coefficient of variation.
+# Below two there is no spread to measure; the gauge is suppressed.
+_MIN_MODELS_FOR_DISAGREEMENT = 2
 
 
 def _build_deploy_tracker(config: Config) -> deploy_risk_mod.DeployTracker:
@@ -238,6 +257,71 @@ def _aggregate_regressor_values(
     return means, timestamps
 
 
+def _trailing_regressor_values(regressors: Any | None) -> dict[str, float]:
+    """Extract the most recent finite value of each regressor column.
+
+    The drift explainer reads "what was loud at the drift moment" from
+    the latest row of the aligned regressor DataFrame. NaN-trailing
+    columns walk backwards to find the last finite reading so a
+    one-step gap at the end of the lookback (common after a deploy)
+    doesn't blank out the regressor's signal.
+
+    Returns an empty dict when no regressors are configured (the
+    common case) so the explainer falls back to ``"unknown"``
+    cleanly.
+    """
+    if regressors is None:
+        return {}
+    out: dict[str, float] = {}
+    # The frame is expected to be a pandas DataFrame whose columns are
+    # ``unique_id``, ``ds``, and one column per regressor id. Avoid
+    # importing pandas at module load — this helper is called only
+    # when the runner has already imported it via the fit pipeline.
+    for column in regressors.columns:
+        if column in ("unique_id", "ds"):
+            continue
+        series = regressors[column]
+        if series.empty:
+            continue
+        for value in reversed(list(series)):
+            try:
+                fv = float(value)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(fv):
+                out[str(column)] = fv
+                break
+    return out
+
+
+def _build_threshold_action_cost_points(group: GroupConfig) -> list[ThresholdActionCostPoint]:
+    """Project a group's configured thresholds onto action-cost points.
+
+    Pure projection from config — the points carry the operator's
+    declared cost as the sample value and one row per
+    (group, query, threshold) with ``action_cost`` configured.
+    Independent of fit results: a query whose fit failed (or was
+    skipped this tick) still publishes its action_cost rows so the
+    Grafana "rank by cost" panel doesn't go blank.
+    """
+    out: list[ThresholdActionCostPoint] = []
+    for query in group.queries:
+        annotations = capacity_mod.build_threshold_action_costs(query.thresholds)
+        for ann in annotations:
+            out.append(
+                ThresholdActionCostPoint(
+                    labels={
+                        "id": query.id,
+                        "group": group.name,
+                        "name": ann.name,
+                        "type": ann.cost_type,
+                    },
+                    value=ann.cost_value,
+                )
+            )
+    return out
+
+
 def _staleness_max_age_seconds(config: Config) -> float:
     """Threshold for the staleness sweep on ``apply_config``.
 
@@ -292,6 +376,19 @@ class Runner:
         # cache; they read the leader's rendered drift gauges via the
         # shared snapshot.
         self._drift_cache = drift_mod.DriftCache()
+        # Forecast-to-forecast revision cache: stores the previous
+        # central yhat value per (series, model, horizon) so the next
+        # fit can score how much that horizon's prediction moved. Same
+        # lifecycle as ``_drift_cache`` — pruned on every reload to
+        # stay bounded by the live config.
+        self._revision_cache = revision_mod.RevisionCache()
+        # Drift-explainer rolling windows. Keyed per
+        # ``(group, query, series_key, model)`` so the Pearson
+        # correlation between drift_score and each regressor value
+        # captures the genuine per-series behaviour rather than
+        # averaging across the query's whole fan-out. Pruned on
+        # reload alongside the drift cache.
+        self._drift_windows: dict[tuple[str, str, str, str], drift_explainer_mod.DriftWindow] = {}
         # Rolling band-coverage tracker: keeps a bounded ring of
         # (actual ∈ band) booleans per (series, level, window). Lives on
         # the Runner so the rolling state survives across runs without
@@ -446,6 +543,16 @@ class Runner:
             self._exporter.retain_discovery_groups(set(new_by_name))
             self._exporter.retain_incident_recurrence_groups(set(new_by_name))
             self._exporter.retain_staleness_groups(set(new_by_name))
+            self._exporter.retain_self_observability_groups(set(new_by_name))
+            # Drop fit-success-ratio buckets for models removed from
+            # ``defaults.models``; without this a dropped model's
+            # frozen-in-time ratio rows would linger on /metrics until
+            # process restart, and the ``ForecastModelFitFailing`` alert
+            # would either misfire on the stale numbers or have to be
+            # silenced manually.
+            self._exporter.retain_fit_outcome_models(
+                {spec.name for spec in new_config.defaults.models}
+            )
             # Per-query staleness cleanup: a reload that drops a single
             # query from a still-present group needs the per-(group, query)
             # entries pruned too, mirroring the incident-recurrence
@@ -456,6 +563,7 @@ class Runner:
                 (group.name, query.id) for group in new_config.groups for query in group.queries
             }
             self._exporter.retain_staleness_queries(live_query_pairs)
+            self._exporter.retain_regressor_stability_queries(live_query_pairs)
             # Per-query cleanup for the incident-recurrence heatmap:
             # the group-level retain above handles whole-group removal,
             # but a reload that drops a single ``data_profile: events``
@@ -478,7 +586,18 @@ class Runner:
             # reload that drops a query doesn't leak its state forever.
             live_pairs = {(g.name, q.id) for g in new_config.groups for q in g.queries}
             self._drift_cache.prune_to(live_pairs)
+            self._revision_cache.prune_to(live_pairs)
             self._band_coverage.forget(live_pairs)
+            # Drift-explainer windows are keyed per
+            # ``(group, query, series_key, model)`` — the live_pairs
+            # set is ``(group, query)``; we project the windows to
+            # those that survive the reload.
+            self._drift_windows = {
+                key: window
+                for key, window in self._drift_windows.items()
+                if (key[0], key[1]) in live_pairs
+            }
+            self._exporter.retain_drift_explained_queries(live_pairs)
             # Rebuild the deploy tracker against the new spec set. The
             # rebuild deliberately drops every in-flight active deploy —
             # a reload mid-rollout starts the next risk-score emission
@@ -499,6 +618,19 @@ class Runner:
             # call repopulates from the rebuilt tracker.
             self._deploy_tracker = _build_deploy_tracker(new_config)
             self._exporter.replace_deploy_risk_scores([])
+            # A reload that turns off ``governance.health_score`` must
+            # drop the prior aggregated rows immediately rather than
+            # waiting for the next group run to clear them. The
+            # opposite case (newly enabled) just lets the next group
+            # run repopulate via :meth:`_refresh_service_health_scores`.
+            if new_config.governance.health_score is None:
+                self._exporter.replace_service_health_scores([])
+            # Same treatment for right-sizing — a reload that disables
+            # the feature (or empties the workload list) must drop the
+            # prior recommendations.
+            new_rs = new_config.recommendations.resource_sizing
+            if not new_rs.enabled or not new_rs.workloads:
+                self._exporter.replace_resource_sizing_recommendations([])
             # Hot-reload the what-if throttle interval. The next-allowed
             # timestamp inside the throttle is preserved so a reload
             # can't be used to bypass an in-flight throttle window;
@@ -750,6 +882,20 @@ class Runner:
             )
             for cpkey, cpcount in ctx.change_points.items():
                 merged_changepoints[cpkey] = merged_changepoints.get(cpkey, 0) + cpcount
+            # Blacklist-window sample counter: monotonic merge keyed on
+            # (query, reason), pruned to live query IDs so a reload that
+            # drops a query also drops its row.
+            merged_blacklisted: dict[tuple[str, str], int] = (
+                {
+                    key: count
+                    for key, count in previous_snapshot.blacklisted_samples_cumulative.items()
+                    if key[0] in current_query_ids
+                }
+                if previous_snapshot is not None
+                else {}
+            )
+            for bkey, bcount in ctx.blacklisted_samples.items():
+                merged_blacklisted[bkey] = merged_blacklisted.get(bkey, 0) + bcount
             # Monotonic merge for the emission-clipped counter, pruned
             # to query IDs that still exist in the live group config so a
             # reload that drops a query doesn't leak its old label set
@@ -785,6 +931,13 @@ class Runner:
             # tracker on the runner — pull a snapshot now so the next
             # /metrics scrape sees the most recent rolling fractions.
             band_coverage_points = self._build_band_coverage_points(group, run_query_ids)
+            # Threshold action-cost is config-derived (not fit-derived),
+            # so rebuild the list directly from the current group config
+            # every run. A threshold removed from YAML disappears from
+            # /metrics on the next refresh; partial-tick refreshes still
+            # publish the full set because every configured query is
+            # walked here regardless of which subset actually ran.
+            threshold_action_cost_points = _build_threshold_action_cost_points(group)
             self._exporter.update(
                 GroupSnapshot(
                     group=group.name,
@@ -824,11 +977,15 @@ class Runner:
                     gaps_filled_cumulative=merged_gaps,
                     outliers_replaced_cumulative=merged_outliers,
                     change_points_cumulative=merged_changepoints,
+                    blacklisted_samples_cumulative=merged_blacklisted,
                     emission_clipped_cumulative=merged_emission_clipped,
                     cold_start_siblings=dict(ctx.cold_start_siblings),
                     drift_points=list(ctx.drift_points),
                     drift_alerts_cumulative=merged_drift_alerts,
                     band_coverage_points=band_coverage_points,
+                    revision_points=list(ctx.revision_points),
+                    model_disagreement_points=list(ctx.model_disagreement_points),
+                    threshold_action_cost_points=threshold_action_cost_points,
                 )
             )
             log.info(
@@ -845,6 +1002,27 @@ class Runner:
                 dropped=dict(ctx.dropped),
                 failures=dict(ctx.failures),
                 regressor_failures=len(ctx.regressor_failures),
+            )
+
+            # Self-observability: per-group resource attribution.
+            # CPU is the sum of per-(query, model) wall-clock seconds this
+            # run consumed on the shared executor — the runner's only
+            # honest CPU number without process-level instrumentation.
+            # **Crucially** we filter to queries that *ran this tick* — the
+            # inheritance pass populates ``ctx.fit_durations`` with prior
+            # values for skipped queries, and those durations already
+            # contributed to the counter in an earlier cycle. Without the
+            # filter, partial-tick refreshes would silently re-add the
+            # same seconds on every refresh. Memory is a best-effort
+            # snapshot footprint captured here — emitting it before the
+            # snapshot is updated would miss the current run's contribution.
+            cpu_this_run = sum(
+                seconds for (q_id, _), seconds in ctx.fit_durations.items() if q_id in run_query_ids
+            )
+            if cpu_this_run > 0:
+                self._exporter.add_group_cpu_seconds(group.name, cpu_this_run)
+            self._exporter.set_group_memory_bytes(
+                group.name, _estimate_group_memory_bytes(group.name, self._exporter)
             )
 
             # Publish the rendered snapshot to the shared HA cache if a
@@ -898,6 +1076,29 @@ class Runner:
                 await self._refresh_deploy_risk(group, run_query_ids)
             except Exception:
                 log.exception("deploy_risk_refresh_failed")
+
+            # Recompute the service-level health composite across all
+            # current group snapshots. Cheap (a single pass over the
+            # already-on-exporter quality_points) and idempotent — every
+            # group run rebuilds the full list rather than diff-merging.
+            # Best-effort: a defect in the aggregator logs but never
+            # crashes the run, matching the
+            # ``_refresh_resource_sizing_recommendations`` /
+            # ``_refresh_deploy_risk`` failure-isolation pattern.
+            try:
+                self._refresh_service_health_scores()
+            except Exception:
+                log.exception("service_health_refresh_failed")
+
+            # Refresh per-workload right-sizing recommendations.
+            # Best-effort: any current_promql fetch failure logs but
+            # never crashes the run. Idempotent — whole-state
+            # replacement on the exporter drops workloads whose
+            # forecast fell below the quality floor this refresh.
+            try:
+                await self._refresh_resource_sizing_recommendations()
+            except Exception:
+                log.exception("resource_sizing_refresh_failed")
 
             # Sweep aged staleness rows after each successful group run.
             # This is the only path that catches ephemeral-series leaks
@@ -1073,6 +1274,143 @@ class Runner:
         ]
         self._exporter.replace_deploy_risk_scores(points)
 
+    def _refresh_service_health_scores(self) -> None:
+        """Rebuild ``forecast_service_health_score`` from current snapshots.
+
+        Cheap: walks the per-group quality_points already on the
+        exporter and feeds them through
+        :func:`health.compute_service_health_scores`. The runner calls
+        this after every group run; whole-state replacement on the
+        exporter means buckets that disappear (e.g. the only series
+        whose label set matched the dim tuple dropped to NaN this
+        refresh) leave /metrics on the next scrape.
+
+        No-op when ``governance.health_score`` is unset, so deployments
+        that don't opt in pay zero cost.
+        """
+        cfg = self._config.governance.health_score
+        if cfg is None:
+            # Clear any prior state — a reload that turns the feature
+            # off must drop the old gauge rows.
+            self._exporter.replace_service_health_scores([])
+            return
+        quality_points: list[QualityPoint] = []
+        for group_name in (g.name for g in self._config.groups):
+            snap = self._exporter.snapshot_for(group_name)
+            if snap is None:
+                continue
+            quality_points.extend(snap.quality_points)
+        scores = health_mod.compute_service_health_scores(quality_points, cfg)
+        self._exporter.replace_service_health_scores(
+            [ServiceHealthScorePoint(labels=dict(s.labels), score=s.score) for s in scores]
+        )
+
+    async def _refresh_resource_sizing_recommendations(self) -> None:
+        """Recompute right-sizing recommendations from current snapshots.
+
+        Cheap per call: bounded by the operator-configured workload
+        count (typically a small number). For each workload:
+
+        1. Pull the forecast snapshot whose query id matches
+           ``forecast_query`` (walking every group's snapshot — the
+           workload doesn't bind to a specific group).
+        2. Optionally fetch ``current_promql`` via the source.
+        3. Delegate the math to
+           :func:`right_sizing.compute_recommendation` which handles
+           the quality gate.
+        4. Replace the exporter's full recommendation map.
+
+        Empty / disabled config short-circuits at the top — the
+        ``replace_resource_sizing_recommendations([])`` call there
+        clears any stale rows from a prior config that had this on.
+        """
+        cfg = self._config.recommendations.resource_sizing
+        if not cfg.enabled or not cfg.workloads:
+            self._exporter.replace_resource_sizing_recommendations([])
+            return
+        # Build a flat lookup of forecast / quality points keyed by
+        # query id so we don't re-walk every group per workload.
+        forecast_by_id: dict[str, list[ForecastPoint]] = {}
+        quality_by_id: dict[str, list[QualityPoint]] = {}
+        for group in self._config.groups:
+            snap = self._exporter.snapshot_for(group.name)
+            if snap is None:
+                continue
+            for point in snap.points:
+                qid = _query_id_from_metric(point.metric)
+                if qid:
+                    forecast_by_id.setdefault(qid, []).append(point)
+            for qp in snap.quality_points:
+                qid = qp.labels.get("id", "")
+                if qid:
+                    quality_by_id.setdefault(qid, []).append(qp)
+        out_points: list[ResourceSizingPoint] = []
+        for workload in cfg.workloads:
+            forecast_points = forecast_by_id.get(workload.forecast_query, [])
+            quality_points = quality_by_id.get(workload.forecast_query, [])
+            current_value = await self._fetch_current_for_workload(workload)
+            rec = right_sizing_mod.compute_recommendation(
+                workload=workload,
+                config=cfg,
+                forecast_points=forecast_points,
+                quality_points=quality_points,
+                current=current_value,
+            )
+            if rec is None:
+                continue
+            out_points.append(
+                ResourceSizingPoint(
+                    labels={
+                        "workload": rec.workload,
+                        "kind": rec.kind,
+                        "confidence": rec.confidence,
+                    },
+                    recommended=rec.recommended,
+                    current=rec.current,
+                    savings_pct=rec.savings_pct,
+                )
+            )
+        self._exporter.replace_resource_sizing_recommendations(out_points)
+
+    async def _fetch_current_for_workload(
+        self,
+        workload: ResourceSizingWorkloadConfig,
+    ) -> float | None:
+        """Resolve ``current_promql`` to a single float, or ``None`` on failure.
+
+        A workload without ``current_promql`` skips the fetch entirely.
+        On error (transport failure, malformed PromQL, no data) we
+        return ``None`` so the recommendation still emits without the
+        sibling ``current`` / ``savings_pct`` rows — better than
+        crashing the whole refresh on one workload's flaky query.
+
+        The lookback window is intentionally narrow: 10 minutes at
+        ``defaults.step`` gives us enough samples to pick the most
+        recent finite reading without dragging in stale data.
+        """
+        if workload.current_promql is None:
+            return None
+        end = datetime.now(tz=UTC)
+        step = self._config.defaults.step
+        start = end - timedelta(minutes=10)
+        step_seconds = max(1, int(step.total_seconds()))
+        try:
+            frames = await self._source.query_range(
+                workload.current_promql, start, end, step_seconds
+            )
+        except Exception:
+            logger.exception(
+                "resource_sizing_current_query_failed",
+                workload=workload.workload,
+                kind=workload.kind,
+            )
+            return None
+        for frame in frames:
+            for value in reversed(frame.values):
+                if math.isfinite(value):
+                    return float(value)
+        return None
+
     def _build_deviation_lookup(self) -> deploy_risk_mod.DeviationLookup:
         """Return a callable that maps (service, query_id) to mean |ratio|.
 
@@ -1207,6 +1545,25 @@ class Runner:
             rkey = (query.id, failure.regressor_id, failure.reason)
             ctx.regressor_failures[rkey] = ctx.regressor_failures.get(rkey, 0) + 1
 
+        # Self-observability: record the per-(group, query, regressor_id)
+        # stability score derived from the aggregated PromQL values. One
+        # pass per query (not per series) keeps the bookkeeping cheap;
+        # calendar regressors are deterministic functions of timestamps so
+        # they're skipped — a "stability" measurement on a deterministic
+        # series isn't meaningful.
+        if prefetch.aggregated:
+            for regressor_id, agg_df in prefetch.aggregated.items():
+                try:
+                    values = agg_df["v"].tolist()
+                except (KeyError, AttributeError):
+                    continue
+                self._exporter.record_regressor_stability(
+                    group=group.name,
+                    query=query.id,
+                    regressor_id=regressor_id,
+                    values=[float(v) for v in values],
+                )
+
         min_points = self._config.defaults.min_points
         eff_step = effective_step(query, self._config.defaults)
         # Cold-start sibling cache: fetched lazily on the first short
@@ -1237,6 +1594,13 @@ class Runner:
                 query_stats.max_gap_seconds = max(
                     query_stats.max_gap_seconds, cleaned.max_gap_seconds
                 )
+                # Blacklist samples may have driven the drop (the empty-
+                # series short-circuit when the entire window is
+                # blacklisted); preserve the per-reason counter so the
+                # operator can see *why* the series dropped.
+                for reason, count in cleaned.blacklisted_samples.items():
+                    bkey = (query.id, reason)
+                    ctx.blacklisted_samples[bkey] = ctx.blacklisted_samples.get(bkey, 0) + count
                 continue
             self._merge_preprocess_stats(
                 ctx=ctx,
@@ -1336,6 +1700,9 @@ class Runner:
         if cleaned.change_points:
             stats.change_points += cleaned.change_points
             ctx.change_points[query_id] = ctx.change_points.get(query_id, 0) + cleaned.change_points
+        for reason, count in cleaned.blacklisted_samples.items():
+            bkey = (query_id, reason)
+            ctx.blacklisted_samples[bkey] = ctx.blacklisted_samples.get(bkey, 0) + count
         if cleaned.effective_lookback_seconds > 0:
             stats.effective_lookback_seconds = cleaned.effective_lookback_seconds
 
@@ -1682,6 +2049,11 @@ class Runner:
                 "group": group.name,
                 "model": cold_start_mod.COLD_START_MODEL_NAME,
                 "cold_start": "true",
+                # Cold-start has no backtest, so we can't split the
+                # quality score by horizon — emit the aggregated row
+                # only (``horizon=""``) for label-shape consistency
+                # with the steady-state quality emission family.
+                "horizon": "",
             }
             quality_score = cold_start_mod.cold_start_quality_score(
                 sibling_count=outcome.sibling_count,
@@ -2138,6 +2510,20 @@ class Runner:
                 rounder=cond_rounder,
             )
 
+        # Forecast-to-forecast revision and model-disagreement gauges.
+        # Both need the per-emitted-model forecast frames + the accuracy
+        # horizons, so they ride next to ``capacity_inputs`` and must
+        # land before the next line clears that buffer.
+        self._record_revision_and_disagreement(
+            query=query,
+            group_name=group_name,
+            frame=frame,
+            inputs=list(result.capacity_inputs),
+            horizon_specs=accuracy_horizons,
+            auto_select=auto_select_enabled,
+            result=result,
+        )
+
         # Free the retained per-model dataframes — they can be MB-scale,
         # and ``_RunContext`` retains them across the per-series loop.
         result.capacity_inputs.clear()
@@ -2224,6 +2610,7 @@ class Runner:
                 curve_points=result.curve,
                 factory=factory,
                 result=result,
+                regressors=regressors_frame,
             )
 
         # Band coverage: record one (inside / outside) observation per
@@ -2255,6 +2642,7 @@ class Runner:
         curve_points: list[ForecastCurvePoint],
         factory: SeriesPointFactory,
         result: _FitResult,
+        regressors: Any | None = None,
     ) -> None:
         """Compute drift gauges for every emitted (series, model) pair.
 
@@ -2271,6 +2659,13 @@ class Runner:
         (no prior fit, or both curves all-NaN) skip the gauge — the
         exporter's render path filters non-finite samples and the
         alert counter only ticks on finite >= threshold values.
+
+        ``regressors`` (when provided) is the per-series regressor
+        DataFrame aligned to the fit window; the change-correlation
+        explainer reads each column's trailing finite value to
+        identify "what was loud at the drift moment" and to compute
+        the rolling Pearson correlation between drift_score and
+        regressor history.
         """
         drift_cfg = query.emission.drift
         yhat_metric = f"{query.id}_forecast"
@@ -2288,6 +2683,7 @@ class Runner:
             if not model_name:
                 continue
             curves_by_model.setdefault(model_name, []).append(point.value)
+        current_regressor_values = _trailing_regressor_values(regressors)
         for model_name, curve in curves_by_model.items():
             previous = self._drift_cache.get(
                 group=group_name,
@@ -2310,8 +2706,224 @@ class Runner:
             if math.isfinite(score):
                 labels = {**factory.drift_labels(model_name), "method": drift_cfg.method}
                 result.drift_points.append(DriftPoint(labels=labels, score=score))
+                # Push the (score, regressor_values) observation into
+                # the per-(series, model) rolling window every fit —
+                # not only on threshold crossings — so the
+                # correlation has enough history to be meaningful by
+                # the time drift fires.
+                window = self._drift_window_for(
+                    group_name=group_name,
+                    query_id=query.id,
+                    series_key=series_key,
+                    model_name=model_name,
+                    maxlen=drift_cfg.correlation_window,
+                )
+                window.record(score, current_regressor_values)
                 if drift_cfg.alert_threshold is not None and score >= drift_cfg.alert_threshold:
                     result.drift_alerts += 1
+                    self._emit_drift_explanation(
+                        group_name=group_name,
+                        query=query,
+                        series_key=series_key,
+                        model_name=model_name,
+                        score=score,
+                        threshold=drift_cfg.alert_threshold,
+                        window=window,
+                        current_regressor_values=current_regressor_values,
+                    )
+
+    def _drift_window_for(
+        self,
+        *,
+        group_name: str,
+        query_id: str,
+        series_key: str,
+        model_name: str,
+        maxlen: int,
+    ) -> drift_explainer_mod.DriftWindow:
+        """Lazily create the per-(series, model) rolling window."""
+        key = (group_name, query_id, series_key, model_name)
+        window = self._drift_windows.get(key)
+        if window is None or window.maxlen != maxlen:
+            # Resize on reload: a new ``correlation_window`` config
+            # value rebuilds the window so the bound takes effect on
+            # the next fit. Prior samples drop because the historical
+            # ones were collected under the old (possibly larger)
+            # window.
+            window = drift_explainer_mod.DriftWindow(maxlen=maxlen)
+            self._drift_windows[key] = window
+        return window
+
+    def _emit_drift_explanation(
+        self,
+        *,
+        group_name: str,
+        query: QueryConfig,
+        series_key: str,
+        model_name: str,
+        score: float,
+        threshold: float,
+        window: drift_explainer_mod.DriftWindow,
+        current_regressor_values: dict[str, float],
+    ) -> None:
+        """Log a ``forecast_drift_explained`` event and bump the counter.
+
+        Always emits the structured log line — even when no suspects
+        emerge (no regressors configured, or none correlating /
+        loud at the moment) — so "drift fired with no candidate
+        explanation" is itself a visible operator signal rather than
+        a silent gap.
+
+        Two contextual fields ride alongside the suspects so the
+        investigation hypothesis isn't limited to regressor changes:
+
+        * ``last_config_reload_timestamp`` — surfaces "did someone
+          just reload?" alongside the drift event. A recent reload
+          is often itself the explanation. ``None`` when no reload
+          has ever been recorded (cold-boot before the first apply).
+        * ``change_point_count`` — cumulative input-side change-points
+          detected for the (group, query). Lets an operator
+          correlate "input-side regime shift detected" with
+          "output-side drift fired" without scraping a second
+          dashboard.
+        """
+        explanation = drift_explainer_mod.explain(window, current_regressor_values)
+        reload_ts, _success, _failures = self._exporter._reload_state()
+        snap = self._exporter.snapshot_for(group_name)
+        change_point_count = (
+            snap.change_points_cumulative.get(query.id, 0) if snap is not None else 0
+        )
+        logger.info(
+            "forecast_drift_explained",
+            group=group_name,
+            query=query.id,
+            model=model_name,
+            series_key=series_key,
+            drift_score=round(score, 6),
+            drift_threshold=threshold,
+            primary_suspect=explanation.primary_suspect,
+            top_value_suspect=explanation.top_value_suspect,
+            top_correlation_suspect=explanation.top_correlation_suspect,
+            top_regressor_correlation=(
+                round(explanation.top_regressor_correlation, 6)
+                if math.isfinite(explanation.top_regressor_correlation)
+                else None
+            ),
+            top_regressor_correlation_confidence=(explanation.top_regressor_correlation_confidence),
+            correlation_window_size=explanation.correlation_window_size,
+            regressor_values_at_drift={
+                rid: round(v, 6) for rid, v in current_regressor_values.items()
+            },
+            last_config_reload_timestamp=reload_ts if reload_ts > 0 else None,
+            change_point_count=change_point_count,
+        )
+        self._exporter.increment_drift_explained(
+            group=group_name,
+            query=query.id,
+            primary_suspect=explanation.primary_suspect,
+        )
+
+    def _record_revision_and_disagreement(
+        self,
+        *,
+        query: QueryConfig,
+        group_name: str,
+        frame: SeriesFrame,
+        inputs: list[_CapacityInput],
+        horizon_specs: list[HorizonSpec],
+        auto_select: bool,
+        result: _FitResult,
+    ) -> None:
+        """Emit ``forecast_revision_magnitude`` + ``forecast_model_disagreement``.
+
+        Revision: per-(series, model, horizon) — relative shift from the
+        previous fit's central forecast at the same horizon. Always
+        emitted when at least one model produced a forecast for an
+        accuracy horizon; the first fit per (series, model, horizon)
+        records ``NaN`` (filtered at render time) and seeds the cache.
+
+        Disagreement: per-(series, horizon) — coefficient of variation
+        across emitted models' central forecasts at the same horizon.
+        Only emitted in explicit mode (``auto_select=False``) with 2+
+        models contributing a finite yhat at that horizon; auto-select
+        modes only ever emit one model's forecast per series so the
+        gauge would be a constant zero.
+        """
+        if not inputs or not horizon_specs:
+            return
+        series_key = _series_key_from_labels(frame.labels)
+        common = {
+            **{k: v for k, v in frame.labels.items() if k != "__name__"},
+            "id": query.id,
+            "group": group_name,
+        }
+        # Pull each emitted model's per-horizon yhat once and reuse for
+        # both metrics. The frames retained on ``inputs`` are the raw
+        # (uncalibrated) per-model forecasts — exactly what the next
+        # fit will produce, so the revision number reflects the actual
+        # prediction change rather than a calibration-side shift.
+        per_horizon: dict[str, dict[str, float]] = {}
+        for capacity_input in inputs:
+            yhats = _extract_per_horizon_yhat(capacity_input.forecast, horizon_specs)
+            if yhats:
+                per_horizon[capacity_input.model_name] = yhats
+        if not per_horizon:
+            return
+        # Revision: compare current to previous cache; update cache.
+        for model_name, yhats in per_horizon.items():
+            for horizon_label, current in yhats.items():
+                previous = self._revision_cache.get(
+                    group=group_name,
+                    query=query.id,
+                    series_key=series_key,
+                    model=model_name,
+                    horizon=horizon_label,
+                )
+                self._revision_cache.put(
+                    group=group_name,
+                    query=query.id,
+                    series_key=series_key,
+                    model=model_name,
+                    horizon=horizon_label,
+                    value=current,
+                )
+                magnitude = (
+                    revision_mod.compute_revision_magnitude(previous=previous, current=current)
+                    if previous is not None
+                    else float("nan")
+                )
+                if not math.isfinite(magnitude):
+                    continue
+                result.revision_points.append(
+                    RevisionPoint(
+                        labels={**common, "model": model_name, "horizon": horizon_label},
+                        magnitude=magnitude,
+                    )
+                )
+        # Disagreement: per-(series, horizon) coefficient of variation
+        # across the emitted models. Suppressed in auto-select / ensemble
+        # modes because only one model's yhat is emitted per series, so
+        # the cross-model spread is undefined.
+        if auto_select or len(per_horizon) < _MIN_MODELS_FOR_DISAGREEMENT:
+            return
+        horizons_seen: set[str] = set()
+        for yhats in per_horizon.values():
+            horizons_seen.update(yhats.keys())
+        for horizon_label in horizons_seen:
+            values = [
+                yhats[horizon_label] for yhats in per_horizon.values() if horizon_label in yhats
+            ]
+            if len(values) < _MIN_MODELS_FOR_DISAGREEMENT:
+                continue
+            score = _coefficient_of_variation(values)
+            if not math.isfinite(score):
+                continue
+            result.model_disagreement_points.append(
+                ModelDisagreementPoint(
+                    labels={**common, "horizon": horizon_label},
+                    score=score,
+                )
+            )
 
     def _record_band_coverage(
         self,
@@ -2822,7 +3434,7 @@ class Runner:
         tasks = [_timed(spec) for spec in models]
         outcomes = await asyncio.gather(*tasks, return_exceptions=True)
         out: list[ForecastPoint] = []
-        for outcome in outcomes:
+        for spec, outcome in zip(models, outcomes, strict=False):
             if isinstance(outcome, BaseException):
                 logger.exception(
                     "fit_failed_in_explicit_mode",
@@ -2830,6 +3442,10 @@ class Runner:
                     query=query.id,
                     exc_info=outcome,
                 )
+                # Per-model fit failure: record against the rolling success
+                # ratio so the model-health alert fires regardless of which
+                # mode (explicit/auto/ensemble) drove the fit.
+                self._record_fit_outcome(group=group_name, model=spec.name, success=False)
                 continue
             model_name, forecast, fit_seconds = outcome
             result.fit_durations[model_name] = fit_seconds
@@ -2840,6 +3456,7 @@ class Runner:
                 model_name=model_name,
                 fit_seconds=fit_seconds,
             )
+            self._record_fit_outcome(group=group_name, model=model_name, success=True)
             out.extend(factory.forecast_points(forecast, model_name, selection=None))
             result.curve.extend(factory.forecast_curve_points(forecast, model_name, selection=None))
             result.capacity_inputs.append(
@@ -2899,15 +3516,24 @@ class Runner:
         # params dict in that case so the fallback runs with stock defaults.
         spec = _resolve_spec(d.models, selection.model)
         t0 = time.monotonic()
-        forecast = await self._fit_one(
-            spec=spec,
-            df=df,
-            horizon=horizon,
-            freq=freq,
-            levels=levels,
-            season_length=season_length,
-            regressors=regressors,
-        )
+        try:
+            forecast = await self._fit_one(
+                spec=spec,
+                df=df,
+                horizon=horizon,
+                freq=freq,
+                levels=levels,
+                season_length=season_length,
+                regressors=regressors,
+            )
+        except Exception:
+            # Narrow on Exception (not BaseException) so a runner cancel
+            # — asyncio.CancelledError, KeyboardInterrupt — propagates
+            # without being recorded as a model-fit failure. TimeoutError
+            # inherits from Exception in 3.11+, so the success-ratio
+            # gauge still drops on real fit timeouts.
+            self._record_fit_outcome(group=group_name, model=selection.model, success=False)
+            raise
         fit_seconds = time.monotonic() - t0
         result.fit_durations[selection.model] = fit_seconds
         self._record_slow_fit_if_needed(
@@ -2917,6 +3543,7 @@ class Runner:
             model_name=selection.model,
             fit_seconds=fit_seconds,
         )
+        self._record_fit_outcome(group=group_name, model=selection.model, success=True)
         result.curve.extend(
             factory.forecast_curve_points(forecast, selection.model, selection=selection)
         )
@@ -2971,7 +3598,7 @@ class Runner:
         outcomes = await asyncio.gather(*(_timed(spec) for spec in models), return_exceptions=True)
         component_forecasts: dict[str, pd.DataFrame] = {}
         out: list[ForecastPoint] = []
-        for outcome in outcomes:
+        for spec, outcome in zip(models, outcomes, strict=False):
             if isinstance(outcome, BaseException):
                 logger.exception(
                     "fit_failed_in_ensemble_mode",
@@ -2979,6 +3606,7 @@ class Runner:
                     query=query.id,
                     exc_info=outcome,
                 )
+                self._record_fit_outcome(group=group_name, model=spec.name, success=False)
                 continue
             model_name, forecast, fit_seconds = outcome
             result.fit_durations[model_name] = fit_seconds
@@ -2989,6 +3617,7 @@ class Runner:
                 model_name=model_name,
                 fit_seconds=fit_seconds,
             )
+            self._record_fit_outcome(group=group_name, model=model_name, success=True)
             component_forecasts[model_name] = forecast
             out.extend(factory.forecast_points(forecast, model_name, selection=None))
             result.curve.extend(factory.forecast_curve_points(forecast, model_name, selection=None))
@@ -3125,6 +3754,23 @@ class Runner:
             threshold_seconds=round(threshold, 3),
             timeout_seconds=round(timeout_seconds, 3),
         )
+
+    def _record_fit_outcome(self, *, group: str, model: str, success: bool) -> None:
+        """Record one per-(group, model) main-forecast fit attempt.
+
+        Wraps the exporter's tracker so the runner doesn't reach into
+        private attributes. Counts both successes and failures (any
+        per-model exception or timeout) on the main forecast emission
+        path — explicit, auto-select, and ensemble modes are all
+        instrumented. The optional conditional-band refit is **not**
+        counted here on purpose: a model that succeeds on the
+        unconditional forecast but happens to fail the conditional
+        refit (e.g. regressor flat-hold degenerates the search) isn't
+        "the model is failing"; downstream ``ForecastModelFitFailing``
+        alerts would misfire. Conditional failures land separately on
+        ``forecast_failures_total{reason="conditional_fit_*"}``.
+        """
+        self._exporter.record_fit_outcome(group=group, model=model, success=success)
 
     async def _run_backtests(
         self,

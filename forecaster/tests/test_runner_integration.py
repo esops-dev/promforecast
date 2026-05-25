@@ -745,3 +745,169 @@ async def test_apply_config_prunes_stale_staleness_after_model_removal(
     )
     await runner.apply_config(new_cfg)
     assert not exporter._series_last_success, "aged rows must be pruned by apply_config sweep"
+
+
+@pytest.mark.asyncio
+async def test_run_group_emits_self_observability_and_stability_metrics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """End-to-end binding test for the self-observability + stability metrics.
+
+    Confirms the runner-level wiring lands the new families on /metrics
+    after a single group run with two configured models in explicit
+    mode + accuracy.evaluate=True (so per-horizon quality, revision,
+    and disagreement all have backtest results to bind against). Also
+    asserts the CPU/memory gauges are populated and the fit-success
+    ratio gauge is 1.0 (every fit succeeded).
+    """
+    from promforecast import models as model_registry  # noqa: PLC0415
+
+    cfg = Config(
+        datasource=DatasourceConfig(url="http://x"),
+        server=ServerConfig(),
+        safety=SafetyConfig(),
+        defaults=DefaultsConfig(
+            min_points=10,
+            models=["AutoARIMA", "SeasonalNaive"],
+            confidence_levels=[80],
+            accuracy=AccuracyConfig(
+                evaluate=True,
+                auto_select=False,
+                horizons=[timedelta(minutes=10), timedelta(minutes=30)],
+            ),
+            emission=EmissionConfig(deviation=True, quality=True, contribution=False),
+        ),
+        groups=[GroupConfig(name="g", queries=[QueryConfig(id="m", promql="up")])],
+    )
+
+    # Use two models that produce different yhat values so the
+    # disagreement gauge has a real spread to measure.
+    def _fake_build(name: str, season_length: int, params: dict | None = None) -> _FakeModel:
+        return _FakeModel(name, value=1.0 if name == "AutoARIMA" else 5.0)
+
+    monkeypatch.setattr(model_registry, "build", _fake_build)
+    source = _FakeSource({"up": [_ramp_frame(60)]})
+    exporter = Exporter()
+    runner = Runner(config=cfg, source=source, exporter=exporter)
+
+    # First run seeds the revision cache; revision points are NaN +
+    # dropped at render. Per-horizon quality + disagreement land
+    # immediately because they don't depend on a prior fit.
+    await runner.run_group(cfg.groups[0])
+
+    body = exporter.render().decode()
+    # Fit success ratio: both models fit cleanly → ratio 1.0 in both windows.
+    # Each ratio row is asserted as a plain substring (the trailing `}` is
+    # not part of an f-string, so we build the expected line by hand).
+    arima_row = 'forecast_model_fit_success_ratio{group="g",model="AutoARIMA",window="1h"} 1.0'
+    snaive_row = 'forecast_model_fit_success_ratio{group="g",model="SeasonalNaive",window="1h"} 1.0'
+    assert arima_row in body
+    assert snaive_row in body
+    # Group-level CPU + memory present.
+    assert 'forecast_group_cpu_seconds_total{group="g"}' in body
+    assert 'forecast_group_memory_bytes{group="g"}' in body
+    # Per-horizon quality emission: aggregated + per-horizon rows.
+    quality_lines = [
+        line for line in body.splitlines() if line.startswith("forecast_quality_score{")
+    ]
+    horizons_seen = {
+        line.split('horizon="', 1)[1].split('"', 1)[0]
+        for line in quality_lines
+        if 'horizon="' in line
+    }
+    # Two emitted models * (1 aggregated + 2 per-horizon) = at least 6 rows;
+    # the horizon label set covers the empty (aggregated) and both
+    # configured horizons.
+    assert "" in horizons_seen
+    assert "10m" in horizons_seen
+    assert "30m" in horizons_seen
+    # Disagreement: two emitted models with distinct yhat → finite CoV.
+    assert "forecast_model_disagreement" in body
+    disagreement_lines = [
+        line for line in body.splitlines() if line.startswith("forecast_model_disagreement{")
+    ]
+    assert disagreement_lines, "disagreement rows must be emitted in explicit mode"
+    # No revision rows on the first fit (cache was empty → NaN → dropped).
+    assert "forecast_revision_magnitude{" not in body
+
+    # Second run populates the revision cache from the first run, so
+    # revision magnitudes are now finite (in this test both fits
+    # produced the same yhat, so the magnitude is exactly 0.0).
+    await runner.run_group(cfg.groups[0])
+    body2 = exporter.render().decode()
+    revision_lines = [
+        line for line in body2.splitlines() if line.startswith("forecast_revision_magnitude{")
+    ]
+    assert revision_lines, "second fit must emit revision rows (cache now populated)"
+
+    # CPU counter is monotonic + increasing across runs.
+    cpu_rows = [
+        line for line in body2.splitlines() if line.startswith("forecast_group_cpu_seconds_total{")
+    ]
+    cpu_value = float(cpu_rows[0].rsplit(" ", 1)[1])
+    assert cpu_value > 0
+
+
+@pytest.mark.asyncio
+async def test_apply_config_prunes_fit_outcome_when_model_dropped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Removing a model from defaults.models must clear its success-ratio rows.
+
+    Regression guard for the self-observability cleanup: without
+    the model-removal sweep, dropping a model from the config would
+    leave its frozen-in-time ratio on /metrics until process restart,
+    misleading the ``ForecastModelFitFailing`` alert.
+    """
+    from promforecast import models as model_registry  # noqa: PLC0415
+
+    monkeypatch.setattr(
+        model_registry,
+        "build",
+        lambda name, season_length, params=None: _FakeModel(name, value=1.0),
+    )
+    cfg = Config(
+        datasource=DatasourceConfig(url="http://x"),
+        server=ServerConfig(),
+        safety=SafetyConfig(),
+        defaults=DefaultsConfig(
+            min_points=10,
+            models=["AutoARIMA", "SeasonalNaive"],
+            confidence_levels=[80],
+            accuracy=AccuracyConfig(
+                evaluate=False, auto_select=False, horizons=[timedelta(minutes=10)]
+            ),
+        ),
+        groups=[GroupConfig(name="g", queries=[QueryConfig(id="m", promql="up")])],
+    )
+    source = _FakeSource({"up": [_ramp_frame(60)]})
+    exporter = Exporter()
+    runner = Runner(config=cfg, source=source, exporter=exporter)
+    await runner.run_group(cfg.groups[0])
+
+    body = exporter.render().decode()
+    assert "AutoARIMA" in body
+    assert "SeasonalNaive" in body
+
+    # Reload with SeasonalNaive removed. The sweep must drop its rows.
+    new_cfg = Config(
+        datasource=cfg.datasource,
+        server=cfg.server,
+        safety=cfg.safety,
+        defaults=DefaultsConfig(
+            min_points=10,
+            models=["AutoARIMA"],
+            confidence_levels=[80],
+            accuracy=cfg.defaults.accuracy,
+        ),
+        groups=list(cfg.groups),
+    )
+    await runner.apply_config(new_cfg)
+
+    body2 = exporter.render().decode()
+    fit_ratio_lines = [
+        line for line in body2.splitlines() if line.startswith("forecast_model_fit_success_ratio{")
+    ]
+    # SeasonalNaive must be gone; AutoARIMA must still be present.
+    assert any('model="AutoARIMA"' in line for line in fit_ratio_lines)
+    assert not any('model="SeasonalNaive"' in line for line in fit_ratio_lines)

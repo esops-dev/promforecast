@@ -1,0 +1,49 @@
+# Cookbook: aws_cloudwatch_estimated_charges_usd
+#
+# Forecast the AWS monthly bill so finance + engineering get a
+# month-end-projection trend before the invoice arrives. Use the
+# damped-trend model — daily billing snapshots otherwise extrapolate
+# linearly and overstate the projection.
+
+apiVersion: promforecast.io/v1
+
+datasource:
+  url: http://victoriametrics:8428/
+
+server:
+  refresh_interval: 1h
+
+defaults:
+  # 6h step is the CloudWatch billing publish cadence; longer step
+  # = fewer rows fetched and lighter on the TSDB. 90d gives the
+  # model enough seasonal context to spot month-over-month patterns.
+  lookback: 90d
+  step: 6h
+  horizon: 30d
+  models:
+    - name: AutoETSDamped
+      params:
+        damping_parameter: 0.95
+    - SeasonalNaive
+  # 4 samples per day at 6h step → weekly seasonality is 28.
+  season_length: 28
+  confidence_levels: [95]
+  accuracy:
+    evaluate: true
+    auto_select: true
+
+groups:
+  - name: cloud_cost
+    queries:
+      - id: aws_estimated_charges_usd
+        promql: |
+          aws_cloudwatch_estimated_charges_usd{service_name="Total"}
+        thresholds:
+          - name: monthly_budget
+            value: 50000
+            comparator: gt
+            alert_within: 14d
+            severity: warning
+            action_cost:
+              type: usd
+              value: 50000

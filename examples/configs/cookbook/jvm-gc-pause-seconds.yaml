@@ -1,0 +1,46 @@
+# Cookbook: jvm_gc_pause_seconds
+#
+# Long GC pauses correlate with user-facing latency; forecasting the
+# rate of long pauses lets you proactively recycle pods before they
+# breach an SLO. Use the deviation gauge to alert on "unusual GC
+# activity right now" rather than absolute thresholds tuned per
+# environment.
+
+apiVersion: promforecast.io/v1
+
+datasource:
+  url: http://victoriametrics:8428/
+
+server:
+  refresh_interval: 5m
+
+defaults:
+  lookback: 7d
+  step: 1m
+  horizon: 1h
+  models:
+    - AutoARIMA
+    - SeasonalNaive
+  season_length: 1440
+  confidence_levels: [80, 95]
+  accuracy:
+    evaluate: true
+    auto_select: true
+  emission:
+    deviation: true
+    quality: true
+
+groups:
+  - name: jvm
+    queries:
+      - id: jvm_gc_long_pause_rate
+        promql: |
+          sum by (instance, pool) (
+            rate(jvm_gc_pause_seconds_count{action="end of major GC"}[5m])
+          )
+        # No hard threshold — operators alert on the deviation gauge
+        # crossing the band rather than a magic GC pause threshold.
+        emission:
+          drift:
+            enabled: true
+            alert_threshold: 0.3

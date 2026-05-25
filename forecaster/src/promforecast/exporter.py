@@ -26,6 +26,11 @@ from prometheus_client import CollectorRegistry, generate_latest
 from prometheus_client.core import CounterMetricFamily, GaugeMetricFamily
 
 from ._naming import InvalidMetricNameError, validate_metric_name
+from .self_observability import (
+    FitOutcomeTracker,
+    GroupResourceTracker,
+    RegressorStabilityTracker,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -50,9 +55,11 @@ __all__ = [
     "GrowthRatePoint",
     "IncidentRecurrencePoint",
     "InvalidMetricNameError",
+    "ModelDisagreementPoint",
     "PreprocessStats",
     "QualityPoint",
     "RecommendedMaintenanceWindowPoint",
+    "RevisionPoint",
     "ThresholdEtaPoint",
     "TimeToDrainPoint",
     "WillBreachPoint",
@@ -284,6 +291,59 @@ class GrowthRatePoint:
 
 
 @dataclass(frozen=True)
+class ResourceSizingPoint:
+    """One ``forecast_recommended_resource_size{workload, kind, confidence}`` row.
+
+    The sample value is the recommended size in the metric's native
+    units (CPU cores, memory bytes, ...). ``current`` / ``savings_pct``
+    populate the sibling gauges below when the operator wired
+    ``current_promql`` on the workload; ``None`` skips that sibling
+    for the row.
+    """
+
+    labels: dict[str, str]
+    recommended: float
+    current: float | None
+    savings_pct: float | None
+
+
+@dataclass(frozen=True)
+class ServiceHealthScorePoint:
+    """One ``forecast_service_health_score`` sample.
+
+    Global metric name (no per-id prefix) — the ``aggregate_by`` label
+    keys ride the label set so the row is uniquely identified by the
+    bucket (e.g. ``service="checkout", environment="prod"``). The
+    sample value is the aggregated quality score in ``[0, 1]``;
+    ``aggregator`` and ``weight_by`` ride as documentation labels so a
+    Grafana panel can record which interpretation was in effect.
+    ``series_count`` rides as a label (rather than a separate metric)
+    so the bucket size is visible alongside the aggregated number.
+    """
+
+    labels: dict[str, str]
+    score: float
+
+
+@dataclass(frozen=True)
+class ThresholdActionCostPoint:
+    """One ``forecast_threshold_action_cost`` sample.
+
+    Global metric name (no per-id prefix) — ``id`` is a label so a
+    single Grafana panel can rank capacity ETAs by cost-to-ignore
+    across every threshold in the fleet. The sample value is the
+    operator-configured cost amount; the ``type`` label discriminates
+    the cost unit (``usd``, ``eur``, ``engineer_hours``, ...).
+    Emitted once per (group, query, threshold) — independent of model
+    / series fan-out — so the family stays small even on
+    high-cardinality groups.
+    """
+
+    labels: dict[str, str]
+    value: float
+
+
+@dataclass(frozen=True)
 class DriftPoint:
     """One ``forecast_drift_score`` sample.
 
@@ -355,6 +415,38 @@ class DeployRiskPoint:
     signals that produced a finite deviation this cycle; alerts
     typically gate on ``contributing_signals >= 2`` to avoid firing
     on a single-signal blip.
+    """
+
+    labels: dict[str, str]
+    score: float
+
+
+@dataclass(frozen=True)
+class RevisionPoint:
+    """One ``forecast_revision_magnitude`` sample.
+
+    Renders as ``forecast_revision_magnitude{id, group, model, horizon, ...}``
+    — the per-(series, model, horizon) magnitude of change between the
+    current fit's prediction and the previous fit's prediction for the
+    same horizon. Unsigned (operators care about "the forecast moved",
+    not "moved up vs. down"); normalised by the prior value's scale so
+    a 30% shift scores 0.3 regardless of magnitude.
+    """
+
+    labels: dict[str, str]
+    magnitude: float
+
+
+@dataclass(frozen=True)
+class ModelDisagreementPoint:
+    """One ``forecast_model_disagreement`` sample.
+
+    Renders as ``forecast_model_disagreement{id, group, horizon}`` — the
+    coefficient of variation across the central forecasts of every
+    configured model at the given horizon. Emitted only in explicit
+    mode (when 2+ models contribute distinct forecasts); auto-select
+    suppresses the metric for that series because only the winning
+    model is emitted.
     """
 
     labels: dict[str, str]
@@ -515,6 +607,12 @@ class GroupSnapshot:
     outliers_replaced_cumulative: dict[tuple[str, str], int] = field(default_factory=dict)
     # Cumulative per-(query) change-point detection counter.
     change_points_cumulative: dict[str, int] = field(default_factory=dict)
+    # Cumulative per-(query, reason) blacklist-window sample counter.
+    # ``reason`` defaults to the empty string for unreasoned windows so
+    # the counter is always single-valued even when the operator did not
+    # configure a reason. Merged with the previous snapshot in
+    # ``run_group`` so the exposed counter stays monotonic across runs.
+    blacklisted_samples_cumulative: dict[tuple[str, str], int] = field(default_factory=dict)
     # Cumulative per-(query, kind) emission clipping counter.
     # ``kind`` is bounded to ``negative`` (a value clipped from below zero
     # by ``emission.clip_non_negative``) and ``rounded`` (a value whose
@@ -539,6 +637,24 @@ class GroupSnapshot:
     # separate ``BandCoverageTracker`` and snapshots the current
     # fractions here at render time.
     band_coverage_points: list[BandCoveragePoint] = field(default_factory=list)
+    # Per-(series, model, horizon) forecast-revision magnitude — how
+    # much the predicted value moved between the most recent fit and
+    # the one before it, normalised by the prior value's typical scale.
+    # Snapshot-style: only the latest run's samples land on /metrics.
+    revision_points: list[RevisionPoint] = field(default_factory=list)
+    # Per-(series, horizon) model-disagreement gauge — the coefficient
+    # of variation across the configured models' central forecasts at
+    # the same horizon. Emitted only in explicit mode with 2+ models
+    # contributing distinct forecasts; auto-select suppresses the
+    # metric because only the winner is emitted.
+    model_disagreement_points: list[ModelDisagreementPoint] = field(default_factory=list)
+    # Per-(group, query, threshold) cost-of-action gauge. Config-derived
+    # constant — one row per threshold with ``action_cost`` configured,
+    # independent of model / series fan-out. The runner rebuilds the
+    # list from the current config on every group run so a threshold
+    # that's been removed from YAML disappears from /metrics on the
+    # next refresh.
+    threshold_action_cost_points: list[ThresholdActionCostPoint] = field(default_factory=list)
 
 
 class Exporter:
@@ -647,6 +763,27 @@ class Exporter:
         # cycle's scores are emitted. Bounded cardinality:
         # 7 days * 24 hours = 168 rows per opted-in (group, query).
         self._incident_recurrence: dict[tuple[str, str, str, str], IncidentRecurrencePoint] = {}
+        # Service-level forecast health composite. Keyed by the
+        # operator's ``aggregate_by`` tuple of label values. Snapshot
+        # state lives on the exporter (rather than per-group snapshot)
+        # because the aggregation crosses groups by design — one
+        # bucket like ``service=checkout, env=prod`` typically pulls
+        # quality_points from multiple groups.
+        self._service_health_scores: dict[tuple[tuple[str, str], ...], ServiceHealthScorePoint] = {}
+        # Right-sizing recommendations. Keyed by (workload, kind) —
+        # operator-configured cardinality is small (typically a few
+        # workloads x 2 kinds). Lives on the exporter (rather than
+        # per-group snapshot) because a workload spec is a top-level
+        # config; the runner repopulates the whole map after every
+        # group run.
+        self._resource_sizing_recommendations: dict[tuple[str, str], ResourceSizingPoint] = {}
+        # Per-(group, query, primary_suspect) drift-explained counter.
+        # Bumped once per drift threshold-crossing event; the
+        # ``primary_suspect`` label is either the regressor id the
+        # change-correlation explainer identified or ``"unknown"``
+        # when no candidate emerged. Cardinality is bounded by the
+        # configured regressor count plus one (``unknown``).
+        self._drift_explained: dict[tuple[str, str, str], int] = {}
         # Per-(group, query, model, series_key) last-successful-fit
         # timestamp. Renders as ``forecast_data_staleness_seconds`` —
         # the per-series complement to the group-level
@@ -662,6 +799,18 @@ class Exporter:
         self._series_last_success: dict[
             tuple[str, str, str, str], tuple[float, dict[str, str]]
         ] = {}
+        # Per-(group, model) rolling fit-outcome ledger backing the
+        # ``forecast_model_fit_success_ratio`` family — fed by every
+        # per-model fit attempt (success and failure) via
+        # :meth:`record_fit_outcome`. Per-(group, query, regressor_id)
+        # stability scores back ``forecast_regressor_stability_score``
+        # and are refreshed from the runner once per fit. Per-group
+        # CPU + memory accounting backs the ``forecast_group_*``
+        # gauges; both live on the exporter so /metrics can read
+        # them without reaching into the runner.
+        self._fit_outcome_tracker = FitOutcomeTracker()
+        self._regressor_stability_tracker = RegressorStabilityTracker()
+        self._group_resource_tracker = GroupResourceTracker()
         self._registry = CollectorRegistry()
         self._registry.register(_SnapshotCollector(self))
 
@@ -1020,6 +1169,94 @@ class Exporter:
                 key: point for key, point in self._incident_recurrence.items() if key[0] in names
             }
 
+    def replace_service_health_scores(self, points: list[ServiceHealthScorePoint]) -> None:
+        """Atomically replace the per-bucket service-health composite.
+
+        Whole-state replacement: buckets that disappear from
+        ``points`` (e.g. a service whose quality_points all dropped
+        below the configured ``quality_floor`` this refresh) leave
+        /metrics on the next scrape. The runner rebuilds the full
+        list from current snapshots after every group run; the
+        operator-configured ``aggregate_by`` decides the bucket key
+        so the dict shape is stable across calls.
+
+        The bucket key sorts ``(label, value)`` pairs by label name
+        before tupling — operator-visible label values stay in their
+        configured order on the rendered metric, but the *dict key*
+        used to deduplicate is order-stable even when the producer
+        changes its label-insertion order. Without the sort, an
+        unrelated edit to the producer (extra labels injected between
+        aggregate_by dims, or a different Python build whose dict
+        order semantics shift) could silently fork buckets across
+        runs and operators would see the same bucket appear twice on
+        /metrics.
+        """
+        new_state: dict[tuple[tuple[str, str], ...], ServiceHealthScorePoint] = {}
+        for point in points:
+            # Bucket key intentionally excludes the documentation
+            # labels (``aggregator`` / ``weight_by`` / ``series_count``)
+            # since they're consequences of the config and don't
+            # discriminate buckets. Sorting by label name keeps the
+            # tuple stable across producer-side insertion orders.
+            key = tuple(
+                sorted(
+                    (k, v)
+                    for k, v in point.labels.items()
+                    if k not in ("aggregator", "weight_by", "series_count")
+                )
+            )
+            new_state[key] = point
+        if not new_state and not self._service_health_scores:
+            return
+        with self._lock:
+            self._service_health_scores = new_state
+
+    def _service_health_state(self) -> list[ServiceHealthScorePoint]:
+        with self._lock:
+            return list(self._service_health_scores.values())
+
+    def replace_resource_sizing_recommendations(self, points: list[ResourceSizingPoint]) -> None:
+        """Atomically replace the right-sizing recommendation set.
+
+        Whole-state replacement: a workload entry whose forecast
+        dropped below the quality floor this refresh (and therefore
+        produced no recommendation) leaves /metrics on the next
+        scrape. The runner rebuilds the full list from current
+        snapshots after every group run.
+        """
+        new_state: dict[tuple[str, str], ResourceSizingPoint] = {}
+        for point in points:
+            workload = point.labels.get("workload", "")
+            kind = point.labels.get("kind", "")
+            new_state[(workload, kind)] = point
+        if not new_state and not self._resource_sizing_recommendations:
+            return
+        with self._lock:
+            self._resource_sizing_recommendations = new_state
+
+    def _resource_sizing_state(self) -> list[ResourceSizingPoint]:
+        with self._lock:
+            return list(self._resource_sizing_recommendations.values())
+
+    def increment_drift_explained(self, *, group: str, query: str, primary_suspect: str) -> None:
+        """Bump the ``forecast_drift_explained_total`` counter for one event."""
+        with self._lock:
+            key = (group, query, primary_suspect)
+            self._drift_explained[key] = self._drift_explained.get(key, 0) + 1
+
+    def _drift_explained_state(self) -> dict[tuple[str, str, str], int]:
+        with self._lock:
+            return dict(self._drift_explained)
+
+    def retain_drift_explained_queries(self, live_pairs: set[tuple[str, str]]) -> None:
+        """Drop counter rows for (group, query) pairs removed by a reload."""
+        with self._lock:
+            self._drift_explained = {
+                key: count
+                for key, count in self._drift_explained.items()
+                if (key[0], key[1]) in live_pairs
+            }
+
     def record_series_fit_success(
         self,
         *,
@@ -1122,6 +1359,57 @@ class Exporter:
         with self._lock:
             return dict(self._series_last_success)
 
+    def record_fit_outcome(self, *, group: str, model: str, success: bool) -> None:
+        """Record one per-(group, model) fit attempt for the rolling-success ratio.
+
+        Called by the runner after every fit (successful or not). The tracker
+        owns its own lock so we don't take the exporter lock on the hot path —
+        per-series fits in the same group run concurrently against the shared
+        executor and would otherwise contend on every outcome.
+        """
+        self._fit_outcome_tracker.record(group=group, model=model, success=success)
+
+    def record_regressor_stability(
+        self,
+        *,
+        group: str,
+        query: str,
+        regressor_id: str,
+        values: list[float],
+    ) -> None:
+        """Record one regressor's recent value series for the stability score."""
+        self._regressor_stability_tracker.record(
+            group=group, query=query, regressor_id=regressor_id, values=values
+        )
+
+    def add_group_cpu_seconds(self, group: str, seconds: float) -> None:
+        """Add to the per-group cumulative CPU counter."""
+        self._group_resource_tracker.add_cpu(group, seconds)
+
+    def set_group_memory_bytes(self, group: str, memory_bytes: float) -> None:
+        """Set the per-group memory gauge to ``memory_bytes``."""
+        self._group_resource_tracker.set_memory(group, memory_bytes)
+
+    def retain_self_observability_groups(self, names: set[str]) -> None:
+        """Drop per-group self-observability state for groups removed by a reload."""
+        self._fit_outcome_tracker.retain_groups(names)
+        self._regressor_stability_tracker.retain_groups(names)
+        self._group_resource_tracker.retain_groups(names)
+
+    def retain_fit_outcome_models(self, live_models: set[str]) -> None:
+        """Drop fit-success-ratio buckets for models no longer in the config.
+
+        Forwarded to :class:`FitOutcomeTracker.retain_models` — needed so
+        a reload that drops a model from ``defaults.models`` clears its
+        success-ratio rows from /metrics instead of leaving the alert
+        bound to a frozen-in-time number.
+        """
+        self._fit_outcome_tracker.retain_models(live_models)
+
+    def retain_regressor_stability_queries(self, live_pairs: set[tuple[str, str]]) -> None:
+        """Drop regressor stability rows for (group, query) pairs removed by a reload."""
+        self._regressor_stability_tracker.retain_queries(live_pairs)
+
     def retain_incident_recurrence_queries(self, live_pairs: set[tuple[str, str]]) -> None:
         """Drop heatmap rows for (group, query) pairs no longer in config.
 
@@ -1207,6 +1495,17 @@ class _SnapshotCollector:
         yield from _deploy_risk_families(deploy_risk_state)
         yield from _incident_recurrence_families(incident_recurrence_state)
         yield from _staleness_families(staleness_state)
+        yield from _fit_success_ratio_families(self._exporter._fit_outcome_tracker.render())
+        yield from _regressor_stability_families(
+            self._exporter._regressor_stability_tracker.render()
+        )
+        yield from _group_resource_families(self._exporter._group_resource_tracker.render())
+        yield from _revision_families(groups)
+        yield from _model_disagreement_families(groups)
+        yield from _threshold_action_cost_families(groups)
+        yield from _service_health_score_families(self._exporter._service_health_state())
+        yield from _resource_sizing_families(self._exporter._resource_sizing_state())
+        yield from _drift_explained_families(self._exporter._drift_explained_state())
 
 
 def _emit_gauge_family(
@@ -1683,6 +1982,21 @@ def _operational_families(  # noqa: PLR0912
         "Unix timestamp of the most recent successful run for the group.",
         labels=["group"],
     )
+    # ``forecast_snapshot_age_seconds`` is the same signal as
+    # ``time() - forecast_last_run_timestamp_seconds`` but pre-computed
+    # server-side so dashboards and degraded-mode alerts
+    # (``ForecastSnapshotStale``) can read a single gauge instead of
+    # subtracting time(). For groups that have never produced a snapshot
+    # the value is 0 — alert authors should gate on the timestamp
+    # being non-zero as well (or on `forecast_last_run_timestamp_seconds
+    # > 0`) before treating a zero age as healthy.
+    snapshot_age = GaugeMetricFamily(
+        "forecast_snapshot_age_seconds",
+        "Seconds since the most recent successful run for the group "
+        "(``time() - forecast_last_run_timestamp_seconds``); 0 when the "
+        "group has never produced a snapshot.",
+        labels=["group"],
+    )
     # Group-aggregate gauges. Stable schema (single ``group`` label) —
     # dashboards relying on these built before per-query refresh intervals
     # existed keep working unchanged. Per-query breakdowns are emitted as
@@ -1716,8 +2030,11 @@ def _operational_families(  # noqa: PLR0912
     )
     have_per_query_duration = False
     have_per_query_series_count = False
+    now = time.time()
     for snap in groups:
         last_run.add_metric([snap.group], snap.last_run_timestamp)
+        age = (now - snap.last_run_timestamp) if snap.last_run_timestamp > 0 else 0.0
+        snapshot_age.add_metric([snap.group], max(0.0, age))
         duration.add_metric([snap.group], snap.run_duration_seconds)
         series_count.add_metric([snap.group], float(snap.series_count))
         for query_id, dur in snap.run_duration_per_query.items():
@@ -1727,6 +2044,7 @@ def _operational_families(  # noqa: PLR0912
             per_query_series_count.add_metric([snap.group, query_id], float(count))
             have_per_query_series_count = True
     yield last_run
+    yield snapshot_age
     yield duration
     yield series_count
     if have_per_query_duration:
@@ -1857,10 +2175,23 @@ def _config_hash_families(
 def _remote_write_families(
     state: dict[tuple[str, str], int],
 ) -> Iterator[CounterMetricFamily]:
-    """Render the ``forecast_remote_write_failures_total`` counter.
+    """Render the per-(group, reason) and reason-aggregated sink-failure counters.
 
     Always emitted (even when empty) so dashboards can display "0 errors"
     rather than 404'ing the panel before the first failure occurs.
+
+    Two families ship side by side:
+
+    * ``forecast_remote_write_failures_total{group, reason}`` — the
+      per-group breakdown used by dashboards that want to see which
+      group's pushes are failing.
+    * ``forecast_sink_write_failures_total{reason}`` — the reason-only
+      roll-up the degraded-mode playbook
+      (``docs/operations/degraded-modes.md``) recommends alerting on
+      (``ForecastSinkWriteFailing``). The aggregate is a more honest
+      "is the sink up?" signal than the per-group counter, which fires
+      separately for every group that pushed while the sink was
+      unreachable.
     """
     counter = CounterMetricFamily(
         "forecast_remote_write_failures",
@@ -1870,6 +2201,20 @@ def _remote_write_families(
     for (group, reason), count in state.items():
         counter.add_metric([group, reason], float(count))
     yield counter
+    sink_counter = CounterMetricFamily(
+        "forecast_sink_write_failures",
+        "Total number of sink (remote_write) push attempts that failed, by reason "
+        "(timeout | http_error | unexpected). Reason-only roll-up of "
+        "``forecast_remote_write_failures_total`` — alert on this when you want "
+        "a single 'is the sink up?' signal rather than one alert per group.",
+        labels=["reason"],
+    )
+    per_reason: dict[str, int] = {}
+    for (_group, reason), count in state.items():
+        per_reason[reason] = per_reason.get(reason, 0) + count
+    for reason, count in per_reason.items():
+        sink_counter.add_metric([reason], float(count))
+    yield sink_counter
 
 
 def _remote_write_retries_families(
@@ -2142,6 +2487,7 @@ def _preprocess_families(
     yield from _outliers_family(groups)
     yield from _change_points_family(groups)
     yield from _effective_lookback_family(groups)
+    yield from _blacklisted_samples_family(groups)
 
 
 def _gaps_filled_family(groups: list[GroupSnapshot]) -> Iterator[CounterMetricFamily]:
@@ -2222,6 +2568,34 @@ def _effective_lookback_family(groups: list[GroupSnapshot]) -> Iterator[GaugeMet
             if stats.effective_lookback_seconds > 0:
                 family.add_metric([snap.group, query_id], float(stats.effective_lookback_seconds))
                 have = True
+    if have:
+        yield family
+
+
+def _blacklisted_samples_family(
+    groups: list[GroupSnapshot],
+) -> Iterator[CounterMetricFamily]:
+    """Render ``forecast_input_blacklisted_samples_total{group, query, reason}``.
+
+    Counts samples removed by ``preprocess.blacklist_windows`` per
+    (group, query, reason). The reason value defaults to the empty string
+    when the operator did not configure one. Only emitted when at least
+    one group has produced a non-zero count so a config without any
+    blacklist windows does not carry an empty family on /metrics.
+    """
+    family = CounterMetricFamily(
+        "forecast_input_blacklisted_samples",
+        "Lookback samples dropped by an operator-configured "
+        "``preprocess.blacklist_windows`` entry. Useful for confirming "
+        "that an annual-recurring window actually fired for the most "
+        "recent year of the lookback.",
+        labels=["group", "query", "reason"],
+    )
+    have = False
+    for snap in groups:
+        for (query_id, reason), count in snap.blacklisted_samples_cumulative.items():
+            family.add_metric([snap.group, query_id, reason], float(count))
+            have = True
     if have:
         yield family
 
@@ -2454,3 +2828,291 @@ def _staleness_families(
         "successful fits reset it to zero.",
         value_fn=lambda p: p.value,
     )
+
+
+def _fit_success_ratio_families(
+    points: list[Any],
+) -> Iterator[GaugeMetricFamily]:
+    """Render ``forecast_model_fit_success_ratio{group, model, window}``.
+
+    Emitted only when at least one observation has been recorded for the
+    (group, model) tuple inside the asked-for window — empty windows
+    short to absent rather than 0/0 noise so a fresh deployment doesn't
+    light up the model-health alert before any fit has run.
+    """
+    if not points:
+        return
+    family = GaugeMetricFamily(
+        "forecast_model_fit_success_ratio",
+        "Fraction of attempted fits that completed within safety.fit_timeout "
+        "without raising, computed over a rolling window. 1.0 = every fit "
+        "succeeded in the window; 0.0 = every fit failed. Per (group, model, "
+        "window) tuple.",
+        labels=["group", "model", "window"],
+    )
+    for point in points:
+        if not math.isfinite(point.ratio):
+            continue
+        family.add_metric([point.group, point.model, point.window_label], float(point.ratio))
+    yield family
+
+
+def _regressor_stability_families(
+    points: list[Any],
+) -> Iterator[GaugeMetricFamily]:
+    """Render ``forecast_regressor_stability_score{group, query, regressor_id}``.
+
+    Higher is more stable: 1.0 means the regressor's recent tail matches
+    its lookback head; 0.0 means it has drifted past the saturation
+    threshold. Non-finite scores (degenerate input series) are dropped
+    so dashboards don't see NaN markers.
+    """
+    if not points:
+        return
+    family = GaugeMetricFamily(
+        "forecast_regressor_stability_score",
+        "How much a configured exogenous regressor's recent values differ "
+        "from its lookback distribution. 1.0 = the recent tail matches the "
+        "lookback head; 0.0 = it has drifted past the saturation threshold. "
+        "Per (group, query, regressor_id) tuple.",
+        labels=["group", "query", "regressor_id"],
+    )
+    have = False
+    for point in points:
+        if not math.isfinite(point.score):
+            continue
+        family.add_metric([point.group, point.query, point.regressor_id], float(point.score))
+        have = True
+    if have:
+        yield family
+
+
+def _revision_families(
+    groups: list[GroupSnapshot],
+) -> Iterator[GaugeMetricFamily]:
+    """Render ``forecast_revision_magnitude{id, group, model, horizon, ...}``.
+
+    Unsigned per-(series, model, horizon) gauge: how much the predicted
+    value at this horizon moved between fits, normalised by the prior
+    forecast's typical scale. NaN samples (no prior fit cached) are
+    dropped — they're the bootstrap state, not a meaningful "magnitude".
+    """
+    points = [p for snap in groups for p in snap.revision_points]
+    yield from _emit_gauge_family(
+        points,
+        "forecast_revision_magnitude",
+        "Magnitude of change in the predicted central value at the given "
+        "horizon between the current fit and the previous fit, normalised "
+        "by ``max(|previous|, scale_floor)``. Unsigned. Useful for "
+        "detecting an over-reactive model or a real regime change before "
+        "downstream alerts notice the shift.",
+        value_fn=lambda p: p.magnitude,
+        skip_fn=lambda p: not math.isfinite(p.magnitude),
+    )
+
+
+def _model_disagreement_families(
+    groups: list[GroupSnapshot],
+) -> Iterator[GaugeMetricFamily]:
+    """Render ``forecast_model_disagreement{id, group, horizon, ...}``.
+
+    Coefficient of variation across the configured models' central
+    forecasts at the same horizon — high values mean no model is
+    confident about this future. Only emitted in explicit mode with
+    2+ models contributing; auto-select suppresses the metric because
+    only the winner is emitted.
+    """
+    points = [p for snap in groups for p in snap.model_disagreement_points]
+    yield from _emit_gauge_family(
+        points,
+        "forecast_model_disagreement",
+        "Coefficient of variation across the central forecasts of every "
+        "configured model at the given horizon. 0 = perfect agreement; "
+        "higher values mean the configured models disagree more about the "
+        "future — a useful 'should I switch to auto-select?' signal.",
+        value_fn=lambda p: p.score,
+        skip_fn=lambda p: not math.isfinite(p.score),
+    )
+
+
+def _drift_explained_families(
+    state: dict[tuple[str, str, str], int],
+) -> Iterator[CounterMetricFamily]:
+    """Render ``forecast_drift_explained_total{group, query, primary_suspect}``.
+
+    Bumped once per drift threshold-crossing event. The
+    ``primary_suspect`` label is the regressor id the
+    change-correlation explainer identified (high/medium correlation
+    bands) or — falling back when correlation is
+    ``insufficient_data`` — the highest-value regressor at the drift
+    moment. ``"unknown"`` covers the case where no regressors are
+    configured or none produced a finite candidate.
+
+    Emitted only after at least one drift event has fired so /metrics
+    stays quiet for deployments that never trip the drift threshold.
+    """
+    if not state:
+        return
+    counter = CounterMetricFamily(
+        "forecast_drift_explained",
+        "Number of drift threshold-crossing events explained by the "
+        "change-correlation suspect for (group, query, primary_suspect). "
+        "primary_suspect prefers the rolling-window Pearson correlation "
+        "candidate when correlation confidence is high or medium; falls "
+        "back to the highest-value regressor at the drift moment "
+        "otherwise. ``unknown`` covers no-suspect cases.",
+        labels=["group", "query", "primary_suspect"],
+    )
+    for (group, query, suspect), count in state.items():
+        counter.add_metric([group, query, suspect], float(count))
+    yield counter
+
+
+def _resource_sizing_families(
+    points: list[ResourceSizingPoint],
+) -> Iterator[GaugeMetricFamily]:
+    """Render the three right-sizing recommendation gauges.
+
+    Three sibling metrics share the (workload, kind) label set so
+    operators can join them in PromQL:
+
+    * ``forecast_recommended_resource_size{..., confidence}`` —
+      the recommended limit/request value in the metric's native
+      units (CPU cores, memory bytes, ...).
+    * ``forecast_recommended_resource_current{...}`` — the current
+      configured limit/request, emitted only when the workload's
+      ``current_promql`` resolved to a finite number.
+    * ``forecast_recommended_resource_savings_pct{..., confidence}`` —
+      ``(current - recommended) / current * 100``, emitted only
+      when both sides are available. Negative values mean upsize,
+      not downsize.
+    """
+    # The recommended gauge always emits — that's the primary signal.
+    yield from _emit_gauge_family(
+        points,
+        "forecast_recommended_resource_size",
+        "Right-sized resource limit/request derived from the forecast peak. "
+        "Sample value is in the metric's native units (CPU cores, memory "
+        "bytes). The ``confidence`` label is derived from "
+        "``forecast_quality_score`` and gates how much to trust the row.",
+        value_fn=lambda p: p.recommended,
+        skip_fn=lambda p: not math.isfinite(p.recommended),
+    )
+    # ``current`` only emits when ``current_promql`` resolved.
+    current_points = [p for p in points if p.current is not None]
+    yield from _emit_gauge_family(
+        current_points,
+        "forecast_recommended_resource_current",
+        "Current configured limit/request for the workload, fetched via "
+        "the operator-supplied ``current_promql``. Sample value is in "
+        "the metric's native units. Emitted only when ``current_promql`` "
+        "was configured.",
+        value_fn=lambda p: float(p.current) if p.current is not None else float("nan"),
+        skip_fn=lambda p: p.current is None or not math.isfinite(p.current),
+    )
+    savings_points = [p for p in points if p.savings_pct is not None]
+    yield from _emit_gauge_family(
+        savings_points,
+        "forecast_recommended_resource_savings_pct",
+        "Expected savings percentage: ``(current - recommended) / current "
+        "* 100``. Positive values mean downsize is safe; negative values "
+        "mean the predicted peak exceeds the current limit and the "
+        "workload needs upsizing.",
+        value_fn=lambda p: float(p.savings_pct) if p.savings_pct is not None else float("nan"),
+        skip_fn=lambda p: p.savings_pct is None or not math.isfinite(p.savings_pct),
+    )
+
+
+def _service_health_score_families(
+    points: list[ServiceHealthScorePoint],
+) -> Iterator[GaugeMetricFamily]:
+    """Render ``forecast_service_health_score{<aggregate_by>, ...}``.
+
+    Single global family — the ``aggregate_by`` dimensions ride the
+    label set so one Grafana panel can show every configured bucket
+    (per-service, per-environment, ...) without a second query. The
+    sample value is the aggregated quality score in ``[0, 1]``.
+    ``aggregator``, ``weight_by``, and ``series_count`` ride as
+    documentation labels so the operator can read which
+    interpretation produced the number alongside its bucket size.
+    """
+    yield from _emit_gauge_family(
+        points,
+        "forecast_service_health_score",
+        "Per-bucket aggregated forecast_quality_score in [0, 1]. The "
+        "aggregate_by labels (e.g. service, environment) ride the "
+        "label set so one Grafana panel can show every configured "
+        "bucket. ``aggregator``, ``weight_by``, and ``series_count`` "
+        "ride as documentation labels.",
+        value_fn=lambda p: p.score,
+        skip_fn=lambda p: not math.isfinite(p.score),
+    )
+
+
+def _threshold_action_cost_families(
+    groups: list[GroupSnapshot],
+) -> Iterator[GaugeMetricFamily]:
+    """Render ``forecast_threshold_action_cost{id, group, name, type}``.
+
+    Static per-(group, query, threshold) gauge carrying the
+    operator-configured cost-of-action. Joined against
+    ``forecast_time_to_threshold_seconds`` so dashboards can rank
+    "soon-and-expensive" capacity events ahead of "soon-and-cheap"
+    ones. The ``type`` label is free text (``usd``, ``eur``,
+    ``priority``, ``engineer_hours``, ...) so non-monetary cost
+    framings coexist with currency ones in a single family.
+    """
+    points = [p for snap in groups for p in snap.threshold_action_cost_points]
+    yield from _emit_gauge_family(
+        points,
+        "forecast_threshold_action_cost",
+        "Operator-configured cost-of-action for a capacity threshold. "
+        "The ``type`` label is free text (``usd``, ``eur``, "
+        "``engineer_hours``, ...). Join against "
+        "``forecast_time_to_threshold_seconds`` on (id, group, name) "
+        "to rank capacity ETAs by cost-to-ignore.",
+        value_fn=lambda p: p.value,
+        skip_fn=lambda p: not math.isfinite(p.value),
+    )
+
+
+def _group_resource_families(
+    points: list[Any],
+) -> Iterator[GaugeMetricFamily | CounterMetricFamily]:
+    """Render ``forecast_group_memory_bytes`` + ``forecast_group_cpu_seconds_total``.
+
+    Memory is a best-effort snapshot of the per-group dataframes + the
+    exporter's per-group snapshot footprint, computed via
+    ``sys.getsizeof`` at the end of every group run. CPU is the
+    cumulative sum of per-fit wall-clock seconds reported by the
+    runner's ``fit_durations`` accumulator.
+    """
+    if not points:
+        return
+    memory = GaugeMetricFamily(
+        "forecast_group_memory_bytes",
+        "Best-effort per-group memory footprint (bytes). Counts the size of "
+        "the per-group snapshot held by the exporter plus the in-flight "
+        "per-fit dataframes the runner retains across the per-series loop.",
+        labels=["group"],
+    )
+    cpu = CounterMetricFamily(
+        "forecast_group_cpu_seconds",
+        "Cumulative wall-clock seconds spent fitting models attributable to "
+        "this group, summed across every per-model fit the runner has "
+        "executed since boot.",
+        labels=["group"],
+    )
+    have_memory = False
+    have_cpu = False
+    for point in points:
+        if math.isfinite(point.memory_bytes) and point.memory_bytes > 0:
+            memory.add_metric([point.group], float(point.memory_bytes))
+            have_memory = True
+        if math.isfinite(point.cpu_seconds_total) and point.cpu_seconds_total > 0:
+            cpu.add_metric([point.group], float(point.cpu_seconds_total))
+            have_cpu = True
+    if have_memory:
+        yield memory
+    if have_cpu:
+        yield cpu

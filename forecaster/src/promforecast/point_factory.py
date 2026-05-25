@@ -940,6 +940,16 @@ class SeriesPointFactory:
         series would fire the ``ForecastQualityZero`` alert without signal;
         the ``ForecastFallbackPersistent`` alert covers that case better.
 
+        Emission shape: each (series, model) yields one aggregated row
+        with ``horizon=""`` (the historical default — existing alert
+        matchers without a ``horizon`` selector keep working unchanged)
+        *plus* one row per configured accuracy horizon labelled with
+        that horizon's label. Capacity-relevant alerts on long horizons
+        can gate against ``forecast_quality_score{horizon="24h"}`` while
+        short-horizon deviation alerts gate on
+        ``forecast_quality_score{horizon="1h"}`` without a single
+        average masking either.
+
         See :mod:`promforecast.quality` for the exact formula.
         """
         abs_train = [abs(v) for v in train_y]
@@ -964,9 +974,27 @@ class SeriesPointFactory:
                 score_kind=score_kind,
             )
             yield QualityPoint(
-                labels={**common, "model": model_name},
+                labels={**common, "model": model_name, "horizon": ""},
                 score=score,
             )
+            # Per-horizon segmentation: same band-width + coverage inputs
+            # (those are series-level, not horizon-level) but the accuracy
+            # term is replaced with the per-horizon MAPE / MASE. The 1h
+            # forecast may score 0.9 while the 24h scores 0.5 — operator
+            # alerts can gate on the right horizon's reliability.
+            for res in outcome.results:
+                per_horizon_accuracy = res.mase if score_kind == "mase" else res.mape
+                per_horizon_score = quality_mod.compute(
+                    backtest_mape=per_horizon_accuracy,
+                    band_width_relative=band_width_relative,
+                    coverage=coverage,
+                    imputed_fraction=imputed_fraction,
+                    score_kind=score_kind,
+                )
+                yield QualityPoint(
+                    labels={**common, "model": model_name, "horizon": res.horizon},
+                    score=per_horizon_score,
+                )
 
     def _common_with_id(self) -> dict[str, str]:
         """Common labels for the operational families (carry ``id`` + ``group``).

@@ -26,6 +26,7 @@ from . import ha_cache as ha_cache_module
 from . import inspect as inspect_module
 from . import preview as preview_module
 from . import telemetry as telemetry_module
+from . import tuner as tuner_module
 from . import validate as validate_module
 from . import warmup as warmup_module
 from . import what_if as what_if_module
@@ -58,6 +59,7 @@ def cli() -> None:
             dry_run=args.dry_run,
             datasource_url_override=args.datasource_url,
             strict_cardinality=args.strict_cardinality,
+            estimate_cost=args.estimate_cost,
         )
         sys.exit(rc)
 
@@ -76,6 +78,16 @@ def cli() -> None:
             to_timestamp=args.to,
             group_selector=args.groups,
             sink_url_override=args.sink_url,
+        )
+        sys.exit(rc)
+
+    if args.command == "tune":
+        rc = tuner_module.run_tuner(
+            config_path=args.config,
+            group_selector=args.groups,
+            sink_url_override=args.sink_url,
+            lookback_override=args.lookback,
+            min_improvement_pct=args.min_improvement_pct,
         )
         sys.exit(rc)
 
@@ -149,7 +161,7 @@ def cli() -> None:
     run(config_path=args.config, log_level=args.log_level)
 
 
-def _build_parser() -> argparse.ArgumentParser:
+def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915
     parser = argparse.ArgumentParser(prog="promforecast")
     sub = parser.add_subparsers(dest="command")
 
@@ -210,6 +222,17 @@ def _build_parser() -> argparse.ArgumentParser:
             "safety.max_total_series instead of emitting an advisory WARN. "
             "Use in CI to reject configs whose opt-in emission would blow "
             "the global series cap. See docs/operations/cardinality.md."
+        ),
+    )
+    validate_p.add_argument(
+        "--estimate-cost",
+        action="store_true",
+        help=(
+            "Run a cheap synthetic-data fit per (group, configured model) "
+            "pair and print the expected per-refresh CPU + memory budget. "
+            "Estimator is order-of-magnitude only — synthetic input doesn't "
+            "capture every real fit-time distribution. See "
+            "docs/operations/validate.md for accuracy bounds."
         ),
     )
 
@@ -377,6 +400,64 @@ def _build_parser() -> argparse.ArgumentParser:
             "Emit the full inspector report as JSON instead of the aligned "
             "text table. Suitable for piping into ``jq`` or saving as a CI "
             "artifact alongside a flaky forecast."
+        ),
+    )
+
+    tune_p = sub.add_parser(
+        "tune",
+        help=(
+            "Recommend hyperparameter values for the configured groups. Runs a "
+            "small grid over season_length and the configured models against "
+            "the past ``--lookback`` of data and pushes one ``forecast_recommended_param`` "
+            "row per candidate whose backtest MAPE beats the configured "
+            "baseline by ``--min-improvement-pct``. Typical schedule: a weekly "
+            "``CronJob`` (shipped via the ``promforecast-tuner`` sub-chart). "
+            "See ``docs/operations/auto-tuning.md`` for a 'should I apply this "
+            "recommendation?' decision guide."
+        ),
+    )
+    tune_p.add_argument(
+        "--config",
+        type=Path,
+        required=True,
+        help="Path to the forecaster YAML config (the live runner's config).",
+    )
+    tune_p.add_argument(
+        "--groups",
+        nargs="+",
+        default=None,
+        help=(
+            "Optional space-separated list of group names to tune. "
+            "Defaults to every configured group when omitted."
+        ),
+    )
+    tune_p.add_argument(
+        "--sink-url",
+        default=None,
+        help=(
+            "Override ``sink.remote_write.url`` for the recommendation push. "
+            "Useful when running the tuner as a one-shot Job against a "
+            "different TSDB than the live forecaster's sink."
+        ),
+    )
+    tune_p.add_argument(
+        "--lookback",
+        default=None,
+        help=(
+            "Override the lookback window for the grid search (Prometheus "
+            "duration, e.g. ``14d``). Falls back to ``defaults.lookback`` "
+            "from the config."
+        ),
+    )
+    tune_p.add_argument(
+        "--min-improvement-pct",
+        type=_positive_float,
+        default=5.0,
+        help=(
+            "Minimum percentage MAPE improvement a candidate must show over "
+            "the configured baseline to be emitted as a recommendation. "
+            "Default 5.0 — keeps small / noisy improvements out of the "
+            "Grafana panel."
         ),
     )
 

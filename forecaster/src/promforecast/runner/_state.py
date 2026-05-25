@@ -33,9 +33,11 @@ from ..exporter import (
     ForecastPoint,
     GroupSnapshot,
     GrowthRatePoint,
+    ModelDisagreementPoint,
     PreprocessStats,
     QualityPoint,
     RecommendedMaintenanceWindowPoint,
+    RevisionPoint,
     ThresholdEtaPoint,
     TimeToDrainPoint,
     WillBreachPoint,
@@ -163,6 +165,16 @@ class _FitResult:
     # Drift alert: how many threshold crossings happened for this query
     # in this run. The runner folds it into the per-(query) total.
     drift_alerts: int = 0
+    # Forecast-to-forecast revision gauges: per (series, model, horizon)
+    # magnitude of change between this fit's prediction and the prior
+    # fit's prediction at the same horizon. NaN on the first fit (no
+    # prior cached); the exporter drops NaN samples.
+    revision_points: list[RevisionPoint] = field(default_factory=list)
+    # Per-(series, horizon) model-disagreement gauge — coefficient of
+    # variation across configured models' central forecasts at the same
+    # horizon. Only populated in explicit mode with 2+ distinct emitted
+    # models; auto-select / cold-start leave this empty.
+    model_disagreement_points: list[ModelDisagreementPoint] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -285,6 +297,8 @@ class _RunContext:
     outliers_replaced: dict[tuple[str, str], int] = field(default_factory=dict)
     # Per-query change-point detection count for this run.
     change_points: dict[str, int] = field(default_factory=dict)
+    # Per-(query, reason) blacklist-window sample count for this run.
+    blacklisted_samples: dict[tuple[str, str], int] = field(default_factory=dict)
     # Per-(query, kind) emission clipping counter for this run. Merged
     # with the previous snapshot in ``run_group`` so the exposed counter
     # stays monotonic across runs.
@@ -301,6 +315,10 @@ class _RunContext:
     drift_points: list[DriftPoint] = field(default_factory=list)
     # Per-(query) drift threshold-crossing counter for this run.
     drift_alerts: dict[str, int] = field(default_factory=dict)
+    # Per-(series, model, horizon) revision-magnitude gauges for this run.
+    revision_points: list[RevisionPoint] = field(default_factory=list)
+    # Per-(series, horizon) model-disagreement gauges for this run.
+    model_disagreement_points: list[ModelDisagreementPoint] = field(default_factory=list)
     # Per-query series count and run duration for the most recent run.
     # Used to populate the ``query`` label on
     # ``forecast_series_count`` and ``forecast_run_duration_seconds``.
@@ -352,6 +370,8 @@ def _merge_fit_into_ctx(ctx: _RunContext, fit_result: _FitResult, query_id: str)
     ctx.drift_points.extend(fit_result.drift_points)
     if fit_result.drift_alerts:
         ctx.drift_alerts[query_id] = ctx.drift_alerts.get(query_id, 0) + fit_result.drift_alerts
+    ctx.revision_points.extend(fit_result.revision_points)
+    ctx.model_disagreement_points.extend(fit_result.model_disagreement_points)
 
 
 # Per-family inheritance registry. Each entry tells
@@ -391,6 +411,8 @@ _INHERITANCE_REGISTRY: tuple[_InheritanceSpec, ...] = (
     _InheritanceSpec("calibration_offsets", "calibration_offsets", "label"),
     _InheritanceSpec("conditional_calibration_offsets", "conditional_calibration_offsets", "label"),
     _InheritanceSpec("drift_points", "drift_points", "label"),
+    _InheritanceSpec("revision_points", "revision_points", "label"),
+    _InheritanceSpec("model_disagreement_points", "model_disagreement_points", "label"),
     # ``forecast_recommended_maintenance_window`` is a global metric
     # name (no per-id prefix); use the ``id`` label to scope inheritance.
     _InheritanceSpec(

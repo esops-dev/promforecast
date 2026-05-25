@@ -6,8 +6,10 @@ import math
 from datetime import UTC, datetime, timedelta
 
 import numpy as np
+import pytest
 
 from promforecast.config import (
+    BlacklistWindowConfig,
     ChangePointConfig,
     GapImputationConfig,
     OutlierConfig,
@@ -293,3 +295,169 @@ def test_preprocess_result_imputed_fraction_zero_clean() -> None:
     assert isinstance(result, PreprocessResult)
     assert result.imputed_fraction == 0.0
     assert result.values == []
+
+
+# ---------- blacklist windows ---------------------------------------------
+
+
+def _config_with_blacklist(windows: list[BlacklistWindowConfig]) -> PreprocessConfig:
+    base = _config()
+    return PreprocessConfig(
+        gaps=base.gaps,
+        outliers=base.outliers,
+        change_point=base.change_point,
+        blacklist_windows=windows,
+    )
+
+
+def test_blacklist_absolute_window_drops_samples() -> None:
+    # 60 1-minute samples; drop the middle 20.
+    ts, vs = _regular_series(60)
+    start = ts[20].isoformat().replace("+00:00", "Z")
+    end = ts[40].isoformat().replace("+00:00", "Z")
+    window = BlacklistWindowConfig(start=start, end=end, reason="incident")
+    result = preprocess_series(
+        timestamps=ts,
+        values=vs,
+        step=timedelta(minutes=1),
+        config=_config_with_blacklist([window]),
+    )
+    assert not result.dropped
+    assert result.blacklisted_samples == {"incident": 20}
+    # The default ``forward_fill`` gap strategy imputes the blacklisted
+    # span back to a regular grid so the series length is unchanged;
+    # what changes is the counter (20 reasoned samples removed) and the
+    # effective-lookback gauge, which discounts those samples.
+    assert len(result.values) == 60
+    expected_total = (ts[-1] - ts[0]).total_seconds()
+    assert result.effective_lookback_seconds < expected_total
+    # ``20 samples x 60s step`` worth of discount: ~1200s.
+    assert result.effective_lookback_seconds == expected_total - 20 * 60
+
+
+def test_blacklist_default_empty_reason() -> None:
+    ts, vs = _regular_series(60)
+    start = ts[10].isoformat().replace("+00:00", "Z")
+    end = ts[15].isoformat().replace("+00:00", "Z")
+    window = BlacklistWindowConfig(start=start, end=end)
+    result = preprocess_series(
+        timestamps=ts,
+        values=vs,
+        step=timedelta(minutes=1),
+        config=_config_with_blacklist([window]),
+    )
+    assert result.blacklisted_samples == {"": 5}
+
+
+def test_blacklist_annual_recurring_fires_per_year() -> None:
+    # 3-year lookback at 1h step (around 365*3*24 ≈ 26280 samples is too
+    # heavy for a unit test). Build a sparse-but-representative two-year
+    # input covering January in each year so the annual window fires twice.
+    points: list[datetime] = []
+    for year in (2024, 2025):
+        for day in range(1, 31):
+            points.append(datetime(year, 1, day, 12, 0, tzinfo=UTC))
+    values = [float(i) for i in range(len(points))]
+    window = BlacklistWindowConfig(
+        start="01-01T00:00",
+        end="01-02T00:00",
+        reason="newyear",
+        recurring="annual",
+    )
+    result = preprocess_series(
+        timestamps=points,
+        values=values,
+        step=timedelta(hours=24),
+        config=_config_with_blacklist([window]),
+    )
+    # One sample per year falls inside the New Year's Day window.
+    assert result.blacklisted_samples == {"newyear": 2}
+
+
+def test_blacklist_consuming_all_samples_drops_series() -> None:
+    ts, vs = _regular_series(30)
+    start = (ts[0] - timedelta(hours=1)).isoformat().replace("+00:00", "Z")
+    end = (ts[-1] + timedelta(hours=1)).isoformat().replace("+00:00", "Z")
+    window = BlacklistWindowConfig(start=start, end=end, reason="freeze")
+    result = preprocess_series(
+        timestamps=ts,
+        values=vs,
+        step=timedelta(minutes=1),
+        config=_config_with_blacklist([window]),
+    )
+    assert result.dropped
+    assert result.drop_reason == "blacklist_removed_all_samples"
+    assert result.blacklisted_samples == {"freeze": 30}
+
+
+def test_blacklist_rejects_malformed_window() -> None:
+    with pytest.raises(ValueError, match="ISO-8601"):
+        BlacklistWindowConfig(start="2024-11-29", end="2024-11-30")
+
+    with pytest.raises(ValueError, match="MM-DDTHH"):
+        BlacklistWindowConfig(
+            start="11-29",
+            end="11-30",
+            recurring="annual",
+        )
+
+
+def test_blacklist_annual_window_anchored_in_local_timezone() -> None:
+    """An annual window configured with ``timezone: America/New_York``
+    should flip at local midnight, not UTC-midnight. A hard test: a
+    sample at 04:00 UTC on Jan 1 is 23:00 on Dec 31 in NYC and must
+    be EXCLUDED from a ``01-01T00:00`` → ``01-02T00:00`` NYC window;
+    a sample at 06:00 UTC (01:00 NYC) is INSIDE the window.
+    """
+    # Pick two samples around midnight-NYC on New Year's Day 2025.
+    # NYC is UTC-5 in January (EST).
+    ts = [
+        datetime(2025, 1, 1, 4, 0, tzinfo=UTC),  # 23:00 EST on Dec 31 - OUTSIDE
+        datetime(2025, 1, 1, 6, 0, tzinfo=UTC),  # 01:00 EST on Jan 1  - INSIDE
+        datetime(2025, 1, 2, 4, 0, tzinfo=UTC),  # 23:00 EST on Jan 1  - INSIDE
+        datetime(2025, 1, 2, 6, 0, tzinfo=UTC),  # 01:00 EST on Jan 2  - OUTSIDE
+    ]
+    values = [1.0, 2.0, 3.0, 4.0]
+    window = BlacklistWindowConfig(
+        start="01-01T00:00",
+        end="01-02T00:00",
+        recurring="annual",
+        timezone="America/New_York",
+        reason="ny_newyear",
+    )
+    result = preprocess_series(
+        timestamps=ts,
+        values=values,
+        step=timedelta(hours=2),
+        config=_config_with_blacklist([window]),
+    )
+    # Two samples (the 06:00 UTC and the 04:00 UTC the next day) fall
+    # inside the local-midnight-to-local-midnight window.
+    assert result.blacklisted_samples == {"ny_newyear": 2}
+
+
+def test_blacklist_annual_unknown_timezone_is_skipped() -> None:
+    """An unparseable timezone should not crash the fit pipeline.
+
+    The pydantic validator does not (yet) check that the timezone is
+    an IANA name; an operator typo would otherwise reach the runtime
+    parser. ``_parse_annual_window`` returns ``None`` on
+    ``ZoneInfoNotFoundError`` and the window is silently skipped so
+    the rest of the series is still fit.
+    """
+    ts, vs = _regular_series(60)
+    window = BlacklistWindowConfig(
+        start="01-01T00:00",
+        end="01-02T00:00",
+        recurring="annual",
+        timezone="Not/A_Real_Zone",
+    )
+    result = preprocess_series(
+        timestamps=ts,
+        values=vs,
+        step=timedelta(minutes=1),
+        config=_config_with_blacklist([window]),
+    )
+    # The window failed to expand; no samples dropped, no counter ticks.
+    assert result.blacklisted_samples == {}
+    assert not result.dropped

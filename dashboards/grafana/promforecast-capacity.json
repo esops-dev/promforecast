@@ -402,6 +402,57 @@
           }
         ]
       }
+    },
+    {
+      "type": "table",
+      "id": 9,
+      "title": "Capacity ETAs ranked by cost of action",
+      "description": "Joins ``forecast_time_to_threshold_seconds`` with ``forecast_threshold_action_cost`` on (id, group, name) and sorts by cost descending — so 'soon-and-expensive' rows surface above 'soon-and-cheap' ones. Only thresholds with an ``action_cost`` annotation contribute. ``type`` is operator free text (usd, eur, engineer_hours, ...); pin the panel to a single ``type`` if your fleet mixes units.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 9, "w": 24, "x": 0, "y": 48 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "forecast_threshold_action_cost{group=~\"$group\",id=~\"$id\"}",
+          "legendFormat": "{{id}} / {{name}}",
+          "format": "table",
+          "instant": true
+        },
+        {
+          "refId": "B",
+          "expr": "max by (id, group, name) (forecast_time_to_threshold_seconds{group=~\"$group\",id=~\"$id\"})",
+          "legendFormat": "{{id}} / {{name}}",
+          "format": "table",
+          "instant": true
+        }
+      ],
+      "transformations": [
+        { "id": "merge", "options": {} },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": { "Time": true, "__name__": true, "job": true, "instance": true },
+            "renameByName": {
+              "id": "metric",
+              "group": "group",
+              "name": "threshold",
+              "type": "cost type",
+              "Value #A": "action cost",
+              "Value #B": "ETA (s)"
+            }
+          }
+        },
+        { "id": "sortBy", "options": { "fields": {}, "sort": [{ "field": "action cost", "desc": true }] } }
+      ],
+      "fieldConfig": {
+        "defaults": { "custom": { "align": "left" } },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "ETA (s)" },
+            "properties": [ { "id": "unit", "value": "s" } ]
+          }
+        ]
+      }
     }
   ]
 }

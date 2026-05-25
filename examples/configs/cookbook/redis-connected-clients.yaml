@@ -1,0 +1,45 @@
+# Cookbook: redis_connected_clients
+#
+# Forecast the connection pool's exhaustion ahead of incidents. A
+# Redis tier that's been quietly accumulating connections eventually
+# hits maxclients and breaks every consumer at once; the time-to-
+# threshold ETA catches that hours before the symptoms.
+
+apiVersion: promforecast.io/v1
+
+datasource:
+  url: http://victoriametrics:8428/
+
+server:
+  refresh_interval: 5m
+
+defaults:
+  lookback: 7d
+  step: 1m
+  horizon: 24h
+  models:
+    - name: AutoETSDamped
+      params:
+        damping_parameter: 0.98
+    - SeasonalNaive
+  season_length: 1440
+  confidence_levels: [95]
+  accuracy:
+    evaluate: true
+    auto_select: true
+
+groups:
+  - name: redis
+    queries:
+      - id: redis_connected_clients
+        promql: |
+          max by (instance) (redis_connected_clients)
+        thresholds:
+          - name: capacity
+            value: 9000              # tune against your maxclients
+            comparator: gt
+            alert_within: 4h
+            severity: critical
+            action_cost:
+              type: priority
+              value: 100

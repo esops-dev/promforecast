@@ -1,0 +1,51 @@
+# Cookbook: node_filesystem_avail_bytes
+#
+# Predict when each mount will run out of space and alert before the
+# pager fires. Pair with a damped-trend model so a brief growth spike
+# doesn't extrapolate into a doomsday forecast.
+
+apiVersion: promforecast.io/v1
+
+datasource:
+  url: http://victoriametrics:8428/
+
+server:
+  refresh_interval: 1h
+
+defaults:
+  lookback: 30d
+  step: 5m
+  horizon: 7d
+  models:
+    - name: AutoETSDamped
+      params:
+        damping_parameter: 0.98
+    - SeasonalNaive
+  season_length: 288
+  confidence_levels: [95]
+  accuracy:
+    evaluate: true
+    auto_select: true
+    fallback_model: SeasonalNaive
+    fallback_mape_threshold: 50
+
+groups:
+  - name: disk_capacity
+    queries:
+      - id: node_filesystem_avail_bytes
+        promql: |
+          node_filesystem_avail_bytes{fstype!~"tmpfs|overlay|squashfs"}
+        thresholds:
+          - name: critical
+            value: 5368709120        # 5 GiB
+            comparator: lt
+            alert_within: 24h
+            severity: critical
+            action_cost:
+              type: usd
+              value: 500             # cost of an emergency cleanup window
+        emission:
+          growth_rate:
+            enabled: true
+            windows: [1d, 7d]
+            units: units_per_second

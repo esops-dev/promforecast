@@ -327,6 +327,87 @@
           }
         ]
       }
+    },
+    {
+      "type": "stat",
+      "id": 40,
+      "title": "Service forecast health (per bucket)",
+      "description": "Aggregated forecast_quality_score per (service, environment, ...) bucket. Off until the operator configures governance.health_score; the value is the mean trustworthiness of the forecasts for that bucket. Red < 0.6 = bucket fails the alert-gate threshold; green > 0.8 = trustworthy. Hover a tile to see the series_count documentation label.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 6, "w": 24, "x": 0, "y": 36 },
+      "targets": [
+        { "refId": "A", "expr": "forecast_service_health_score", "legendFormat": "{{service}} / {{environment}}" }
+      ],
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "orientation": "horizontal",
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "value_and_name"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "min": 0,
+          "max": 1,
+          "decimals": 2,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "yellow", "value": 0.6 },
+              { "color": "green", "value": 0.8 }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "table",
+      "id": 41,
+      "title": "Right-sizing suggestions (ranked by savings)",
+      "description": "Per-workload recommendations from recommendations.resource_sizing. Sorted by savings %. Positive savings = safe to downsize; negative = upsize recommended. Gated by quality_floor so untrustworthy forecasts produce no row. ``confidence`` label categorises the underlying forecast_quality_score.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 9, "w": 24, "x": 0, "y": 42 },
+      "targets": [
+        { "refId": "A", "expr": "forecast_recommended_resource_size", "legendFormat": "{{workload}} / {{kind}}", "format": "table", "instant": true },
+        { "refId": "B", "expr": "forecast_recommended_resource_current", "legendFormat": "{{workload}} / {{kind}}", "format": "table", "instant": true },
+        { "refId": "C", "expr": "forecast_recommended_resource_savings_pct", "legendFormat": "{{workload}} / {{kind}}", "format": "table", "instant": true }
+      ],
+      "transformations": [
+        { "id": "merge", "options": {} },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": { "Time": true, "__name__": true, "job": true, "instance": true },
+            "renameByName": {
+              "workload": "workload",
+              "kind": "kind",
+              "confidence": "confidence",
+              "Value #A": "recommended",
+              "Value #B": "current",
+              "Value #C": "savings %"
+            }
+          }
+        },
+        { "id": "sortBy", "options": { "fields": {}, "sort": [{ "field": "savings %", "desc": true }] } }
+      ],
+      "fieldConfig": {
+        "defaults": { "custom": { "align": "left" } },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "savings %" },
+            "properties": [
+              { "id": "unit", "value": "percent" },
+              { "id": "custom.cellOptions", "value": { "type": "color-text" } },
+              { "id": "thresholds", "value": { "mode": "absolute", "steps": [
+                { "color": "red", "value": null }, { "color": "yellow", "value": 0 }, { "color": "green", "value": 10 }
+              ]}}
+            ]
+          }
+        ]
+      }
     }
   ]
 }

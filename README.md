@@ -53,9 +53,19 @@ path. See [`docs/reference/cli.md`](docs/reference/cli.md) for `promforecast val
 which CI users can run against a config file before merging.
 
 See [`docs/`](docs/) for configuration, model selection, and operational
-guidance. For a real-world deployment — multi-group config, HA values, and
-ready-to-apply ArgoCD/Flux manifests with a reference architecture diagram
-— see [`examples/production/`](examples/production/).
+guidance. Before flipping production traffic, walk
+[`docs/production-checklist.md`](docs/production-checklist.md) — sizing
+tables, reference architectures, and the boxes worth ticking off
+before going live. For a real-world deployment — multi-group config,
+HA values, and ready-to-apply ArgoCD/Flux manifests with a reference
+architecture diagram — see [`examples/production/`](examples/production/).
+
+New to forecasting Prometheus metrics? The
+[`docs/cookbook/`](docs/cookbook/) collection covers the common
+metric families (disk-fill, request rate, Kafka lag, JVM GC, AWS
+spend, ...) with copy-pasteable configs sized for a small fleet and
+companion alert snippets — the fastest path from "I want to forecast
+X" to "X is on a dashboard with an alert".
 
 ## Status
 
