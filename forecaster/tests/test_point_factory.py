@@ -89,9 +89,16 @@ def test_quality_points_skip_models_without_backtest() -> None:
             coverage=1.0,
         )
     )
-    assert len(points) == 1
-    assert points[0].labels["model"] == "AutoARIMA"
-    assert math.isfinite(points[0].score)
+    # Aggregated (``horizon=""``) row + one per-horizon row from the
+    # single backtest result. SeasonalNaive contributes nothing
+    # because it has no backtest data.
+    assert len(points) == 2
+    models = {p.labels["model"] for p in points}
+    assert models == {"AutoARIMA"}
+    horizons = {p.labels.get("horizon", "") for p in points}
+    assert horizons == {"", "1h"}
+    for p in points:
+        assert math.isfinite(p.score)
 
 
 def test_deviation_points_skip_models_without_band_at_level() -> None:

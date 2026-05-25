@@ -1,0 +1,50 @@
+# Cookbook: http_requests_total
+#
+# Forecast request rate per service/endpoint so capacity planning and
+# SLO error-budget projections work from one source of truth. Couple
+# the rate forecast with an SLO block to surface error-budget
+# exhaustion forecasts.
+
+apiVersion: promforecast.io/v1
+
+datasource:
+  url: http://victoriametrics:8428/
+
+server:
+  refresh_interval: 5m
+
+defaults:
+  lookback: 14d
+  step: 1m
+  horizon: 6h
+  models:
+    - AutoARIMA
+    - SeasonalNaive
+  season_length: 1440   # daily seasonality at 1m step
+  confidence_levels: [80, 95]
+  accuracy:
+    evaluate: true
+    auto_select: true
+    horizons: [15m, 1h, 6h]
+  emission:
+    deviation: true
+    quality: true
+
+groups:
+  - name: http_traffic
+    queries:
+      - id: http_requests_rate
+        promql: |
+          sum by (service) (rate(http_requests_total[5m]))
+        # Predictive will-breach gauge: alert before capacity bites.
+        thresholds:
+          - name: capacity_soft
+            value: 5000
+            comparator: gt
+            alert_within: 30m
+            severity: warning
+        emission:
+          growth_rate:
+            enabled: true
+            windows: [1h, 1d]
+            units: percent

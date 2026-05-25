@@ -37,6 +37,11 @@ if TYPE_CHECKING:
 
 Writer = Callable[[str], None]
 
+# Minimum number of configured models required for the disagreement
+# metric to project rows in the cardinality estimate; matches the
+# runtime gate in :mod:`promforecast.runner`.
+_MIN_MODELS_FOR_DISAGREEMENT_ESTIMATE = 2
+
 
 @dataclass(frozen=True)
 class CardinalityEstimate:
@@ -93,6 +98,32 @@ class CardinalityEstimate:
     # Incident recurrence heatmap — fixed 7 (days) * 24 (hours) per
     # opted-in query with ``data_profile: events``.
     incident_recurrence_lines: int
+    # Forecast-to-forecast revision: per-(series, model, horizon)
+    # whenever ``accuracy.horizons`` is configured. Independent of
+    # ``accuracy.evaluate`` because the metric reads the central
+    # forecast at each horizon directly, no backtest needed.
+    revision_lines: int
+    # Model-disagreement: per-(series, horizon) in explicit mode only.
+    # Same gate-shape as ``revision_lines``.
+    disagreement_lines: int
+    # Threshold action-cost: one config-derived gauge row per
+    # threshold with ``action_cost`` configured. Independent of model
+    # / series fan-out — the count is the total of opted-in
+    # thresholds across the live config.
+    action_cost_lines: int
+    # Service-level forecast health composite: bounded by the unique
+    # combinations of ``aggregate_by`` label values across the live
+    # quality_points. We can't know that combinatoric without running,
+    # so we estimate the upper bound at ``series_cap * queries`` (one
+    # bucket per series in the worst case, when every series has a
+    # distinct ``aggregate_by`` tuple) and let the operator narrow
+    # via ``quality_floor`` if it overshoots.
+    service_health_lines: int
+    # Per-workload right-sizing: up to three rows per configured
+    # workload (recommended + optional current + optional savings_pct).
+    # Bounded by the operator's configured workload count; the actual
+    # row count is smaller when ``current_promql`` is unset.
+    resource_sizing_lines: int
     operational_lines: int
 
     @property
@@ -118,16 +149,22 @@ class CardinalityEstimate:
             + self.recommended_window_lines
             + self.deploy_risk_lines
             + self.incident_recurrence_lines
+            + self.revision_lines
+            + self.disagreement_lines
+            + self.action_cost_lines
+            + self.service_health_lines
+            + self.resource_sizing_lines
             + self.operational_lines
         )
 
 
-def run_validate(  # noqa: PLR0915
+def run_validate(  # noqa: PLR0911, PLR0915
     config_path: Path,
     *,
     dry_run: bool = False,
     datasource_url_override: str | None = None,
     strict_cardinality: bool = False,
+    estimate_cost: bool = False,
     out: IO[str] | None = None,
 ) -> int:
     """Validate ``config_path`` and optionally run a sample fit.
@@ -141,6 +178,13 @@ def run_validate(  # noqa: PLR0915
     on a config PR can reject configs whose projected emission exceeds
     ``safety.max_total_series`` before the change ships. The knob is
     opt-in so existing callers keep their advisory behaviour.
+
+    ``estimate_cost`` runs a cheap synthetic-data fit per (group,
+    configured model) pair and prints the expected per-refresh CPU /
+    fit-duration totals. The estimator is deliberately approximate
+    (synthetic data doesn't capture every real-world fit-time
+    distribution); the goal is order-of-magnitude headroom checks at
+    review time rather than a benchmark.
     """
     stream: IO[str] = out if out is not None else sys.stdout
 
@@ -192,6 +236,11 @@ def run_validate(  # noqa: PLR0915
     write(f"  recommended wins   {estimate.recommended_window_lines:>8}")
     write(f"  deploy risk lines  {estimate.deploy_risk_lines:>8}")
     write(f"  incident recur     {estimate.incident_recurrence_lines:>8}")
+    write(f"  revision lines     {estimate.revision_lines:>8}")
+    write(f"  disagreement lines {estimate.disagreement_lines:>8}")
+    write(f"  action cost lines  {estimate.action_cost_lines:>8}")
+    write(f"  service health     {estimate.service_health_lines:>8}")
+    write(f"  resource sizing    {estimate.resource_sizing_lines:>8}")
     write(f"  operational lines  {estimate.operational_lines:>8}")
     write(f"  total              {estimate.total:>8}")
     rc = _handle_cardinality_overshoot(
@@ -203,6 +252,14 @@ def run_validate(  # noqa: PLR0915
     )
     if rc != 0:
         return rc
+
+    if estimate_cost:
+        write("")
+        try:
+            _run_cost_estimate(cfg, write)
+        except Exception as exc:
+            err(f"error: cost estimate failed: {exc}")
+            return 2
 
     if not dry_run:
         return 0
@@ -301,7 +358,18 @@ def _estimate_cardinality(cfg: Config) -> CardinalityEstimate:  # noqa: PLR0912,
         if cfg.defaults.emission.deviation
         else 0
     )
-    quality_lines = queries * series_cap * emitted_models if cfg.defaults.emission.quality else 0
+    # Per-horizon segmentation: each (series, model) emits the aggregated
+    # ``horizon=""`` row plus one row per configured accuracy horizon.
+    # The aggregate row is always emitted (preserves the historical
+    # ``horizon``-less shape so existing alerts continue to bind); the
+    # per-horizon rows only show up when ``accuracy.evaluate: true``
+    # produces backtest results.
+    per_horizon_quality_factor = 1 + (n_horizons if cfg.defaults.accuracy.evaluate else 0)
+    quality_lines = (
+        queries * series_cap * emitted_models * per_horizon_quality_factor
+        if cfg.defaults.emission.quality
+        else 0
+    )
     # Contribution: only emitted for queries that actually configure
     # regressors; the count is the *worst case* assuming every series of
     # those queries fans out one row per regressor. Calendar regressors are
@@ -402,6 +470,19 @@ def _estimate_cardinality(cfg: Config) -> CardinalityEstimate:  # noqa: PLR0912,
         preprocess_lines += queries * n_outlier_methods
     if any_changepoint_on:
         preprocess_lines += queries
+    # Blacklist windows emit ``forecast_input_blacklisted_samples_total``
+    # per (group, query, reason) where ``reason`` is bounded by the
+    # operator's config (one distinct reason per configured window, plus
+    # the empty-string reason for unreasoned windows). The per-query
+    # multiplier is the count of distinct reasons across the group's
+    # blacklist windows — accounted only on groups that actually
+    # configured one.
+    for group in cfg.groups:
+        if not group.preprocess.blacklist_windows:
+            continue
+        distinct_reasons = {w.reason for w in group.preprocess.blacklist_windows}
+        if distinct_reasons:
+            preprocess_lines += len(group.queries) * len(distinct_reasons)
 
     # Count-aware emission clipping: a per-(query, kind=negative|rounded)
     # counter, bounded to 2 lines per query. Charged only against queries
@@ -442,6 +523,24 @@ def _estimate_cardinality(cfg: Config) -> CardinalityEstimate:  # noqa: PLR0912,
                 continue
             drift_lines += series_cap * emitted_models
             drift_lines += 1  # the per-(group, query) alert counter row
+
+    # Revision magnitude: per-(series, model, horizon). The runtime
+    # only requires ``accuracy.horizons`` to be configured — backtest
+    # ``evaluate`` is *not* a gate, because the metric reads the
+    # central forecast at each horizon directly, without needing
+    # backtest results. First-fit rows are NaN and dropped at render,
+    # so the worst case is the steady-state row count.
+    revision_lines = queries * series_cap * emitted_models * n_horizons if n_horizons else 0
+    # Model disagreement: per-(series, horizon). Only emitted in
+    # explicit mode (auto_select == False) with 2+ configured models.
+    # Same gate-shape as revision: needs configured horizons, not
+    # ``accuracy.evaluate``. ``auto_select == "ensemble"`` counts as
+    # active (only the ensemble row is emitted, so there's no
+    # cross-model spread to score).
+    auto_select_active = cfg.defaults.accuracy.auto_select is not False
+    disagreement_lines = 0
+    if n_horizons and not auto_select_active and n_models >= _MIN_MODELS_FOR_DISAGREEMENT_ESTIMATE:
+        disagreement_lines = queries * series_cap * n_horizons
 
     # Empirical band coverage. ``forecast_band_empirical_coverage`` is
     # per (series, model, level, window) for opted-in queries.
@@ -491,6 +590,40 @@ def _estimate_cardinality(cfg: Config) -> CardinalityEstimate:  # noqa: PLR0912,
             if q.data_profile == "events":
                 incident_recurrence_lines += event_buckets
 
+    # Threshold action-cost: one config-derived line per threshold
+    # with ``action_cost`` configured. Bounded by the operator's
+    # configured threshold count; no model / series fan-out.
+    action_cost_lines = 0
+    for group in cfg.groups:
+        for q in group.queries:
+            action_cost_lines += sum(1 for t in q.thresholds if t.action_cost is not None)
+
+    # Service-level forecast health composite. Worst-case upper bound:
+    # one bucket per quality_point (which is per (series, model,
+    # horizon)). The realistic count is far smaller (operators
+    # aggregate by 1-2 labels with low cardinality) but we can't
+    # introspect the live label values from config alone.
+    service_health_lines = 0
+    if cfg.governance.health_score is not None:
+        # ``per_horizon_quality_factor`` was computed earlier — one
+        # quality row per emitted (model, horizon) per series. Upper
+        # bound is the quality_lines total itself.
+        service_health_lines = quality_lines
+
+    # Right-sizing: up to three rows per configured workload entry —
+    # the primary recommended gauge plus the optional current /
+    # savings_pct siblings (only emitted when ``current_promql`` is set
+    # on the entry). Bounded by the operator's configured workload count.
+    resource_sizing_lines = 0
+    rs_cfg = cfg.recommendations.resource_sizing
+    if rs_cfg.enabled:
+        for workload in rs_cfg.workloads:
+            # One row for the recommended gauge plus up to two more
+            # for the optional sibling pair.
+            resource_sizing_lines += 1
+            if workload.current_promql is not None:
+                resource_sizing_lines += 2  # current + savings_pct
+
     # Operational: 7 gauges + N reasons per group; we ballpark 7 per group.
     # The runner also emits per-(group, query) rows of
     # ``forecast_query_run_duration_seconds`` and
@@ -524,6 +657,11 @@ def _estimate_cardinality(cfg: Config) -> CardinalityEstimate:  # noqa: PLR0912,
         recommended_window_lines=recommended_window_lines,
         deploy_risk_lines=deploy_risk_lines,
         incident_recurrence_lines=incident_recurrence_lines,
+        revision_lines=revision_lines,
+        disagreement_lines=disagreement_lines,
+        action_cost_lines=action_cost_lines,
+        service_health_lines=service_health_lines,
+        resource_sizing_lines=resource_sizing_lines,
         operational_lines=operational_lines,
     )
 
@@ -703,3 +841,169 @@ def _pandas_freq_seconds(seconds: int) -> str:
     if seconds % 60 == 0:
         return f"{seconds // 60}min"
     return f"{seconds}s"
+
+
+@dataclass(frozen=True)
+class CostEstimate:
+    """One group's projected per-refresh resource budget.
+
+    All numbers are best-effort: the per-(group, model) fit time is
+    measured against a synthetic sinusoid + trend series, which is
+    smoother than typical production input but captures the AutoARIMA
+    /AutoETS / SeasonalNaive cost order-of-magnitude. The estimator's
+    purpose is to catch *config-level* surprises (e.g. AutoARIMA on
+    14 days of 5-minute data over 500 series) at review time, not to
+    benchmark a deployment.
+    """
+
+    group: str
+    refresh_interval_seconds: float
+    estimated_series: int
+    per_fit_seconds_by_model: dict[str, float]
+    total_fit_seconds_per_refresh: float
+    peak_memory_bytes: int
+
+
+def _run_cost_estimate(cfg: Config, write: Writer) -> None:
+    """Print a per-group fit-time + memory budget."""
+    write("Estimated runtime cost (synthetic-data fit per model):")
+    write(
+        "  Note: estimator is order-of-magnitude only — synthetic input doesn't "
+        "capture every real fit-time shape. Treat as a sanity check, not a benchmark."
+    )
+    write("")
+    estimates = list(_estimate_runtime_cost(cfg))
+    if not estimates:
+        write("  (no groups to estimate)")
+        return
+    total_seconds = 0.0
+    for est in estimates:
+        write(f"  group {est.group}:")
+        write(f"    refresh_interval         {est.refresh_interval_seconds:>10.1f}s")
+        write(f"    estimated series         {est.estimated_series:>10d}")
+        for model_name, seconds in sorted(est.per_fit_seconds_by_model.items()):
+            write(f"    per-fit {model_name:<20}{seconds:>10.3f}s")
+        write(f"    total fit time / refresh {est.total_fit_seconds_per_refresh:>10.2f}s")
+        write(f"    peak memory (tracemalloc){est.peak_memory_bytes:>10d} bytes")
+        if (
+            est.refresh_interval_seconds > 0
+            and est.total_fit_seconds_per_refresh > est.refresh_interval_seconds
+        ):
+            write(
+                "    WARN: projected fit time exceeds refresh_interval — "
+                "the group cannot keep up at the configured cadence."
+            )
+        total_seconds += est.total_fit_seconds_per_refresh
+    write("")
+    write(f"  total fit time across groups (per refresh): {total_seconds:.2f}s")
+
+
+def _estimate_runtime_cost(cfg: Config) -> list[CostEstimate]:
+    """Time each configured model against synthetic data; project per-refresh totals.
+
+    ``defaults.models`` is config-global, so each model is fit exactly
+    once against the synthetic data and the resulting timings are reused
+    across every group. Without this, an N-group x M-model config would
+    run NxM identical fits where M would suffice — turning a 30-second
+    validate into multiple minutes on realistic configs.
+
+    Per-fit peak memory is captured via :mod:`tracemalloc` (Python's
+    allocator-level peak), which gives an honest per-block number
+    instead of the process-wide RSS that monotonically grows across
+    fits and makes the second group's "peak" always meaningless.
+    """
+    import tracemalloc  # noqa: PLC0415
+
+    import numpy as np  # noqa: PLC0415
+    import pandas as pd  # noqa: PLC0415
+
+    from . import models as model_registry  # noqa: PLC0415
+
+    series_cap = cfg.safety.max_series_per_query
+    # Synthetic dataset: 720 hourly points (~30d) — enough for AutoARIMA
+    # to do real work but small enough to keep the estimator cheap. The
+    # signal is a daily sinusoid + linear trend + light noise so the
+    # statsforecast fit isn't trivially degenerate.
+    n_points = 720
+    rng = np.random.default_rng(seed=42)
+    timestamps = pd.date_range("2024-01-01", periods=n_points, freq="1h")
+    base = (
+        np.sin(np.arange(n_points) * 2 * math.pi / 24) * 10.0
+        + np.arange(n_points) * 0.01
+        + rng.normal(0, 0.5, n_points)
+        + 100.0
+    )
+    df = pd.DataFrame({"unique_id": ["s"] * n_points, "ds": timestamps, "y": base})
+    levels = list(cfg.defaults.confidence_levels)
+    horizon = 24
+    freq = "1h"
+
+    # Fit each model once and capture the per-fit wall-clock and the
+    # tracemalloc peak attributable to that fit alone.
+    per_fit_times: dict[str, float] = {}
+    per_fit_memory: dict[str, int] = {}
+    tracemalloc.start()
+    try:
+        for spec in cfg.defaults.models:
+            try:
+                model = model_registry.build(
+                    spec.name,
+                    season_length=cfg.defaults.season_length,
+                    params=spec.params,
+                )
+            except Exception:
+                # Model wasn't registered (typo, missing plug-in). Skip
+                # without crashing — validate also reports config-level
+                # errors elsewhere.
+                continue
+            tracemalloc.reset_peak()
+            t0 = time.monotonic()
+            try:
+                _ = model.fit_predict(df=df, horizon=horizon, freq=freq, levels=levels)
+            except Exception:
+                # Real fit failures are noisy — store NaN so the
+                # operator sees "couldn't measure" rather than a
+                # spurious zero.
+                per_fit_times[spec.name] = float("nan")
+                per_fit_memory[spec.name] = 0
+                continue
+            per_fit_times[spec.name] = time.monotonic() - t0
+            _, peak = tracemalloc.get_traced_memory()
+            per_fit_memory[spec.name] = int(peak)
+    finally:
+        tracemalloc.stop()
+
+    out: list[CostEstimate] = []
+    for group in cfg.groups:
+        # Refresh interval can come from the per-query override; if no
+        # queries exist we fall back to the server default.
+        if group.queries:
+            refresh_interval = config_module.effective_refresh_interval(
+                group.queries[0], cfg.server
+            ).total_seconds()
+        else:
+            refresh_interval = cfg.server.refresh_interval.total_seconds()
+        # Each query fits every configured model once per series; in
+        # auto-select mode only the winner emits but every candidate is
+        # still backtested. The estimate sums per-fit cost across
+        # configured models and projects to the per-query series cap.
+        per_query_fit_time = sum(v for v in per_fit_times.values() if math.isfinite(v))
+        queries = len(group.queries)
+        total = per_query_fit_time * queries * series_cap
+        # Peak memory attributable to a fit in this group: the max
+        # per-fit allocation peak across the configured models. Since
+        # ``defaults.models`` is global, the per-model peak is the same
+        # in every group, but the field shape preserves the per-group
+        # report so a downstream UI can render it per row.
+        peak_memory = max(per_fit_memory.values(), default=0)
+        out.append(
+            CostEstimate(
+                group=group.name,
+                refresh_interval_seconds=refresh_interval,
+                estimated_series=series_cap * queries,
+                per_fit_seconds_by_model=dict(per_fit_times),
+                total_fit_seconds_per_refresh=total,
+                peak_memory_bytes=peak_memory,
+            )
+        )
+    return out

@@ -129,12 +129,98 @@ def test_cardinality_estimate_matches_doc_formula() -> None:
     assert est.accuracy_lines == 1 * 100 * 2 * 2 * 2
     # 1 * 100 * 2 emitted * 2 levels * 2 (ratio + outside) = 800.
     assert est.deviation_lines == 1 * 100 * 2 * 2 * 2
-    # 1 * 100 * 2 emitted = 200.
-    assert est.quality_lines == 1 * 100 * 2
+    # 1 * 100 * 2 emitted * (1 aggregated + 2 horizons) = 600.
+    # Per-horizon quality segmentation; existing alerts gating on
+    # ``horizon=""`` keep matching the aggregated row.
+    assert est.quality_lines == 1 * 100 * 2 * (1 + 2)
+    # Revision: 1 * 100 * 2 emitted * 2 horizons = 400 (steady-state;
+    # first-fit NaN rows are dropped at render).
+    assert est.revision_lines == 1 * 100 * 2 * 2
+    # Disagreement: 1 * 100 * 2 horizons = 200 (explicit mode, 2+ models).
+    assert est.disagreement_lines == 1 * 100 * 2
     # Without thresholds / growth-rate emission, the capacity families
     # contribute zero to the estimate.
     assert est.threshold_eta_lines == 0
     assert est.growth_rate_lines == 0
+
+
+def test_revision_and_disagreement_lines_dont_gate_on_evaluate() -> None:
+    """Revision + disagreement emit on configured horizons, regardless of evaluate.
+
+    Reading the central forecast at each horizon needs no backtest;
+    the runtime emits these metrics even when ``accuracy.evaluate``
+    is off. The estimator must match the runtime, or the
+    ``--strict-cardinality`` gate falsely lets oversized configs
+    through when the operator has explicitly disabled backtesting.
+    """
+    from datetime import timedelta  # noqa: PLC0415
+
+    from promforecast.config import (  # noqa: PLC0415
+        AccuracyConfig,
+        Config,
+        DatasourceConfig,
+        DefaultsConfig,
+        GroupConfig,
+        QueryConfig,
+        SafetyConfig,
+        ServerConfig,
+    )
+
+    cfg = Config(
+        datasource=DatasourceConfig(url="http://x"),
+        server=ServerConfig(),
+        safety=SafetyConfig(max_series_per_query=10, max_total_series=0),
+        defaults=DefaultsConfig(
+            models=["AutoARIMA", "SeasonalNaive"],
+            confidence_levels=[80],
+            accuracy=AccuracyConfig(
+                evaluate=False,
+                horizons=[timedelta(hours=1), timedelta(hours=24)],
+                auto_select=False,
+            ),
+        ),
+        groups=[GroupConfig(name="g", queries=[QueryConfig(id="m", promql="up")])],
+    )
+    est = _estimate_cardinality(cfg)
+    # 1 query * 10 series * 2 emitted models * 2 horizons = 40.
+    assert est.revision_lines == 40
+    # Explicit mode + 2 models: 1 * 10 * 2 horizons = 20.
+    assert est.disagreement_lines == 20
+
+
+def test_disagreement_lines_suppressed_under_auto_select() -> None:
+    """auto_select (including ensemble) suppresses model_disagreement entirely."""
+    from datetime import timedelta  # noqa: PLC0415
+
+    from promforecast.config import (  # noqa: PLC0415
+        AccuracyConfig,
+        Config,
+        DatasourceConfig,
+        DefaultsConfig,
+        GroupConfig,
+        QueryConfig,
+        SafetyConfig,
+        ServerConfig,
+    )
+
+    for selector in (True, "ensemble"):
+        cfg = Config(
+            datasource=DatasourceConfig(url="http://x"),
+            server=ServerConfig(),
+            safety=SafetyConfig(max_series_per_query=10, max_total_series=0),
+            defaults=DefaultsConfig(
+                models=["AutoARIMA", "SeasonalNaive"],
+                confidence_levels=[80],
+                accuracy=AccuracyConfig(
+                    evaluate=True,
+                    horizons=[timedelta(hours=1)],
+                    auto_select=selector,
+                ),
+            ),
+            groups=[GroupConfig(name="g", queries=[QueryConfig(id="m", promql="up")])],
+        )
+        est = _estimate_cardinality(cfg)
+        assert est.disagreement_lines == 0, f"auto_select={selector!r} must suppress disagreement"
 
 
 def test_cardinality_estimate_counts_threshold_and_growth_rate_lines() -> None:
@@ -197,6 +283,163 @@ def test_cardinality_estimate_counts_threshold_and_growth_rate_lines() -> None:
     assert est.threshold_eta_lines == 100 * 1 * 2 * (1 + 2)
     # 100 series * 1 model * 2 windows = 200.
     assert est.growth_rate_lines == 100 * 1 * 2
+
+
+def test_cardinality_estimate_counts_service_health_only_when_enabled() -> None:
+    """``governance.health_score`` configured => bounded estimate; absent => zero."""
+    from datetime import timedelta  # noqa: PLC0415
+
+    from promforecast.config import (  # noqa: PLC0415
+        AccuracyConfig,
+        Config,
+        DatasourceConfig,
+        DefaultsConfig,
+        EmissionConfig,
+        GovernanceConfig,
+        GroupConfig,
+        HealthScoreConfig,
+        QueryConfig,
+        SafetyConfig,
+        ServerConfig,
+    )
+
+    def _build(governance: GovernanceConfig) -> Config:
+        return Config(
+            datasource=DatasourceConfig(url="http://x"),
+            server=ServerConfig(),
+            safety=SafetyConfig(max_series_per_query=100, max_total_series=0),
+            defaults=DefaultsConfig(
+                models=["AutoARIMA"],
+                confidence_levels=[80],
+                accuracy=AccuracyConfig(
+                    evaluate=True,
+                    auto_select=False,
+                    horizons=[timedelta(hours=1)],
+                ),
+                emission=EmissionConfig(quality=True),
+            ),
+            groups=[GroupConfig(name="g", queries=[QueryConfig(id="m", promql="up")])],
+            governance=governance,
+        )
+
+    off = _estimate_cardinality(_build(GovernanceConfig()))
+    on = _estimate_cardinality(
+        _build(GovernanceConfig(health_score=HealthScoreConfig(aggregate_by=["service"])))
+    )
+    assert off.service_health_lines == 0
+    # Upper bound matches the quality_lines total when the feature is on
+    # (one bucket per quality_point in the worst case).
+    assert on.service_health_lines == on.quality_lines
+    assert on.service_health_lines > 0
+
+
+def test_cardinality_estimate_counts_resource_sizing_rows() -> None:
+    """Right-sizing charges 1 row per workload, plus 2 more when ``current_promql`` is set."""
+    from promforecast.config import (  # noqa: PLC0415
+        Config,
+        DatasourceConfig,
+        DefaultsConfig,
+        GroupConfig,
+        QueryConfig,
+        RecommendationsConfig,
+        ResourceSizingConfig,
+        ResourceSizingWorkloadConfig,
+        SafetyConfig,
+        ServerConfig,
+    )
+
+    cfg = Config(
+        datasource=DatasourceConfig(url="http://x"),
+        server=ServerConfig(),
+        safety=SafetyConfig(max_series_per_query=10, max_total_series=0),
+        defaults=DefaultsConfig(models=["AutoARIMA"]),
+        groups=[GroupConfig(name="g", queries=[QueryConfig(id="svc", promql="up")])],
+        recommendations=RecommendationsConfig(
+            resource_sizing=ResourceSizingConfig(
+                enabled=True,
+                workloads=[
+                    # No current_promql -> 1 line (recommended only).
+                    ResourceSizingWorkloadConfig(workload="api", kind="cpu", forecast_query="svc"),
+                    # current_promql wired -> 3 lines (recommended + current + savings_pct).
+                    ResourceSizingWorkloadConfig(
+                        workload="api",
+                        kind="memory",
+                        forecast_query="svc",
+                        current_promql="kube_pod_container_resource_requests",
+                    ),
+                ],
+            )
+        ),
+    )
+    est = _estimate_cardinality(cfg)
+    # 1 (cpu, recommended only) + 3 (memory, recommended + current + savings_pct) = 4.
+    assert est.resource_sizing_lines == 4
+
+
+def test_cardinality_estimate_counts_action_cost_only_for_opted_in() -> None:
+    """``forecast_threshold_action_cost`` charges one line per opted-in threshold.
+
+    Independent of model / series / level fan-out — the metric is
+    config-derived. Thresholds without ``action_cost`` configured must
+    not contribute to the cardinality budget.
+    """
+    from datetime import timedelta  # noqa: PLC0415
+
+    from promforecast.config import (  # noqa: PLC0415
+        AccuracyConfig,
+        ActionCostConfig,
+        Config,
+        DatasourceConfig,
+        DefaultsConfig,
+        GroupConfig,
+        QueryConfig,
+        SafetyConfig,
+        ServerConfig,
+        ThresholdConfig,
+    )
+
+    cfg = Config(
+        datasource=DatasourceConfig(url="http://x"),
+        server=ServerConfig(),
+        safety=SafetyConfig(max_series_per_query=100, max_total_series=0),
+        defaults=DefaultsConfig(
+            models=["AutoARIMA"],
+            confidence_levels=[80, 95],
+            accuracy=AccuracyConfig(
+                evaluate=False,
+                auto_select=False,
+                horizons=[timedelta(hours=1)],
+            ),
+        ),
+        groups=[
+            GroupConfig(
+                name="g",
+                queries=[
+                    QueryConfig(
+                        id="m",
+                        promql="up",
+                        thresholds=[
+                            ThresholdConfig(
+                                name="warn",
+                                value=80,
+                                action_cost=ActionCostConfig(type="usd", value=50.0),
+                            ),
+                            ThresholdConfig(
+                                name="crit",
+                                value=95,
+                                action_cost=ActionCostConfig(type="usd", value=50_000.0),
+                            ),
+                            # No action_cost — must not contribute.
+                            ThresholdConfig(name="info", value=50),
+                        ],
+                    ),
+                ],
+            )
+        ],
+    )
+    est = _estimate_cardinality(cfg)
+    # 2 thresholds opted in x 1 row each = 2 lines (no series fan-out).
+    assert est.action_cost_lines == 2
 
 
 def test_cardinality_estimate_counts_conditional_calibration_when_conformal_on() -> None:

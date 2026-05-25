@@ -150,7 +150,15 @@ FIXTURE: dict[str, list[dict[str, str]]] = {
         ),
     ],
     "forecast_quality_score": [
-        _with(_SNAPSHOT_OP_LABELS, group=g, id=i, model=m, model_fallback=mf, cold_start="false")
+        _with(
+            _SNAPSHOT_OP_LABELS,
+            group=g,
+            id=i,
+            model=m,
+            model_fallback=mf,
+            cold_start="false",
+            horizon=h,
+        )
         for g, i, m in [
             ("node_capacity", "node_cpu_busy_pct", "AutoARIMA"),
             ("node_capacity", "node_memory_used_bytes", "SeasonalNaive"),
@@ -160,6 +168,13 @@ FIXTURE: dict[str, list[dict[str, str]]] = {
         # (filters on ``model_fallback="true"``) and the cold-start /
         # quality alerts (filter on ``cold_start!="true"``) both resolve.
         for mf in ("false", "true")
+        # Aggregated (``horizon=""``) + per-horizon ("1h"/"24h") rows
+        # match the per-horizon emission shape. Example alerts gate
+        # explicitly on ``horizon=""`` for back-compat with the
+        # historical horizon-less behaviour, but the fixture carries
+        # the per-horizon rows too so any rule that opts into a
+        # specific horizon resolves cleanly.
+        for h in ("", "1h", "24h")
     ],
     "forecast_deviation_outside_band": [
         _with(_SNAPSHOT_OP_LABELS, group=g, id=i, model=m, level=lvl)
@@ -316,6 +331,139 @@ FIXTURE: dict[str, list[dict[str, str]]] = {
         )
         for d in (0, 1, 2)
         for h in (0, 12, 23)
+    ],
+    # Per-(series, model) staleness gauge. Snapshot-only, so it carries
+    # the forecaster scrape labels alongside the source-side labels the
+    # forecast emission picked up.
+    "forecast_data_staleness_seconds": [
+        _with(
+            _SNAPSHOT_OP_LABELS,
+            id=i,
+            group=g,
+            model=m,
+            instance="node-exporter:9100",
+        )
+        for g, i, m in [
+            ("node_capacity", "node_cpu_busy_pct", "AutoARIMA"),
+            ("node_capacity", "node_memory_used_bytes", "SeasonalNaive"),
+            ("node_storage", "node_filesystem_avail_bytes", "AutoARIMA"),
+        ]
+    ],
+    # Forecast-stability families. Both carry the forecaster scrape
+    # labels alongside the source-side labels.
+    "forecast_revision_magnitude": [
+        _with(
+            _SNAPSHOT_OP_LABELS,
+            id=i,
+            group=g,
+            model=m,
+            horizon=h,
+            instance="node-exporter:9100",
+        )
+        for g, i, m in [
+            ("node_capacity", "node_cpu_busy_pct", "AutoARIMA"),
+            ("node_storage", "node_filesystem_avail_bytes", "AutoARIMA"),
+        ]
+        for h in ("1h", "24h")
+    ],
+    "forecast_model_disagreement": [
+        _with(
+            _SNAPSHOT_OP_LABELS,
+            id=i,
+            group=g,
+            horizon=h,
+            instance="node-exporter:9100",
+        )
+        for g, i in [
+            ("node_capacity", "node_cpu_busy_pct"),
+            ("node_storage", "node_filesystem_avail_bytes"),
+        ]
+        for h in ("1h", "24h")
+    ],
+    # Self-observability families.
+    "forecast_model_fit_success_ratio": [
+        _with(_SNAPSHOT_OP_LABELS, group=g, model=m, window=w)
+        for g, m in [
+            ("node_capacity", "AutoARIMA"),
+            ("node_capacity", "SeasonalNaive"),
+            ("node_storage", "AutoARIMA"),
+        ]
+        for w in ("1h", "24h")
+    ],
+    "forecast_regressor_stability_score": [
+        _with(_SNAPSHOT_OP_LABELS, group=g, query=q, regressor_id=r)
+        for g, q, r in [
+            ("node_capacity", "node_cpu_busy_pct", "deploys"),
+            ("node_storage", "node_filesystem_avail_bytes", "deploys"),
+        ]
+    ],
+    # Degraded-mode families. Source retries and sink-failure aggregate
+    # ship on /metrics only (snapshot path), so they carry the forecaster
+    # scrape labels. The snapshot-age gauge mirrors
+    # ``forecast_last_run_timestamp_seconds`` and is one row per group.
+    "forecast_source_retries_total": [
+        _with(_SNAPSHOT_OP_LABELS, reason=r) for r in ("transport", "http_5xx")
+    ],
+    "forecast_sink_write_failures_total": [
+        _with(_SNAPSHOT_OP_LABELS, reason=r) for r in ("timeout", "http_error", "unexpected")
+    ],
+    "forecast_snapshot_age_seconds": [
+        _with(_SNAPSHOT_OP_LABELS, group=g) for g in ("node_capacity", "node_storage")
+    ],
+    "forecast_failures_total": [
+        _with(_SNAPSHOT_OP_LABELS, group=g, reason=r)
+        for g in ("node_capacity", "node_storage")
+        for r in ("query_error", "query_timeout", "fit_error", "fit_timeout")
+    ],
+    # Governance / drift-explainer families. Snapshot-only emission
+    # so they carry the scrape-side labels.
+    "forecast_service_health_score": [
+        _with(
+            _SNAPSHOT_OP_LABELS,
+            service=s,
+            environment=e,
+            aggregator="weighted_mean",
+            weight_by="forecast_series_count",
+            series_count=str(c),
+        )
+        for s, e, c in [
+            ("checkout", "prod", 42),
+            ("payments", "prod", 18),
+        ]
+    ],
+    "forecast_drift_explained_total": [
+        _with(_SNAPSHOT_OP_LABELS, group=g, query=q, primary_suspect=s)
+        for g, q, s in [
+            ("node_capacity", "node_cpu_busy_pct", "deploys"),
+            ("node_storage", "node_filesystem_avail_bytes", "unknown"),
+        ]
+    ],
+    # Cost-of-action gauge for capacity thresholds. Config-derived;
+    # ``type`` is free-text per spec, but the fixture pins it to USD
+    # to keep the binding deterministic.
+    "forecast_threshold_action_cost": [
+        _with(_SNAPSHOT_OP_LABELS, id=i, group=g, name=n, type="usd")
+        for g, i, n in [
+            ("node_storage", "node_filesystem_avail_bytes", "critical"),
+            ("kafka", "kafka_consumer_lag", "backlog_warn"),
+        ]
+    ],
+    # Right-sizing recommendation family — three sibling gauges,
+    # all keyed on (workload, kind). ``confidence`` rides only on
+    # the recommended + savings_pct emissions; the ``current``
+    # sibling doesn't carry it because operators may want to
+    # graph current size without filtering by confidence band.
+    "forecast_recommended_resource_size": [
+        _with(_SNAPSHOT_OP_LABELS, workload=w, kind=k, confidence="high")
+        for w, k in [("api-server", "cpu"), ("api-server", "memory")]
+    ],
+    "forecast_recommended_resource_current": [
+        _with(_SNAPSHOT_OP_LABELS, workload=w, kind=k)
+        for w, k in [("api-server", "cpu"), ("api-server", "memory")]
+    ],
+    "forecast_recommended_resource_savings_pct": [
+        _with(_SNAPSHOT_OP_LABELS, workload=w, kind=k, confidence="high")
+        for w, k in [("api-server", "cpu"), ("api-server", "memory")]
     ],
 }
 

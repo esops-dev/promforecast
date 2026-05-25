@@ -245,3 +245,101 @@ def _run_fit(
     return model.fit_predict(
         df=df, horizon=horizon, freq=freq, levels=levels, regressors=regressors
     )
+
+
+# Floor for relative-metric denominators across the per-horizon
+# revision + disagreement helpers below; matches the
+# :mod:`promforecast.revision` scale floor.
+_RELATIVE_METRIC_FLOOR = 1e-9
+# Minimum number of distinct finite values required to compute the
+# disagreement coefficient of variation. Two is the smallest mathematically
+# meaningful count; below that there's no spread to measure.
+_MIN_DISAGREEMENT_VALUES = 2
+
+
+def _extract_per_horizon_yhat(forecast: Any, horizon_specs: list[Any]) -> dict[str, float]:
+    """Return ``{horizon_label: yhat_value}`` from a forecast frame.
+
+    ``horizon_specs`` is the list produced by
+    :func:`promforecast.accuracy.horizons_from_durations`. Each entry's
+    ``steps`` is the 1-indexed step count for that horizon — we read
+    row ``steps - 1`` of ``forecast`` for that horizon's yhat. Rows
+    past the end of the frame and non-finite values are skipped.
+    """
+    import math  # noqa: PLC0415
+
+    if forecast is None or len(forecast) == 0:
+        return {}
+    out: dict[str, float] = {}
+    try:
+        yhat_col = forecast["yhat"]
+    except (KeyError, TypeError):
+        return out
+    n = len(forecast)
+    for spec in horizon_specs:
+        idx = int(spec.steps) - 1
+        if idx < 0 or idx >= n:
+            continue
+        try:
+            value = float(yhat_col.iloc[idx])
+        except (KeyError, IndexError, ValueError):
+            continue
+        if not math.isfinite(value):
+            continue
+        out[spec.label] = value
+    return out
+
+
+def _coefficient_of_variation(values: list[float]) -> float:
+    """Coefficient of variation (stddev / |mean|) across ``values``.
+
+    Used as the model-disagreement score: 0 = perfect agreement, higher
+    = more disagreement. Returns ``NaN`` when fewer than 2 finite
+    values are present (no disagreement to measure) or when the mean
+    is too close to zero for the relative metric to be meaningful.
+    """
+    import math  # noqa: PLC0415
+
+    finite = [v for v in values if math.isfinite(v)]
+    if len(finite) < _MIN_DISAGREEMENT_VALUES:
+        return float("nan")
+    mean = sum(finite) / len(finite)
+    denom = abs(mean)
+    if denom < _RELATIVE_METRIC_FLOOR:
+        return float("nan")
+    variance = sum((v - mean) ** 2 for v in finite) / len(finite)
+    return math.sqrt(variance) / denom
+
+
+def _estimate_group_memory_bytes(group_name: str, exporter: Any) -> float:
+    """Best-effort per-group snapshot memory estimate.
+
+    Sums ``sys.getsizeof`` over every list-valued field on the snapshot
+    so the resulting gauge tracks "which group's snapshot is dominant"
+    without pulling in psutil. Fields are discovered via
+    :func:`dataclasses.fields` so a new emission family that adds a
+    ``list`` attribute to :class:`GroupSnapshot` is accounted for
+    without an edit here — the hardcoded-list shape this replaced
+    silently undercounted the snapshot every time a new family
+    landed. The number is still a recursive undercount (Python's
+    object graph isn't fully traversed) and an overcount when point
+    objects are shared across snapshots; intent is comparative, not
+    exact. Falls back to 0.0 when the snapshot is missing.
+    """
+    import dataclasses  # noqa: PLC0415
+    import sys  # noqa: PLC0415
+
+    snapshot = exporter.snapshot_for(group_name)
+    if snapshot is None:
+        return 0.0
+    total = sys.getsizeof(snapshot)
+    if not dataclasses.is_dataclass(snapshot):
+        return float(total)
+    for snap_field in dataclasses.fields(snapshot):
+        items = getattr(snapshot, snap_field.name, None)
+        if not isinstance(items, list) or not items:
+            continue
+        total += sys.getsizeof(items)
+        for item in items:
+            total += sys.getsizeof(item)
+    return float(total)

@@ -1,0 +1,131 @@
+# promforecast-tuner — Helm values.
+#
+# The tuner is a one-shot binary (``promforecast tune ...``) shipped
+# in the same container image as the live forecaster. This sub-chart
+# wires it into a CronJob that runs on a configurable cadence
+# (weekly by default) and pushes recommendation rows
+# (``forecast_recommended_param``) to the configured ``remote_write``
+# sink.
+#
+# Operators read the recommendations from a dedicated Grafana panel
+# and apply them by editing the forecaster's config — there is no
+# auto-apply path.
+
+image:
+  repository: ghcr.io/esops-dev/promforecast
+  # tag: ""             # Defaults to the chart's appVersion when empty.
+  pullPolicy: IfNotPresent
+
+# Cron schedule for the recommendation walk. Weekly (Sunday 02:00 UTC)
+# is a sensible default — it covers a full weekly seasonality cycle of
+# the past 14 days without contending with the typical batch-job
+# window. Switch to a daily cadence for very dynamic workloads or to a
+# monthly one for stable infrastructure metrics.
+schedule: "0 2 * * 0"
+
+# Whether the CronJob is enabled. Disabling lets operators install the
+# chart for dashboards-only (the Grafana panel referenced in
+# ``docs/operations/auto-tuning.md`` works against an empty metric set
+# without errors).
+enabled: true
+
+# Existing ConfigMap carrying the forecaster YAML config. The tuner
+# loads the same config the live forecaster runs against so the
+# baseline (model, season_length) values match exactly.
+#
+# The default ``promforecast`` matches the ConfigMap the standalone
+# ``promforecast`` chart emits when installed under that release
+# name (``helm install promforecast charts/promforecast``). Other
+# install shapes require overriding:
+#
+# * Umbrella ``promforecast-stack`` released as ``stack`` →
+#   ConfigMap is ``stack-promforecast``.
+# * Standalone released as ``pf`` →
+#   ConfigMap is ``pf-promforecast``.
+# * ``existingConfigMap`` set on the forecaster install → use that
+#   ConfigMap name verbatim here.
+configMap:
+  name: "promforecast"
+  key: "config.yaml"
+
+# Override ``sink.remote_write.url`` for the tuner's recommendation
+# push. Leave empty to inherit from the config; useful when running
+# the tuner against a dedicated TSDB endpoint (e.g. a relaxed
+# ``futureRetention`` for the recommendation gauges).
+sinkUrlOverride: ""
+
+# Minimum percentage MAPE improvement a candidate must show over the
+# configured baseline to be emitted as a recommendation. Tune higher
+# for noisy data (avoids small / noisy improvements polluting the
+# panel) and lower when small wins matter.
+minImprovementPct: 5.0
+
+# Lookback window for the grid search. Falls back to
+# ``defaults.lookback`` from the config when null. 14d is the typical
+# choice — covers two weekly cycles without making the per-fit cost
+# explode.
+lookback: null
+
+# Optional list of group names to tune. Empty / null tunes every
+# configured group. Useful for splitting a heavy tuner walk across
+# multiple CronJobs with different schedules.
+groups: []
+
+# Per-pod resource requests / limits. The tuner runs ``N_groups *
+# N_queries * (1 + 2 + (M-1))`` fits per run (baseline + season_length
+# grid + alternative models). Sized for a small fleet by default;
+# bump for deployments with hundreds of queries or expensive
+# models (AutoARIMA on long lookbacks).
+resources:
+  requests:
+    cpu: 200m
+    memory: 512Mi
+  limits:
+    cpu: 1
+    memory: 1Gi
+
+# CronJob concurrency. ``Forbid`` ensures a long-running walk never
+# overlaps with the next schedule — the tuner is best-effort and a
+# missed run is fine; double-running would just push the same
+# recommendations twice. ``startingDeadlineSeconds`` matches the
+# default schedule cadence so a brief cluster outage doesn't fire a
+# stale catch-up run.
+concurrencyPolicy: Forbid
+startingDeadlineSeconds: 3600
+successfulJobsHistoryLimit: 1
+failedJobsHistoryLimit: 3
+
+# Activation deadline for a single tuner run. A walk that takes
+# longer than this is killed by the kubelet; the next schedule fires
+# normally. Sized comfortably above the typical run time (single
+# digits of minutes per group).
+activeDeadlineSeconds: 1800
+backoffLimit: 2
+restartPolicy: Never
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+# Pod security context. The tuner doesn't need anything special —
+# runs as a non-root user, no privileged operations.
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+
+nameOverride: ""
+fullnameOverride: ""
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+# Extra environment variables to inject into the CronJob pod. Useful
+# for passing through proxy settings or auth tokens that the tuner's
+# datasource / sink need.
+extraEnv: []
+  # - name: HTTP_PROXY
+  #   value: "http://proxy.internal:3128"

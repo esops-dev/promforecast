@@ -170,6 +170,71 @@ same labelset is the operator-visible "when" for the breach. See
 `examples/alerts/promforecast-rules.yaml` for the `ForecastWillBreach`
 rule template.
 
+### Ranking by cost of action
+
+`time_to_threshold_seconds` alone tells you *which* capacity event is
+closest. It does not tell you which one is most expensive to ignore.
+Add an `action_cost` annotation to surface a cost gauge that dashboards
+and alerts can multiplex against the ETA:
+
+```yaml
+queries:
+  - id: object_storage_used_bytes
+    promql: sum by (bucket) (object_storage_used_bytes)
+    thresholds:
+      - name: critical
+        value: 1099511627776   # 1 TiB
+        comparator: gt
+        alert_within: 7d
+        severity: critical
+        action_cost:
+          type: usd
+          value: 50000          # tier-upgrade cost if we breach
+      - name: backup_warn
+        value: 5368709120       # 5 GiB
+        comparator: gt
+        action_cost:
+          type: usd
+          value: 50              # nightly archive purge cost
+```
+
+| Field   | Required | Meaning                                                                                                |
+|---------|----------|--------------------------------------------------------------------------------------------------------|
+| `type`  | yes      | Free-text label. Use a currency (`usd`, `eur`) or a non-monetary unit (`engineer_hours`, `priority`).  |
+| `value` | yes      | Numeric cost. Must be `> 0` — zero or negative values would silently rank below every meaningful row.  |
+
+Output:
+
+```
+forecast_threshold_action_cost{
+  id="object_storage_used_bytes", group="capacity",
+  name="critical", type="usd"
+} 50000
+```
+
+The gauge is config-derived: one row per `(group, query, threshold)`
+with `action_cost` configured, independent of model / series fan-out.
+A threshold removed from YAML disappears from `/metrics` on the next
+refresh (the family is rebuilt from current config each run).
+
+Rank by cost in Grafana:
+
+```promql
+# Top 10 capacity events by cost-to-ignore — gated to "within 24h".
+topk(
+  10,
+  forecast_threshold_action_cost
+  * on(id, group, name) group_left()
+  (forecast_time_to_threshold_seconds < 86400)
+)
+```
+
+`type` is free text on purpose: `usd` and `engineer_hours` coexist in
+a single family so different teams can rank by their own currency
+without forking the metric. Pin the label in your queries
+(`forecast_threshold_action_cost{type="usd"}`) so a panel reports a
+single currency and never sums apples with oranges.
+
 ## Forecast growth rate
 
 Configure per-query growth-rate emission to publish how fast the
@@ -291,6 +356,8 @@ All the capacity-style families count against the global
 - Will-breach: `N_series × N_models × N_thresholds_with_alert × (1 + N_levels)`
   per query — only thresholds with `alert_within` + `severity` count.
 - Growth rate: `N_series × N_models × N_windows` per query that opts in.
+- Action cost: one line per threshold with `action_cost` configured.
+  No model / series fan-out — the metric is config-derived.
 
 Run `promforecast validate config.yaml` after adding thresholds or
 growth-rate emission to confirm the new totals fit within your safety

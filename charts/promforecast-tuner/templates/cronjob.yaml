@@ -1,0 +1,85 @@
+{{- if .Values.enabled }}
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "promforecast-tuner.fullname" . }}
+  labels:
+    {{- include "promforecast-tuner.labels" . | nindent 4 }}
+spec:
+  schedule: {{ .Values.schedule | quote }}
+  concurrencyPolicy: {{ .Values.concurrencyPolicy }}
+  successfulJobsHistoryLimit: {{ .Values.successfulJobsHistoryLimit }}
+  failedJobsHistoryLimit: {{ .Values.failedJobsHistoryLimit }}
+  {{- if .Values.startingDeadlineSeconds }}
+  startingDeadlineSeconds: {{ .Values.startingDeadlineSeconds }}
+  {{- end }}
+  jobTemplate:
+    spec:
+      activeDeadlineSeconds: {{ .Values.activeDeadlineSeconds }}
+      backoffLimit: {{ .Values.backoffLimit }}
+      template:
+        metadata:
+          labels:
+            {{- include "promforecast-tuner.selectorLabels" . | nindent 12 }}
+        spec:
+          serviceAccountName: {{ include "promforecast-tuner.serviceAccountName" . }}
+          # The tuner needs no K8s API access — it reads from VM via PromQL
+          # and pushes to the configured sink. Disabling the API token mount
+          # keeps the principle of least privilege in shops where the default
+          # ServiceAccount has cluster-wide read by accident.
+          automountServiceAccountToken: false
+          restartPolicy: {{ .Values.restartPolicy }}
+          {{- with .Values.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.nodeSelector }}
+          nodeSelector:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.tolerations }}
+          tolerations:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.affinity }}
+          affinity:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          containers:
+            - name: tuner
+              image: {{ include "promforecast-tuner.image" . | quote }}
+              imagePullPolicy: {{ .Values.image.pullPolicy }}
+              args:
+                - "tune"
+                - "--config=/etc/promforecast/{{ .Values.configMap.key }}"
+                - "--min-improvement-pct={{ .Values.minImprovementPct }}"
+                {{- if .Values.sinkUrlOverride }}
+                - "--sink-url={{ .Values.sinkUrlOverride }}"
+                {{- end }}
+                {{- if .Values.lookback }}
+                - "--lookback={{ .Values.lookback }}"
+                {{- end }}
+                {{- with .Values.groups }}
+                - "--groups"
+                {{- range . }}
+                - {{ . | quote }}
+                {{- end }}
+                {{- end }}
+              {{- with .Values.extraEnv }}
+              env:
+                {{- toYaml . | nindent 16 }}
+              {{- end }}
+              volumeMounts:
+                - name: config
+                  mountPath: /etc/promforecast
+                  readOnly: true
+              resources:
+                {{- toYaml .Values.resources | nindent 16 }}
+          volumes:
+            - name: config
+              configMap:
+                name: {{ .Values.configMap.name | quote }}
+                items:
+                  - key: {{ .Values.configMap.key | quote }}
+                    path: {{ .Values.configMap.key | quote }}
+{{- end }}

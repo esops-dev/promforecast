@@ -152,6 +152,16 @@ class ServerConfig(BaseModel):
     # ``safety.fleet_what_if_min_interval``. Same network-level
     # access-control model as ``/-/reload`` / ``/forecast/preview``.
     expose_what_if_endpoint: bool = False
+    # ``GET /forecast/warmup`` reports per-(group, query) "what is still
+    # loading?" status for a fresh install: how many points each query
+    # has versus how many it needs, the blocking reason (min_points,
+    # missing regressor, ...), and a rough ETA to first usable forecast.
+    # Off by default — the endpoint costs one cheap probe query per
+    # configured query when called, which is fine for ad-hoc debugging
+    # but would be wasteful for any monitoring system polling it on
+    # cadence. Same network-level access-control model as
+    # ``/-/reload``. See ``docs/operations/warmup.md``.
+    expose_warmup_endpoint: bool = False
 
 
 class SafetyConfig(BaseModel):
@@ -191,6 +201,16 @@ class SafetyConfig(BaseModel):
     # interactive dashboards; setting it higher is appropriate for
     # forecasters that share an executor with high-cardinality groups.
     fleet_what_if_min_interval: Duration = timedelta(minutes=5)
+    # Hard upper bound on the backfill window passed to
+    # ``promforecast backfill --from <duration>``. Backfill walks one
+    # fit per ``server.refresh_interval`` across the requested window —
+    # at the default 1h refresh a 90d window is 2160 fits per group,
+    # comfortably in the hours of CPU range. The cap rejects accidental
+    # year-long requests at the CLI boundary rather than letting them
+    # silently kick off an overnight job; raise it explicitly only when
+    # the operator has sized the cluster for the work. See
+    # ``docs/operations/backfill.md`` for the trade-off.
+    backfill_max_window: Duration = timedelta(days=90)
 
 
 class ConformalConfig(BaseModel):
@@ -379,6 +399,29 @@ class DiscoveryVariable(BaseModel):
     promql: str
 
 
+class ActionCostConfig(BaseModel):
+    """Optional cost-of-action annotation for a threshold.
+
+    Surfaces as ``forecast_threshold_action_cost{id, group, name, type}``
+    whose sample value is ``value``. Dashboards multiplex
+    ``forecast_time_to_threshold_seconds`` by this gauge to rank
+    "soon-and-expensive" first — an ETA of 7 days on a 50,000-currency
+    storage tier outranks an ETA of 1 day on a 50-currency backup
+    volume.
+
+    ``type`` is a free-text discriminator label (``usd``, ``eur``,
+    ``priority``, ``engineer_hours``) so non-monetary cost framings
+    work alongside currency ones. ``value`` is the numeric amount;
+    ``> 0`` is enforced because a zero or negative cost makes no
+    sense and would silently rank below every meaningful threshold.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    type: str
+    value: float = Field(gt=0.0)
+
+
 class ThresholdConfig(BaseModel):
     """One named threshold for the time-to-threshold ETA metric.
 
@@ -401,6 +444,12 @@ class ThresholdConfig(BaseModel):
     Both fields are required together (one without the other is
     rejected at load time) — the predictive metric is a derived shape and
     cannot be partially configured.
+
+    ``action_cost`` opts the threshold into the
+    ``forecast_threshold_action_cost`` gauge — see
+    :class:`ActionCostConfig`. The cost rides with the threshold's
+    lifecycle so a Grafana panel can rank capacity ETAs by
+    cost-to-ignore rather than just time-to-breach.
 
     The ``le_drain`` comparator targets the queue-burn-down case. It
     differs from ``lt`` along four axes:
@@ -431,6 +480,7 @@ class ThresholdConfig(BaseModel):
     comparator: Literal["gt", "lt", "le_drain"] = "gt"
     alert_within: Duration | None = None
     severity: Literal["warning", "critical"] | None = None
+    action_cost: ActionCostConfig | None = None
 
 
 class SLOConfig(BaseModel):
@@ -552,6 +602,12 @@ class DriftEmissionConfig(BaseModel):
     enabled: bool = True
     method: Literal["mape", "wasserstein"] = "mape"
     alert_threshold: float | None = 0.25
+    # Rolling window (in fits) used by the drift-explainer's Pearson
+    # correlation between drift_score and each configured regressor.
+    # Default 30 fits matches the v1.8 spec; lower values produce
+    # noisier correlations, higher values are slower to react to a
+    # genuine regime change in which regressor explains the drift.
+    correlation_window: int = Field(default=30, ge=2)
 
 
 class BandCoverageConfig(BaseModel):
@@ -862,18 +918,93 @@ class ChangePointConfig(BaseModel):
     reweight_decay: float = Field(default=0.5, ge=0.0, le=1.0)
 
 
+class BlacklistWindowConfig(BaseModel):
+    """One operator-known anomalous window to drop from the lookback.
+
+    Samples whose timestamp falls inside ``[start, end)`` are dropped
+    *before* gap imputation, so the standard ``gaps`` strategy treats the
+    blacklisted span as a gap and applies the configured fill / drop
+    policy. The window is interpreted as a half-open interval so two
+    adjacent windows touching at the boundary cover the boundary point
+    exactly once.
+
+    Two shapes are supported:
+
+    * **Absolute** — ``start`` / ``end`` are ISO-8601 timestamps (e.g.
+      ``2024-11-29T00:00:00Z``). Useful for "the November 2024 incident
+      window" or "the Q1 migration freeze". The ``timezone`` field is
+      ignored for absolute windows because the ISO-8601 string already
+      carries an offset (or implies UTC when none is given).
+    * **Recurring** — ``recurring`` carries a calendar pattern (``annual``
+      today; ``weekly`` / ``monthly`` are reserved for future expansion).
+      ``start`` / ``end`` are formatted as ``MM-DDTHH:MM`` (year omitted)
+      so the window applies to every year in the lookback. ``timezone``
+      controls the local calendar the window is anchored in — defaults
+      to ``UTC``, but US Black-Friday-style operators typically want
+      ``America/New_York`` or their site's local zone so the window
+      flips at local midnight rather than UTC-midnight. Same convention
+      as the v1.4 ``holidays`` regressor's ``timezone`` field.
+
+    The optional ``reason`` is a free-text tag surfaced on the per-window
+    counter (``forecast_input_blacklisted_samples_total{reason}``) so an
+    operator can audit which windows are actually firing without log
+    scraping. Reason cardinality is bounded by the operator's config —
+    avoid templating per-incident values into it.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    start: str
+    end: str
+    reason: str = ""
+    # ``recurring: null`` (default) treats ``start``/``end`` as absolute
+    # ISO-8601 timestamps. ``recurring: annual`` treats them as
+    # ``MM-DDTHH:MM`` calendar patterns and applies the window across
+    # every year in the lookback. Other periodicities are reserved.
+    recurring: Literal["annual"] | None = None
+    # IANA timezone name used to anchor a recurring window's calendar
+    # boundary. Ignored when ``recurring`` is null (the absolute form
+    # carries its own offset in the ISO-8601 string). Defaults to
+    # ``UTC`` so a missing field never silently shifts the window.
+    timezone: str = "UTC"
+
+    @model_validator(mode="after")
+    def _check_shape(self) -> BlacklistWindowConfig:
+        if not self.start or not self.end:
+            raise ValueError("blacklist window requires both start and end")
+        if self.recurring == "annual":
+            # ``MM-DDTHH:MM`` shape: 5 chars + ``T`` + 5 chars = 11.
+            # Accept the trailing seconds for symmetry with ISO-8601.
+            if "T" not in self.start or "T" not in self.end:
+                raise ValueError(
+                    "annual blacklist windows require 'MM-DDTHH:MM' shape "
+                    f"(got start={self.start!r}, end={self.end!r})"
+                )
+        # Absolute window — the parser in preprocess.py reads via
+        # ``datetime.fromisoformat``; do a cheap structural check
+        # here so a typo fails at boot rather than mid-fit.
+        elif "T" not in self.start or "T" not in self.end:
+            raise ValueError(
+                "absolute blacklist windows require ISO-8601 timestamps "
+                f"(got start={self.start!r}, end={self.end!r})"
+            )
+        return self
+
+
 class PreprocessConfig(BaseModel):
     """All pre-fit cleaning steps for a group.
 
-    Steps run in the order ``gaps -> outliers -> change_point``: gaps are
-    filled first so outlier detection sees a regularly-sampled signal, and
-    change-point detection runs last on the cleaned series so a single
-    spike doesn't masquerade as a regime shift.
+    Steps run in the order ``blacklist -> gaps -> outliers -> change_point``:
+    blacklisted samples are dropped first so gap imputation treats the window
+    as a gap (and may fall back to ``drop_series`` if the window is longer
+    than ``gaps.max_gap``); gaps are filled so outlier detection sees a
+    regularly-sampled signal; outliers are scrubbed before change-point
+    detection so a single spike doesn't masquerade as a regime shift.
 
-    All three sub-sections default to inert behaviour (``forward_fill`` with
-    a 30-minute cap, outliers off, change-point off), so adding the block
-    to a config without further edits does nothing observable. Each
-    individual feature flips on independently.
+    All four sub-sections default to inert behaviour (``blacklist_windows``
+    empty, ``forward_fill`` with a 30-minute cap, outliers off, change-point
+    off), so adding the block to a config without further edits does nothing
+    observable. Each individual feature flips on independently.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -881,6 +1012,7 @@ class PreprocessConfig(BaseModel):
     gaps: GapImputationConfig = GapImputationConfig()
     outliers: OutlierConfig = OutlierConfig()
     change_point: ChangePointConfig = ChangePointConfig()
+    blacklist_windows: list[BlacklistWindowConfig] = Field(default_factory=list)
 
 
 class GroupConfig(BaseModel):
@@ -1133,6 +1265,135 @@ class DeploySignalConfig(BaseModel):
     weight: float = Field(default=1.0, gt=0.0)
 
 
+class ResourceSizingWorkloadConfig(BaseModel):
+    """One workload's right-sizing wiring.
+
+    Off by default. Activated by configuring the parent
+    :class:`ResourceSizingConfig` block. Each entry binds a Kubernetes
+    workload to the forecast it should be sized against, plus
+    optionally a PromQL query that reports the *current* limit/request
+    so the runner can compute an expected savings percentage.
+
+    ``forecast_query`` must match the ``id`` of a configured query;
+    the runner reads its predicted peak (max ``yhat_upper`` at the
+    highest configured confidence level, falling back to ``yhat``)
+    and applies the headroom multiplier.
+
+    ``current_promql`` is optional. When set, the runner fetches it
+    via the existing :class:`PromSource` (a cheap instant-style
+    range query) and emits the matching ``current`` and
+    ``expected_savings_pct`` gauges alongside the recommendation. When
+    unset only the recommendation is emitted; operators can derive
+    the savings comparison via PromQL recording rules against their
+    own infrastructure metrics (``kube_pod_container_resource_requests``,
+    ...).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    workload: str
+    kind: Literal["cpu", "memory"]
+    forecast_query: str
+    current_promql: str | None = None
+
+
+class ResourceSizingConfig(BaseModel):
+    """Per-workload right-sizing recommendations from forecast peaks.
+
+    Off by default. When configured, the runner walks each
+    :class:`ResourceSizingWorkloadConfig` after every group run,
+    reads the forecast snapshot for the named query, projects the
+    headroom-adjusted peak, and emits
+    ``forecast_recommended_resource_size{workload, kind, confidence}``
+    plus optional ``current`` / ``savings_pct`` siblings.
+
+    ``headroom_pct`` is added on top of the predicted peak — a 30%
+    headroom means the recommendation is ``peak * 1.30``. Defaults to
+    ``30`` because anything below 20% leaves no rope for unexpected
+    load and anything above 50% defeats the purpose of right-sizing.
+
+    ``quality_floor`` gates the emission against
+    ``forecast_quality_score``. A forecast whose quality is below the
+    floor produces no recommendation for that workload — better to
+    omit the row than mislead operators with a recommendation built
+    on an untrustworthy forecast.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    headroom_pct: float = Field(default=30.0, ge=0.0, le=200.0)
+    quality_floor: float = Field(default=0.6, ge=0.0, le=1.0)
+    workloads: list[ResourceSizingWorkloadConfig] = Field(default_factory=list)
+
+
+class RecommendationsConfig(BaseModel):
+    """Operator-facing recommendation outputs.
+
+    Off by default. Today only :class:`ResourceSizingConfig` is
+    surfaced under this block; future recommendation families land
+    here so a config can enable them all under one umbrella.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    resource_sizing: ResourceSizingConfig = Field(default_factory=ResourceSizingConfig)
+
+
+class HealthScoreConfig(BaseModel):
+    """Per-service forecast health composite.
+
+    Off by default — when configured, the runner aggregates
+    ``forecast_quality_score`` samples across all groups and emits
+    ``forecast_service_health_score`` per distinct combination of the
+    labels listed in ``aggregate_by``. The metric is intended for
+    "how reliable is our prediction infrastructure for this service /
+    environment?" reporting, distinct from "how reliable is the
+    service itself?".
+
+    ``aggregate_by`` lists the source-side labels (e.g. ``service``,
+    ``environment``, ``cluster``) that become discriminator labels on
+    the emitted metric; quality_points whose label set is missing any
+    of these are dropped from the aggregation (so a single un-labelled
+    forecast can't silently inflate or deflate every bucket).
+
+    ``aggregator`` picks the summary statistic — currently only
+    ``weighted_mean`` is supported (every quality_point is one series,
+    so the weight is implicitly 1 per row regardless of ``weight_by``).
+    ``weight_by`` is exposed for forward compatibility with future
+    pre-aggregated quality emission shapes; today it does not change
+    the math but the configured value rides through onto the emitted
+    ``weight_by`` documentation label so downstream BI dashboards
+    can record which interpretation was in effect.
+
+    ``quality_floor`` (optional) drops quality scores below the floor
+    before aggregating. Useful when cold-start or low-quality forecasts
+    should not pull a service's health score down — set the floor at
+    the same value as the alert gate (typically ``0.6``) so the
+    aggregated number aligns with the alerting story.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    aggregate_by: list[str] = Field(min_length=1)
+    aggregator: Literal["weighted_mean"] = "weighted_mean"
+    weight_by: Literal["uniform", "forecast_series_count"] = "forecast_series_count"
+    quality_floor: float | None = Field(default=None, ge=0.0, le=1.0)
+
+
+class GovernanceConfig(BaseModel):
+    """Operator / platform-team aggregated views over forecast quality.
+
+    Off by default. The only sub-block today is :class:`HealthScoreConfig`;
+    new governance-style aggregations will land here so a config can
+    enable them all under one block.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    health_score: HealthScoreConfig | None = None
+
+
 class DeploySignalsConfig(BaseModel):
     """One service's deploy-risk composite definition.
 
@@ -1198,6 +1459,12 @@ class Config(BaseModel):
     # queries. The runner emits ``forecast_deploy_risk_score`` per
     # active deploy. See :class:`DeploySignalsConfig`.
     deploy_signals: list[DeploySignalsConfig] = Field(default_factory=list)
+    # Governance aggregations over forecast quality. Off by default;
+    # see :class:`GovernanceConfig`.
+    governance: GovernanceConfig = Field(default_factory=GovernanceConfig)
+    # Operator-facing recommendations (right-sizing, ...). Off by
+    # default; see :class:`RecommendationsConfig`.
+    recommendations: RecommendationsConfig = Field(default_factory=RecommendationsConfig)
 
 
 def load(path: str | Path) -> Config:
@@ -1238,7 +1505,52 @@ def load(path: str | Path) -> Config:
             for reg in query.regressors:
                 _validate_regressor(group_name=group.name, query_id=query.id, reg=reg)
     _validate_deploy_signals(config)
+    _validate_resource_sizing(config)
     return config
+
+
+def _validate_resource_sizing(config: Config) -> None:
+    """Cross-reference every right-sizing workload against the live queries.
+
+    Each workload entry's ``forecast_query`` must resolve to a
+    configured query id; an unknown id is almost always a typo that
+    would otherwise silently emit nothing. Duplicate (workload, kind)
+    pairs are rejected so the emitted gauge stays single-valued —
+    otherwise two entries would write to the same label set and the
+    last one would silently win.
+    """
+    cfg = config.recommendations.resource_sizing
+    if not cfg.enabled or not cfg.workloads:
+        return
+    queries_by_id: set[str] = {q.id for g in config.groups for q in g.queries}
+    seen: set[tuple[str, str]] = set()
+    for entry in cfg.workloads:
+        label = f"recommendations.resource_sizing.workloads[{entry.workload}/{entry.kind}]"
+        if entry.forecast_query not in queries_by_id:
+            raise ValueError(
+                f"{label}: forecast_query={entry.forecast_query!r} does not "
+                "match any configured query id"
+            )
+        # ``current_promql`` is optional, but if the operator sets it
+        # to the empty string the runtime fetcher would treat the
+        # value as "configured" and issue a doomed PromQL request
+        # every refresh. Reject at load time so the misconfig is
+        # visible.
+        if entry.current_promql is not None and not entry.current_promql.strip():
+            raise ValueError(
+                f"{label}: current_promql must be a non-empty PromQL query when "
+                "set (omit the field to skip the current / savings_pct emission)"
+            )
+        if not entry.workload.strip():
+            raise ValueError(f"{label}: workload must be non-empty")
+        key = (entry.workload, entry.kind)
+        if key in seen:
+            raise ValueError(
+                f"recommendations.resource_sizing.workloads: duplicate "
+                f"(workload={entry.workload!r}, kind={entry.kind!r}); "
+                "each pair must appear at most once"
+            )
+        seen.add(key)
 
 
 def _validate_deploy_signals(config: Config) -> None:
@@ -1397,6 +1709,14 @@ def _validate_query_overrides(*, group_name: str, query: QueryConfig) -> None:  
                 "supported on le_drain thresholds; the will_breach gauge would invert "
                 "(it would fire on a queue draining quickly). Use the +Inf-anchored "
                 "QueueNotDraining-style alert on forecast_time_to_drain_seconds instead."
+            )
+        # ``type`` becomes a free-text label on /metrics — empty or
+        # whitespace-only values would silently render as an empty
+        # label which dashboards typically discard. Reject at boot.
+        if threshold.action_cost is not None and not threshold.action_cost.type.strip():
+            raise ValueError(
+                f"{label}.thresholds[{threshold.name}].action_cost.type must be non-empty "
+                "(e.g. 'usd', 'eur', 'engineer_hours')"
             )
     _validate_cold_start(label=label, query=query)
     _validate_events_profile(label=label, query=query)

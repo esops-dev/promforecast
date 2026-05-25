@@ -776,6 +776,248 @@ groups:
         config_module.load(path)
 
 
+def test_load_accepts_threshold_with_action_cost(tmp_path: Path) -> None:
+    """A threshold with ``action_cost`` round-trips through the loader."""
+    path = _write(
+        tmp_path,
+        """
+apiVersion: promforecast.io/v1
+datasource:
+  url: http://vm:8428/
+groups:
+  - name: g
+    queries:
+      - id: disk_used_pct
+        promql: up
+        thresholds:
+          - name: critical
+            value: 95
+            action_cost:
+              type: usd
+              value: 50000
+""",
+    )
+    cfg = config_module.load(path)
+    threshold = cfg.groups[0].queries[0].thresholds[0]
+    assert threshold.action_cost is not None
+    assert threshold.action_cost.type == "usd"
+    assert threshold.action_cost.value == 50_000
+
+
+def test_load_rejects_action_cost_with_empty_type(tmp_path: Path) -> None:
+    """An empty / whitespace ``type`` label is rejected at load time.
+
+    Empty labels render as ``type=""`` on /metrics and Grafana templating
+    typically drops them — silently breaking the rank-by-cost panel.
+    Better to fail fast.
+    """
+    path = _write(
+        tmp_path,
+        """
+apiVersion: promforecast.io/v1
+datasource:
+  url: http://vm:8428/
+groups:
+  - name: g
+    queries:
+      - id: m
+        promql: up
+        thresholds:
+          - name: warn
+            value: 80
+            action_cost:
+              type: "  "
+              value: 1.0
+""",
+    )
+    with pytest.raises(ValueError, match=r"action_cost\.type must be non-empty"):
+        config_module.load(path)
+
+
+def test_load_rejects_action_cost_with_non_positive_value(tmp_path: Path) -> None:
+    """``value <= 0`` is rejected so a misconfig can't silently rank below every meaningful cost."""
+    path = _write(
+        tmp_path,
+        """
+apiVersion: promforecast.io/v1
+datasource:
+  url: http://vm:8428/
+groups:
+  - name: g
+    queries:
+      - id: m
+        promql: up
+        thresholds:
+          - name: warn
+            value: 80
+            action_cost:
+              type: usd
+              value: 0
+""",
+    )
+    with pytest.raises(ValueError, match="greater than 0"):
+        config_module.load(path)
+
+
+def test_load_accepts_governance_health_score(tmp_path: Path) -> None:
+    """A ``governance.health_score`` block round-trips through the loader."""
+    path = _write(
+        tmp_path,
+        """
+apiVersion: promforecast.io/v1
+datasource:
+  url: http://vm:8428/
+governance:
+  health_score:
+    aggregate_by: [service, environment]
+    aggregator: weighted_mean
+    weight_by: forecast_series_count
+    quality_floor: 0.6
+groups:
+  - name: g
+    queries:
+      - id: m
+        promql: up
+""",
+    )
+    cfg = config_module.load(path)
+    hs = cfg.governance.health_score
+    assert hs is not None
+    assert hs.aggregate_by == ["service", "environment"]
+    assert hs.aggregator == "weighted_mean"
+    assert hs.weight_by == "forecast_series_count"
+    assert hs.quality_floor == 0.6
+
+
+def test_load_rejects_governance_health_score_with_empty_aggregate_by(
+    tmp_path: Path,
+) -> None:
+    """An empty ``aggregate_by`` is rejected — the bucket key would be ``()``."""
+    path = _write(
+        tmp_path,
+        """
+apiVersion: promforecast.io/v1
+datasource:
+  url: http://vm:8428/
+governance:
+  health_score:
+    aggregate_by: []
+groups:
+  - name: g
+    queries:
+      - id: m
+        promql: up
+""",
+    )
+    with pytest.raises(ValueError, match="aggregate_by"):
+        config_module.load(path)
+
+
+# ---------------------------------------------------------------------------
+# Right-sizing recommendation validator paths.
+# ---------------------------------------------------------------------------
+
+
+_BASE_RESOURCE_SIZING_HEADER = """
+apiVersion: promforecast.io/v1
+datasource:
+  url: http://vm:8428/
+groups:
+  - name: g
+    queries:
+      - id: svc
+        promql: up
+recommendations:
+  resource_sizing:
+    enabled: true
+    workloads:
+"""
+
+
+def test_load_accepts_valid_resource_sizing_block(tmp_path: Path) -> None:
+    """A well-formed right-sizing block round-trips through the loader."""
+    path = _write(
+        tmp_path,
+        _BASE_RESOURCE_SIZING_HEADER
+        + """      - workload: api
+        kind: cpu
+        forecast_query: svc
+        current_promql: kube_pod_container_resource_requests
+""",
+    )
+    cfg = config_module.load(path)
+    rs = cfg.recommendations.resource_sizing
+    assert rs.enabled is True
+    assert len(rs.workloads) == 1
+    assert rs.workloads[0].workload == "api"
+    assert rs.workloads[0].kind == "cpu"
+
+
+def test_load_rejects_resource_sizing_unknown_forecast_query(tmp_path: Path) -> None:
+    """``forecast_query`` must reference a configured query id."""
+    path = _write(
+        tmp_path,
+        _BASE_RESOURCE_SIZING_HEADER
+        + """      - workload: api
+        kind: cpu
+        forecast_query: nonexistent
+""",
+    )
+    with pytest.raises(ValueError, match="does not match any configured query id"):
+        config_module.load(path)
+
+
+def test_load_rejects_resource_sizing_duplicate_workload_kind(tmp_path: Path) -> None:
+    """Two entries with the same (workload, kind) would race on /metrics — reject."""
+    path = _write(
+        tmp_path,
+        _BASE_RESOURCE_SIZING_HEADER
+        + """      - workload: api
+        kind: cpu
+        forecast_query: svc
+      - workload: api
+        kind: cpu
+        forecast_query: svc
+""",
+    )
+    with pytest.raises(ValueError, match="duplicate"):
+        config_module.load(path)
+
+
+def test_load_rejects_resource_sizing_empty_current_promql(tmp_path: Path) -> None:
+    """Empty / whitespace ``current_promql`` is the half-configured shape; reject.
+
+    Treating an empty string as "configured" would issue a doomed
+    PromQL fetch every refresh and silently never produce the
+    current / savings_pct siblings the operator was after.
+    """
+    path = _write(
+        tmp_path,
+        _BASE_RESOURCE_SIZING_HEADER
+        + """      - workload: api
+        kind: cpu
+        forecast_query: svc
+        current_promql: "  "
+""",
+    )
+    with pytest.raises(ValueError, match="current_promql must be a non-empty PromQL"):
+        config_module.load(path)
+
+
+def test_load_rejects_resource_sizing_empty_workload_name(tmp_path: Path) -> None:
+    """An empty ``workload`` label would render as ``workload=""`` on /metrics."""
+    path = _write(
+        tmp_path,
+        _BASE_RESOURCE_SIZING_HEADER
+        + """      - workload: ""
+        kind: cpu
+        forecast_query: svc
+""",
+    )
+    with pytest.raises(ValueError, match="workload must be non-empty"):
+        config_module.load(path)
+
+
 def test_load_rejects_growth_rate_enabled_without_windows(tmp_path: Path) -> None:
     """``growth_rate.enabled: true`` with empty windows must fail at load time."""
     path = _write(

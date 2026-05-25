@@ -26,8 +26,9 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import numpy as np
 import structlog
@@ -36,6 +37,7 @@ if TYPE_CHECKING:
     from numpy.typing import NDArray
 
     from .config import (
+        BlacklistWindowConfig,
         ChangePointConfig,
         GapImputationConfig,
         OutlierConfig,
@@ -76,6 +78,13 @@ class PreprocessResult:
     Counters are dict-of-counts so the runner can fold them into the
     exporter's per-(group, query, ...) counters without losing the sub-key
     breakdown (strategy, method).
+
+    ``blacklisted_samples`` is a per-``reason`` counter (defaulting to
+    the empty string for unreasoned windows) for samples removed by the
+    ``preprocess.blacklist_windows`` list. The values flow into
+    ``forecast_input_blacklisted_samples_total{reason}`` so an operator
+    can confirm an annual-recurring blacklist actually fired for the
+    most recent year in the lookback.
     """
 
     timestamps: list[datetime]
@@ -86,6 +95,7 @@ class PreprocessResult:
     change_points: int = 0
     effective_lookback_seconds: float = 0.0
     imputed_fraction: float = 0.0
+    blacklisted_samples: dict[str, int] = field(default_factory=dict)
     dropped: bool = False
     drop_reason: str | None = None
 
@@ -113,7 +123,28 @@ def preprocess_series(
     if len(timestamps) != len(values):
         raise ValueError("preprocess: timestamps/values length mismatch")
 
+    blacklist_counts: dict[str, int] = {}
+    if config.blacklist_windows:
+        timestamps, values, blacklist_counts = _drop_blacklisted(
+            timestamps=timestamps,
+            values=values,
+            windows=config.blacklist_windows,
+        )
+
+    if not timestamps or not values:
+        # The blacklist consumed every sample. Surface as a drop so the
+        # caller bumps ``forecast_series_dropped_total{reason="preprocess_drop"}``
+        # rather than continuing into the fit with an empty series.
+        return PreprocessResult(
+            timestamps=[],
+            values=[],
+            blacklisted_samples=blacklist_counts,
+            dropped=True,
+            drop_reason="blacklist_removed_all_samples",
+        )
+
     result = _fill_gaps(timestamps=timestamps, values=values, step=step, config=config.gaps)
+    result.blacklisted_samples = blacklist_counts
     if result.dropped:
         return result
 
@@ -126,7 +157,151 @@ def preprocess_series(
     if not result.effective_lookback_seconds and result.timestamps:
         span = result.timestamps[-1] - result.timestamps[0]
         result.effective_lookback_seconds = span.total_seconds()
+    # Discount the blacklist-removed duration from the effective
+    # lookback so the gauge reflects the actual fit-input duration
+    # (a 14-day lookback with two 6-hour blacklisted windows reports
+    # ``14d - 12h`` rather than the raw 14d span). Calculated from
+    # ``count * step`` rather than the raw window length so a window
+    # that only partially overlaps the lookback is counted accurately.
+    total_blacklisted = sum(blacklist_counts.values())
+    if total_blacklisted and step.total_seconds() > 0:
+        deduction = total_blacklisted * step.total_seconds()
+        result.effective_lookback_seconds = max(0.0, result.effective_lookback_seconds - deduction)
     return result
+
+
+# ---------- blacklist windows ----------------------------------------------
+
+
+def _drop_blacklisted(  # noqa: PLR0912
+    *,
+    timestamps: list[datetime],
+    values: list[float],
+    windows: list[BlacklistWindowConfig],
+) -> tuple[list[datetime], list[float], dict[str, int]]:
+    """Remove samples whose timestamp falls inside any blacklist window.
+
+    Returns the surviving (timestamps, values) plus a per-``reason``
+    counter of samples removed. Empty windows (zero-length absolute
+    spans or unparseable patterns) are skipped silently — pydantic
+    catches the gross-shape errors at boot, so anything reaching this
+    helper is structurally valid.
+
+    The windows are interpreted as half-open intervals ``[start, end)``;
+    annual-recurring patterns expand to one absolute span per year
+    seen in the input timestamps (so a 30-year-lookback config does
+    not pay the cost of materialising 30 spans on every fit).
+    """
+    if not timestamps:
+        return list(timestamps), list(values), {}
+
+    # Expand recurring patterns once across the years actually present
+    # in the input window so the per-sample comparison stays cheap.
+    span_years = _years_present(timestamps)
+    expanded: list[tuple[datetime, datetime, str]] = []
+    for window in windows:
+        if window.recurring == "annual":
+            for year in span_years:
+                pair = _parse_annual_window(
+                    window.start, window.end, year, timezone_name=window.timezone
+                )
+                if pair is not None:
+                    expanded.append((pair[0], pair[1], window.reason))
+        else:
+            absolute = _parse_absolute_window(window.start, window.end)
+            if absolute is not None:
+                expanded.append((absolute[0], absolute[1], window.reason))
+
+    if not expanded:
+        return list(timestamps), list(values), {}
+
+    out_ts: list[datetime] = []
+    out_vals: list[float] = []
+    counts: dict[str, int] = {}
+    for ts, val in zip(timestamps, values, strict=True):
+        ts_aware = ts if ts.tzinfo is not None else ts.replace(tzinfo=UTC)
+        hit_reason: str | None = None
+        for start, end, reason in expanded:
+            if start <= ts_aware < end:
+                hit_reason = reason
+                break
+        if hit_reason is None:
+            out_ts.append(ts)
+            out_vals.append(val)
+        else:
+            counts[hit_reason] = counts.get(hit_reason, 0) + 1
+    return out_ts, out_vals, counts
+
+
+def _years_present(timestamps: list[datetime]) -> list[int]:
+    """Return the distinct years present in ``timestamps``."""
+    if not timestamps:
+        return []
+    first = timestamps[0]
+    last = timestamps[-1]
+    return list(range(first.year, last.year + 1))
+
+
+def _parse_absolute_window(start: str, end: str) -> tuple[datetime, datetime] | None:
+    """Parse an ISO-8601 ``start`` / ``end`` pair into UTC-aware datetimes.
+
+    Returns ``None`` on a malformed input — the pydantic validator
+    catches structurally-wrong shapes at config load, so reaching this
+    branch implies a deeper format error worth swallowing rather than
+    crashing the per-fit pipeline.
+    """
+    try:
+        # ``fromisoformat`` is strict about the trailing ``Z`` only on
+        # Python 3.11+, but ``Z`` is the standard UTC suffix the rest
+        # of the codebase emits; normalise to ``+00:00`` for portability.
+        s = datetime.fromisoformat(start.replace("Z", "+00:00"))
+        e = datetime.fromisoformat(end.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if s.tzinfo is None:
+        s = s.replace(tzinfo=UTC)
+    if e.tzinfo is None:
+        e = e.replace(tzinfo=UTC)
+    if e <= s:
+        return None
+    return s, e
+
+
+def _parse_annual_window(
+    start_pattern: str, end_pattern: str, year: int, *, timezone_name: str = "UTC"
+) -> tuple[datetime, datetime] | None:
+    """Materialise an annual ``MM-DDTHH:MM`` window for ``year``.
+
+    Returns ``None`` on malformed input or an unrecognised IANA
+    ``timezone_name``. The window is anchored in the operator's
+    configured local zone (defaulting to UTC) so a Black-Friday-style
+    rule flips at local midnight rather than UTC-midnight; the
+    returned datetimes are normalised to UTC so the per-sample
+    comparison in :func:`_drop_blacklisted` can stay zone-agnostic.
+    """
+    try:
+        tz = ZoneInfo(timezone_name)
+    except ZoneInfoNotFoundError:
+        return None
+    try:
+        s_local = datetime.fromisoformat(f"{year:04d}-{start_pattern}").replace(tzinfo=tz)
+        e_year = year
+        # Allow the recurring window to wrap a year boundary
+        # ("12-29T00:00" -> "01-02T00:00") by rolling ``end`` forward.
+        e_local = datetime.fromisoformat(f"{year:04d}-{end_pattern}").replace(tzinfo=tz)
+        if e_local <= s_local:
+            e_year = year + 1
+            e_local = datetime.fromisoformat(f"{e_year:04d}-{end_pattern}").replace(tzinfo=tz)
+    except ValueError:
+        return None
+    # Normalise to UTC so the half-open ``[start, end)`` comparison
+    # against UTC-aware sample timestamps is correct regardless of the
+    # zone chosen by the operator.
+    s = s_local.astimezone(UTC)
+    e_candidate = e_local.astimezone(UTC)
+    if e_candidate <= s:
+        return None
+    return s, e_candidate
 
 
 # ---------- gap imputation -------------------------------------------------

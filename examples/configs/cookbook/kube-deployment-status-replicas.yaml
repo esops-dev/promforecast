@@ -1,0 +1,39 @@
+# Cookbook: kube_deployment_status_replicas
+#
+# Forecast deployment replica count so capacity planners see ahead
+# of a sustained autoscale ramp instead of reacting to alerts.
+# Predominantly piecewise-stable signals — SeasonalNaive performs
+# well; ARIMA captures the autoscaler-driven ramp.
+
+apiVersion: promforecast.io/v1
+
+datasource:
+  url: http://victoriametrics:8428/
+
+server:
+  refresh_interval: 15m
+
+defaults:
+  lookback: 30d
+  step: 5m
+  horizon: 24h
+  # Counts-and-stairs signals — keep models cheap, prefer count-aware
+  # safeguards so the predicted replica count rounds to an integer.
+  models:
+    - SeasonalNaive
+    - AutoARIMA
+  season_length: 288
+  confidence_levels: [95]
+  accuracy:
+    evaluate: true
+    auto_select: true
+
+groups:
+  - name: kube_workloads
+    queries:
+      - id: kube_deployment_status_replicas
+        promql: |
+          sum by (namespace, deployment) (
+            kube_deployment_status_replicas
+          )
+        data_profile: count

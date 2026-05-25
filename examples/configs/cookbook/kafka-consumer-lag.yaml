@@ -1,0 +1,45 @@
+# Cookbook: kafka_consumer_lag
+#
+# Two-sided question: "when will lag exhaust the broker's retention?"
+# (capacity) and "when will it drain?" (operations). The drain ETA
+# fires +Inf when the lag isn't actually draining, which Alertmanager
+# can pin as a distinct alert from "draining slowly".
+
+apiVersion: promforecast.io/v1
+
+datasource:
+  url: http://victoriametrics:8428/
+
+server:
+  refresh_interval: 1m
+
+defaults:
+  lookback: 7d
+  step: 1m
+  horizon: 4h
+  models:
+    - AutoARIMA
+    - SeasonalNaive
+  season_length: 1440
+  confidence_levels: [95]
+  accuracy:
+    evaluate: true
+    auto_select: true
+
+groups:
+  - name: kafka
+    queries:
+      - id: kafka_consumer_lag
+        promql: |
+          sum by (topic, consumergroup) (
+            kafka_consumergroup_lag
+          )
+        thresholds:
+          - name: backlog_warn
+            value: 100000
+            comparator: gt
+            alert_within: 1h
+            severity: warning
+          - name: drained
+            value: 0
+            comparator: le_drain

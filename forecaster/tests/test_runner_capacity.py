@@ -14,6 +14,7 @@ import pytest
 
 from promforecast.config import (
     AccuracyConfig,
+    ActionCostConfig,
     Config,
     DatasourceConfig,
     DefaultsConfig,
@@ -589,3 +590,106 @@ async def test_runner_emits_recommended_maintenance_window_family(
     assert 'id="cpu_busy"' in body
     assert 'rank="1"' in body
     assert 'rank="2"' in body
+
+
+@pytest.mark.asyncio
+async def test_runner_emits_threshold_action_cost_family(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A threshold with ``action_cost`` produces the cost gauge on /metrics.
+
+    Independent of model fan-out — one row per (group, query, threshold).
+    The cost lands as the sample value, ``type`` rides the label set.
+    """
+    from promforecast import models as model_registry  # noqa: PLC0415
+
+    monkeypatch.setattr(model_registry, "build", lambda *a, **kw: _RampForecastModel())
+
+    cfg = _config_with_query(
+        QueryConfig(
+            id="disk_used_pct",
+            promql="up",
+            thresholds=[
+                ThresholdConfig(
+                    name="warn",
+                    value=60.0,
+                    comparator="gt",
+                    action_cost=ActionCostConfig(type="usd", value=50.0),
+                ),
+                ThresholdConfig(
+                    name="critical",
+                    value=70.0,
+                    comparator="gt",
+                    action_cost=ActionCostConfig(type="usd", value=50_000.0),
+                ),
+                # A threshold without action_cost must NOT show up in
+                # the action_cost family — only the opted-in subset is
+                # published.
+                ThresholdConfig(name="info", value=55.0, comparator="gt"),
+            ],
+        )
+    )
+    source = _FakeSource({"up": [_frame(20)]})
+    runner = Runner(config=cfg, source=source, exporter=(exporter := Exporter()))
+
+    await runner.run_group(cfg.groups[0])
+
+    body = exporter.render().decode()
+    cost_lines = [
+        line for line in body.splitlines() if line.startswith("forecast_threshold_action_cost{")
+    ]
+    assert len(cost_lines) == 2
+    joined = "\n".join(cost_lines)
+    assert 'id="disk_used_pct"' in joined
+    assert 'group="g"' in joined
+    assert 'name="warn"' in joined
+    assert 'name="critical"' in joined
+    assert 'type="usd"' in joined
+    # ``info`` has no action_cost — it must not appear in this family.
+    assert 'name="info"' not in joined
+    # Sample values land as the cost (no per-model fan-out).
+    assert " 50.0" in joined
+    assert " 50000.0" in joined
+
+
+@pytest.mark.asyncio
+async def test_runner_action_cost_drops_when_threshold_removed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A reconfigured group that drops a threshold drops its action_cost row.
+
+    The family is rebuilt from current config every run, so /metrics
+    reflects the live YAML rather than the historical union.
+    """
+    from promforecast import models as model_registry  # noqa: PLC0415
+
+    monkeypatch.setattr(model_registry, "build", lambda *a, **kw: _RampForecastModel())
+
+    cfg = _config_with_query(
+        QueryConfig(
+            id="m",
+            promql="up",
+            thresholds=[
+                ThresholdConfig(
+                    name="warn",
+                    value=60.0,
+                    action_cost=ActionCostConfig(type="usd", value=50.0),
+                ),
+            ],
+        )
+    )
+    source = _FakeSource({"up": [_frame(20)]})
+    runner = Runner(config=cfg, source=source, exporter=(exporter := Exporter()))
+
+    await runner.run_group(cfg.groups[0])
+    initial = exporter.render().decode()
+    assert "forecast_threshold_action_cost" in initial
+
+    # Re-run with the threshold's action_cost removed; the row must
+    # disappear from /metrics on the next refresh.
+    cfg.groups[0].queries[0].thresholds = [
+        ThresholdConfig(name="warn", value=60.0),
+    ]
+    await runner.run_group(cfg.groups[0])
+    after = exporter.render().decode()
+    assert "forecast_threshold_action_cost" not in after

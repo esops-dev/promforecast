@@ -25,6 +25,22 @@ spec:
               {{`{{ $labels.group }}`}} in over 2 hours. Check pod logs and
               datasource availability.
 
+        - alert: ForecastSeriesStale
+          expr: forecast_data_staleness_seconds > 14400
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Forecast {{`{{ $labels.id }}`}} model {{`{{ $labels.model }}`}} on {{`{{ $labels.instance }}`}} hasn't been refit for >4h"
+            description: |
+              The (series, model) tuple for {{`{{ $labels.id }}`}} on group
+              {{`{{ $labels.group }}`}} hasn't produced a successful forecast
+              for over four hours. The group-level ForecastStale alert stays
+              quiet because other series in the group are still being fit
+              successfully; this rule catches the silent per-series failure
+              (model crash, persistent fit timeout, data gap that drops the
+              series under min_points).
+
         - alert: ForecastModelDegraded
           expr: forecast_accuracy_mape > 30
           for: 24h
@@ -49,7 +65,7 @@ spec:
               the forecast is doing no better than a seasonal naive baseline.
 
         - alert: ForecastFallbackPersistent
-          expr: count by (group) (forecast_quality_score{model_fallback="true"}) > 0
+          expr: count by (group) (forecast_quality_score{model_fallback="true", horizon=""}) > 0
           for: 6h
           labels:
             severity: info
@@ -61,7 +77,7 @@ spec:
 
         - alert: ForecastQualityLow
           expr: |
-            avg by (group) (forecast_quality_score{cold_start!="true"}) < 0.4
+            avg by (group) (forecast_quality_score{cold_start!="true", horizon=""}) < 0.4
           for: 6h
           labels:
             severity: info
@@ -73,7 +89,7 @@ spec:
               downstream forecast-based alerts with caution.
 
         - alert: ForecastQualityZero
-          expr: forecast_quality_score{cold_start!="true"} == 0
+          expr: forecast_quality_score{cold_start!="true", horizon=""} == 0
           for: 1h
           labels:
             severity: info
@@ -103,7 +119,7 @@ spec:
         - alert: ForecastDeviation
           expr: |
             forecast_deviation_outside_band == 1
-            and on (id, group, model) forecast_quality_score > 0.6
+            and on (id, group, model) forecast_quality_score{horizon=""} > 0.6
           for: 15m
           labels:
             severity: warning
@@ -117,7 +133,7 @@ spec:
         - alert: ForecastDeviationSevere
           expr: |
             abs(forecast_deviation_ratio) > 2
-            and on (id, group, model) forecast_quality_score > 0.6
+            and on (id, group, model) forecast_quality_score{horizon=""} > 0.6
           for: 5m
           labels:
             severity: critical

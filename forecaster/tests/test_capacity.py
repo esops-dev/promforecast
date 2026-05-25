@@ -8,11 +8,12 @@ from datetime import UTC, datetime, timedelta
 import pandas as pd
 
 from promforecast.capacity import (
+    build_threshold_action_costs,
     compute_growth_rates,
     compute_threshold_etas,
     compute_will_breach,
 )
-from promforecast.config import ThresholdConfig
+from promforecast.config import ActionCostConfig, ThresholdConfig
 
 
 def _forecast_frame(values: list[float], *, step_seconds: int = 60) -> pd.DataFrame:
@@ -348,3 +349,84 @@ def test_will_breach_emits_per_level_row() -> None:
     band = next(b for b in breaches if b.level == 80)
     assert point.value == 0.0
     assert band.value == 1.0
+
+
+def test_action_cost_skips_thresholds_without_annotation() -> None:
+    """Only thresholds with ``action_cost`` produce annotations.
+
+    Most thresholds carry no cost. ``build_threshold_action_costs``
+    must filter them out so the gauge family only ever materialises for
+    the opted-in subset.
+    """
+    out = build_threshold_action_costs(
+        [
+            ThresholdConfig(name="warn", value=80.0, comparator="gt"),
+            ThresholdConfig(name="critical", value=95.0, comparator="gt"),
+        ]
+    )
+    assert out == []
+
+
+def test_action_cost_projects_value_and_type() -> None:
+    """The projection carries the configured value and type label verbatim."""
+    out = build_threshold_action_costs(
+        [
+            ThresholdConfig(
+                name="warn",
+                value=80.0,
+                comparator="gt",
+                action_cost=ActionCostConfig(type="usd", value=50.0),
+            ),
+            ThresholdConfig(
+                name="critical",
+                value=95.0,
+                comparator="gt",
+                action_cost=ActionCostConfig(type="usd", value=50_000.0),
+            ),
+        ]
+    )
+    assert [(a.name, a.cost_type, a.cost_value) for a in out] == [
+        ("warn", "usd", 50.0),
+        ("critical", "usd", 50_000.0),
+    ]
+
+
+def test_action_cost_preserves_config_order() -> None:
+    """Stable ordering keeps the published gauge sequence deterministic.
+
+    A reshuffle each run would churn the per-(group, query, name) label
+    set Grafana caches against the metric — operators expect rows to
+    stay in their configured order so successive renders look identical
+    on dashboards.
+    """
+    out = build_threshold_action_costs(
+        [
+            ThresholdConfig(
+                name="z_last",
+                value=1.0,
+                action_cost=ActionCostConfig(type="usd", value=3.0),
+            ),
+            ThresholdConfig(
+                name="a_first",
+                value=1.0,
+                action_cost=ActionCostConfig(type="usd", value=1.0),
+            ),
+        ]
+    )
+    assert [a.name for a in out] == ["z_last", "a_first"]
+
+
+def test_action_cost_non_currency_type_is_accepted() -> None:
+    """``type`` is free text so non-currency cost framings work too."""
+    out = build_threshold_action_costs(
+        [
+            ThresholdConfig(
+                name="warn",
+                value=80.0,
+                action_cost=ActionCostConfig(type="engineer_hours", value=8.0),
+            ),
+        ]
+    )
+    assert out == [
+        type(out[0])(name="warn", cost_type="engineer_hours", cost_value=8.0),
+    ]

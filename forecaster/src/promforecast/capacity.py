@@ -94,6 +94,46 @@ class WillBreach:
     value: float
 
 
+@dataclass(frozen=True)
+class ThresholdActionCost:
+    """Config-derived cost-of-action annotation for one threshold.
+
+    Surfaces as the per-(group, query, threshold) sample of
+    ``forecast_threshold_action_cost`` so dashboards can rank capacity
+    ETAs by cost-to-ignore. ``cost_type`` corresponds to the
+    operator-configured ``action_cost.type`` and renders on the
+    ``type`` label (renamed locally to avoid shadowing the builtin).
+    """
+
+    name: str
+    cost_type: str
+    cost_value: float
+
+
+def build_threshold_action_costs(
+    thresholds: list[ThresholdConfig],
+) -> list[ThresholdActionCost]:
+    """Project a query's configured thresholds onto action-cost annotations.
+
+    Skips thresholds without an ``action_cost`` block so the family
+    only carries the opted-in subset. The output ordering matches the
+    config ordering so successive runs publish a stable row sequence.
+    """
+    out: list[ThresholdActionCost] = []
+    for threshold in thresholds:
+        cost = threshold.action_cost
+        if cost is None:
+            continue
+        out.append(
+            ThresholdActionCost(
+                name=threshold.name,
+                cost_type=cost.type,
+                cost_value=float(cost.value),
+            )
+        )
+    return out
+
+
 def compute_will_breach(
     *,
     etas: list[ThresholdEta],

@@ -1,0 +1,84 @@
+# promforecast historical backfill — one-shot Kubernetes Job
+#
+# Replays the configured fit pipeline at simulated past timestamps
+# and pushes the resulting forecast curves + accuracy summaries to
+# the configured remote_write sink with historical timestamps. Use
+# right after `helm install` so SLO / quality dashboards built on
+# `forecast_quality_score` / `forecast_accuracy_mape` produce
+# meaningful aggregates from day one instead of starting from
+# install time.
+#
+# The Job is intentionally a separate workload from the live
+# Deployment — a long backfill walks many fits and would contend
+# with the scheduled fit budget if it shared a process. The cap
+# `safety.backfill_max_window` rejects accidental year-long
+# requests at the CLI boundary.
+#
+# Tune `--from` to match the longest window your SLO / quality
+# dashboards aggregate over (typically 30d for SLO error budgets,
+# 7d for quality-score trends). See `docs/operations/backfill.md`
+# for the per-fit-cost estimate.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: promforecast-backfill
+  labels:
+    app.kubernetes.io/name: promforecast
+    app.kubernetes.io/component: backfill
+spec:
+  # Single-shot — don't retry on container exit. A backfill that
+  # crashed halfway through is best re-run with a narrower window
+  # rather than re-doing the work end-to-end (the sink dedupes by
+  # (labels, timestamp) so partial re-runs are safe but wasteful).
+  backoffLimit: 0
+  # Bound the worst case at one hour. A 30d backfill at the default
+  # 1h refresh interval is 720 fits per group; on a single core
+  # this should comfortably finish well inside the cap. Raise for
+  # high-cardinality configs after running `promforecast validate`
+  # to size the work.
+  activeDeadlineSeconds: 3600
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: backfill
+          # Pin to the same image as the live Deployment so the
+          # backfill uses the exact model versions that production
+          # will see.
+          image: ghcr.io/esops-dev/promforecast:latest
+          imagePullPolicy: IfNotPresent
+          args:
+            - backfill
+            - --config=/etc/promforecast/config.yaml
+            - --from=30d
+            # --to defaults to "now"; pin to an explicit ISO-8601
+            # timestamp if you want reproducibility across re-runs.
+            # - --to=2026-05-24T00:00:00Z
+            # --groups defaults to every configured group; narrow
+            # when iterating on a single dashboard.
+            # - --groups
+            # - node_capacity
+          volumeMounts:
+            - name: config
+              mountPath: /etc/promforecast
+              readOnly: true
+          resources:
+            # Backfill is CPU-bound (statsforecast fits); memory
+            # tracks the largest lookback frame. The defaults here
+            # match the live Deployment's; bump CPU when the walk
+            # is dominated by AutoARIMA fits on many series.
+            requests:
+              cpu: "500m"
+              memory: "512Mi"
+            limits:
+              cpu: "2000m"
+              memory: "2Gi"
+      volumes:
+        - name: config
+          configMap:
+            # Reuse the live forecaster's ConfigMap so backfill
+            # always uses the deployed config. If the ConfigMap
+            # ships under a different name in your install (the
+            # standalone chart names it after the release), update
+            # this `name`.
+            name: promforecast

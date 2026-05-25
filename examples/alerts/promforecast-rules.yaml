@@ -34,6 +34,33 @@ spec:
               {{ $labels.group }} in over 2 hours. Check pod logs and
               datasource availability.
 
+        # Per-series complement to ForecastStale above. The group-level
+        # gauge keeps ticking as long as *any* series of the group is
+        # fit successfully, so a single series whose model crashes
+        # silently is invisible there. ``forecast_data_staleness_seconds``
+        # tracks the per-(series, model) clock so the silent failure
+        # surfaces — alert when staleness exceeds four refresh cycles
+        # (≈ four hours at the default 1h refresh).
+        - alert: ForecastSeriesStale
+          expr: forecast_data_staleness_seconds > 14400
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: >-
+              Forecast {{ $labels.id }} model {{ $labels.model }} on
+              {{ $labels.instance }} hasn't been refit for >4h
+            description: |
+              The (series, model) tuple for {{ $labels.id }} on group
+              {{ $labels.group }} hasn't produced a successful forecast
+              for over four hours. The group-level ForecastStale alert
+              stays quiet because other series in the group are still
+              being fit successfully; this rule catches the silent
+              per-series failure (model crash, persistent fit timeout,
+              data gap that drops the series under min_points). Check
+              the forecaster logs filtered by group + query, then by
+              the source-side labels carried on the staleness gauge.
+
         # Backtest accuracy has degraded — model needs retraining or
         # replacement. Threshold is intentionally loose; tune for the SLOs
         # of the metrics being forecasted.
@@ -78,7 +105,7 @@ spec:
         - alert: ForecastFallbackPersistent
           expr: |
             count by (group) (
-              forecast_quality_score{model_fallback="true", cold_start!="true"}
+              forecast_quality_score{model_fallback="true", cold_start!="true", horizon=""}
             ) > 0
           for: 6h
           labels:
@@ -98,7 +125,7 @@ spec:
         # noisily trip this alert until the underlying series matures.
         - alert: ForecastQualityLow
           expr: |
-            avg by (group) (forecast_quality_score{cold_start!="true"}) < 0.4
+            avg by (group) (forecast_quality_score{cold_start!="true", horizon=""}) < 0.4
           for: 6h
           labels:
             severity: info
@@ -116,7 +143,7 @@ spec:
         # Excludes cold-start: those scores can land at a configured
         # ``max_quality_score`` and are not a model-degradation signal.
         - alert: ForecastQualityZero
-          expr: forecast_quality_score{cold_start!="true"} == 0
+          expr: forecast_quality_score{cold_start!="true", horizon=""} == 0
           for: 1h
           labels:
             severity: info
@@ -168,7 +195,7 @@ spec:
         - alert: ForecastDeviation
           expr: |
             forecast_deviation_outside_band{level="95"} == 1
-            and on (id, group, model) forecast_quality_score > 0.6
+            and on (id, group, model) forecast_quality_score{horizon="1h"} > 0.6
           for: 15m
           labels:
             severity: warning
@@ -188,7 +215,7 @@ spec:
         - alert: ForecastDeviationSevere
           expr: |
             abs(forecast_deviation_ratio{level="95"}) > 2
-            and on (id, group, model) forecast_quality_score > 0.6
+            and on (id, group, model) forecast_quality_score{horizon="1h"} > 0.6
           for: 5m
           labels:
             severity: critical
@@ -222,6 +249,30 @@ spec:
               The end-of-horizon forecast for free space on
               {{ $labels.instance }} ({{ $labels.mountpoint }}) is below
               zero. Provision capacity or clean up.
+
+        # Long-horizon capacity warning gated on the 24h quality slice.
+        # Per-horizon quality scores let capacity-style alerts gate on
+        # the long-horizon reliability rather than an aggregated score
+        # that's dominated by the (typically more reliable) short
+        # horizons. A 24h forecast scoring above 0.5 has enough
+        # backtested accuracy + tight bands at *that* horizon to be
+        # alertable; the equivalent ``horizon=""`` filter would let
+        # noisy long-horizon forecasts trigger off the back of a clean
+        # short-horizon average.
+        - alert: ForecastCapacityWarning
+          expr: |
+            node_filesystem_avail_bytes_forecast < 0
+            and on (id, group, instance) forecast_quality_score{horizon="24h"} > 0.5
+          for: 30m
+          labels:
+            severity: warning
+          annotations:
+            summary: "{{ $labels.instance }}:{{ $labels.mountpoint }} forecast to fill within 24h (reliable)"
+            description: |
+              The 24h forecast for {{ $labels.instance }}
+              ({{ $labels.mountpoint }}) projects exhausted free space,
+              and the 24h quality score is above 0.5 — the forecast is
+              reliable enough to act on. Provision capacity or clean up.
 
         # Alert on the time-to-threshold ETA family directly.
         # Read against the conservative band (``level="95"``) so the
@@ -447,3 +498,238 @@ spec:
               outside its forecast. Roll back unless the deploy is
               expected to shift the metric (in which case retrain
               the model with the new regime).
+
+    # ----------------------------------------------------------------
+    # Forecast stability + cross-model agreement alerts.
+    # ----------------------------------------------------------------
+    # ``forecast_revision_magnitude`` reports how much a model's
+    # prediction for a given horizon moved between successive fits.
+    # ``forecast_model_disagreement`` reports the coefficient of
+    # variation across configured models' central forecasts at the
+    # same horizon (explicit mode only — auto-select suppresses it).
+    - name: promforecast.stability.examples
+      interval: 1m
+      rules:
+        - alert: ForecastUnstable
+          expr: forecast_revision_magnitude > 0.3
+          for: 20m
+          labels:
+            severity: info
+          annotations:
+            summary: "Forecast for {{ $labels.id }} ({{ $labels.model }}) is thrashing"
+            description: |
+              The {{ $labels.horizon }} forecast for {{ $labels.id }}
+              ({{ $labels.model }}) has been moving more than 30% relative
+              to the prior fit for 20m. Possible causes: a regime change
+              the model is over-reacting to, an unstable input regressor,
+              or a season-length misconfiguration.
+
+        - alert: ForecastModelsDisagree
+          expr: forecast_model_disagreement > 0.4
+          for: 30m
+          labels:
+            severity: info
+          annotations:
+            summary: "Configured models disagree on {{ $labels.id }} at {{ $labels.horizon }}"
+            description: |
+              The coefficient of variation across configured models'
+              central forecasts for {{ $labels.id }} at horizon
+              {{ $labels.horizon }} has been above 0.4 for 30m. No
+              single model is confident about this future — consider
+              switching the query to ``auto_select`` or changing the
+              configured model set.
+
+    # ----------------------------------------------------------------
+    # Forecaster self-observability alerts.
+    # ----------------------------------------------------------------
+    # ``forecast_model_fit_success_ratio`` rolls per-(group, model)
+    # fit success/failure over 1h and 24h windows.
+    # ``forecast_regressor_stability_score`` flags regressors whose
+    # recent distribution drifted from their lookback distribution.
+    - name: promforecast.self_observability.examples
+      interval: 5m
+      rules:
+        - alert: ForecastModelFitFailing
+          expr: forecast_model_fit_success_ratio{window="1h"} < 0.9
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Model {{ $labels.model }} fit failing in group {{ $labels.group }}"
+            description: |
+              Less than 90% of {{ $labels.model }} fit attempts in
+              {{ $labels.group }} succeeded over the last hour. Check
+              ``forecast_failures_total`` for the underlying reason
+              (fit_error / fit_timeout / query_error).
+
+        - alert: ForecastRegressorUnstable
+          expr: forecast_regressor_stability_score < 0.3
+          for: 1h
+          labels:
+            severity: info
+          annotations:
+            summary: "Regressor {{ $labels.regressor_id }} for {{ $labels.query }} is unstable"
+            description: |
+              The recent value distribution of regressor
+              {{ $labels.regressor_id }} (query {{ $labels.query }},
+              group {{ $labels.group }}) has drifted significantly
+              from its lookback distribution. The forecast may
+              react to changing regressor signal in unexpected ways
+              until the regressor stabilises or the model re-fits.
+
+    # ----------------------------------------------------------------
+    # Degraded-mode alerts.
+    # ----------------------------------------------------------------
+    # The forecaster isolates failures per (query, series, group) and
+    # papers over many of them with retries, so a failing datasource
+    # or a failing sink can stay invisible if you only watch the
+    # per-fit failure counter. These rules surface the three
+    # operational degraded states the playbook
+    # (``docs/operations/degraded-modes.md``) calls out as the ones
+    # worth paging on: PromQL reads against the long-term TSDB are
+    # failing, sink pushes are failing, or the per-group snapshot
+    # has aged past the freshness threshold operators care about.
+    - name: promforecast.degraded.examples
+      interval: 1m
+      rules:
+        # PromQL reads against the long-term TSDB are failing across
+        # multiple groups. ``forecast_source_retries_total`` ticks on
+        # transient transport errors and 5xx responses; a sustained
+        # rate above 0 is the early signal that the datasource is
+        # not reliably reachable. Pair with
+        # ``forecast_failures_total{reason="query_error"}`` if you
+        # want a stronger terminal-failure signal.
+        - alert: ForecastDatasourceUnreachable
+          expr: |
+            rate(forecast_source_retries_total[5m]) > 0.1
+            or
+            rate(forecast_failures_total{reason=~"query_error|query_timeout"}[5m]) > 0.1
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "promforecast datasource is failing reads ({{ $labels.reason }})"
+            description: |
+              The forecaster is retrying or failing PromQL fetches
+              against the configured ``datasource.url`` at >0.1/s for
+              10m. Existing snapshot data continues to serve via
+              ``/metrics`` but new fits cannot proceed — check
+              VictoriaMetrics (or the configured TSDB) reachability,
+              authentication, and network policies. See
+              ``docs/operations/degraded-modes.md`` for the recovery
+              path.
+
+        # Sink (``remote_write``) writes are failing. Distinct from
+        # fit-side failures — a failing sink is invisible to
+        # ``forecast_failures_total`` because the runner records the
+        # failure on the dedicated ``forecast_sink_write_failures_total``
+        # counter and continues. Forecasts still appear on ``/metrics``
+        # via the snapshot path; only the long-term TSDB stops
+        # accruing the smooth curve.
+        - alert: ForecastSinkWriteFailing
+          expr: rate(forecast_sink_write_failures_total[5m]) > 0
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: "promforecast sink writes are failing ({{ $labels.reason }})"
+            description: |
+              The forecaster has been failing to push forecast curves
+              to the configured ``sink.remote_write`` target for 15m
+              (reason {{ $labels.reason }}). Snapshots remain on
+              ``/metrics`` but the long-term TSDB stops accumulating
+              the future-dated forecast curve. Check the sink target's
+              reachability, the configured ``futureRetention``
+              (VictoriaMetrics rejects past it), and the bearer/auth
+              headers. See ``docs/operations/degraded-modes.md``.
+
+        # The per-group snapshot is stale. ``forecast_snapshot_age_seconds``
+        # is the server-side complement to
+        # ``time() - forecast_last_run_timestamp_seconds`` — the same
+        # signal but pre-subtracted so the alert reads as a direct
+        # gauge comparison. Tune the threshold to roughly 4x the
+        # group's ``refresh_interval``; the default 2h matches a 30m
+        # refresh.
+        - alert: ForecastSnapshotStale
+          expr: forecast_snapshot_age_seconds > 7200
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Snapshot for {{ $labels.group }} hasn't refreshed in over 2h"
+            description: |
+              The most recent successful snapshot for group
+              {{ $labels.group }} is older than 2h. Distinct from
+              ``ForecastStale``: this alert reads the pre-subtracted
+              ``forecast_snapshot_age_seconds`` gauge directly, which
+              makes the alert and dashboard expressions identical.
+              Check pod health, datasource reachability
+              (``ForecastDatasourceUnreachable``), and sink health
+              (``ForecastSinkWriteFailing``) for the underlying
+              cause. See ``docs/operations/degraded-modes.md``.
+
+    # ----------------------------------------------------------------
+    # Governance + drift-explainer alerts.
+    # ----------------------------------------------------------------
+    # ``forecast_service_health_score`` and
+    # ``forecast_drift_explained_total`` are emission families the
+    # forecaster produces when the operator opts into the
+    # ``governance.health_score`` block and the drift-explainer
+    # (always on when ``emission.drift.enabled: true``) respectively.
+    # The rules below ship as templates — adjust the bucket labels
+    # (``service``, ``environment``) and thresholds to match your
+    # fleet.
+    - name: promforecast.governance.examples
+      interval: 1m
+      rules:
+        # Service-level forecast health is below the executive-
+        # dashboard floor. Use this as a quarterly review trigger,
+        # not a pager — a low aggregate score across a whole service
+        # bucket is rarely an immediate incident, but it points at
+        # systemic forecast-quality issues worth investigating before
+        # they degrade the alerts gated on
+        # ``forecast_quality_score``.
+        - alert: ForecastServiceHealthLow
+          expr: forecast_service_health_score < 0.6
+          for: 24h
+          labels:
+            severity: info
+          annotations:
+            summary: "Forecast health for {{ $labels.service }} below 0.6"
+            description: |
+              Aggregate forecast quality across the
+              {{ $labels.service }} bucket has been below 0.6 for
+              24h ({{ $labels.series_count }} series in the bucket).
+              Pages of derived alerts (deviation, capacity ETA) that
+              gate on ``forecast_quality_score`` for the same
+              services are silently rejecting their forecasts. Check
+              ``forecast_accuracy_mape`` and
+              ``forecast_band_empirical_coverage`` to identify which
+              dimension dropped. See
+              ``docs/governance/forecast-health.md``.
+
+        # A single regressor keeps explaining drift events for the
+        # same query — strong hint that the regressor is the actual
+        # driver of the forecast moving. Useful for spotting
+        # regressors that need tuning (e.g. a noisy ``deploys``
+        # counter), or signals worth promoting to a dedicated
+        # alert.
+        - alert: DriftExplainedRepeats
+          expr: |
+            sum by (group, query, primary_suspect) (
+              increase(forecast_drift_explained_total[1h])
+            ) >= 3
+          for: 15m
+          labels:
+            severity: info
+          annotations:
+            summary: "{{ $labels.primary_suspect }} keeps explaining drift on {{ $labels.query }}"
+            description: |
+              ``forecast_drift_explained_total`` shows
+              {{ $labels.primary_suspect }} as the primary suspect
+              for >=3 drift events on (group={{ $labels.group }},
+              query={{ $labels.query }}) in the last hour. Either
+              the regressor is genuinely driving the forecast — in
+              which case investigate the upstream signal — or the
+              correlation window is too short and the suspect is
+              noise. See ``docs/operations/drift-explained.md``.
