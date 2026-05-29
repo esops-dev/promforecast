@@ -47,6 +47,7 @@ from .. import regressors as regressors_mod
 from .. import revision as revision_mod
 from .. import right_sizing as right_sizing_mod
 from .. import seasonality as seasonality_mod
+from .. import sharding as sharding_mod
 from .. import slo as slo_mod
 from .. import telemetry as telemetry_mod
 from .. import what_if as what_if_mod
@@ -300,7 +301,9 @@ def _trailing_regressor_values(regressors: Any | None) -> dict[str, float]:
     return out
 
 
-def _build_threshold_action_cost_points(group: GroupConfig) -> list[ThresholdActionCostPoint]:
+def _build_threshold_action_cost_points(
+    group: GroupConfig, *, shard_id: str = ""
+) -> list[ThresholdActionCostPoint]:
     """Project a group's configured thresholds onto action-cost points.
 
     Pure projection from config — the points carry the operator's
@@ -309,7 +312,11 @@ def _build_threshold_action_cost_points(group: GroupConfig) -> list[ThresholdAct
     Independent of fit results: a query whose fit failed (or was
     skipped this tick) still publishes its action_cost rows so the
     Grafana "rank by cost" panel doesn't go blank.
+
+    ``shard_id`` (sharded mode only) is attached so the family carries the
+    same ``shard_id`` label as the rest of this replica's output.
     """
+    shard_label = {"shard_id": shard_id} if shard_id else {}
     out: list[ThresholdActionCostPoint] = []
     for query in group.queries:
         annotations = capacity_mod.build_threshold_action_costs(query.thresholds)
@@ -317,6 +324,7 @@ def _build_threshold_action_cost_points(group: GroupConfig) -> list[ThresholdAct
             out.append(
                 ThresholdActionCostPoint(
                     labels={
+                        **shard_label,
                         "id": query.id,
                         "group": group.name,
                         "name": ann.name,
@@ -447,6 +455,12 @@ class Runner:
         # Used by HA mode to publish the rendered /metrics payload to the
         # shared snapshot cache; ``None`` in single-replica deployments.
         self._snapshot_publisher: Callable[[], Awaitable[None]] | None = None
+        # Optional shard coordinator (sharding mode). ``None`` means "own every
+        # group" — the single-replica / HA default, unchanged behaviour. When
+        # set, only groups this replica owns get a scheduled loop, and output
+        # points carry the ``shard_id`` label.
+        self._shard_coordinator: sharding_mod.ShardCoordinator | None = None
+        self._shard_id: str = ""
         self._locks: dict[str, asyncio.Lock] = {g.name: asyncio.Lock() for g in config.groups}
         # Per-group task: keyed by group.name, holds the long-lived loop. We
         # key per-group (rather than a flat list) so apply_config can diff and
@@ -474,6 +488,41 @@ class Runner:
         """
         self._snapshot_publisher = publisher
 
+    def set_shard_coordinator(self, coordinator: sharding_mod.ShardCoordinator | None) -> None:
+        """Install (or clear) the shard coordinator for horizontal sharding.
+
+        When set, this replica only schedules the groups the coordinator says
+        it owns, and every output point carries the coordinator's ``shard_id``
+        label. Called once at boot from :func:`main.run` before ``start``.
+        """
+        self._shard_coordinator = coordinator
+        self._shard_id = coordinator.shard_id if coordinator is not None else ""
+
+    def group_names(self) -> list[str]:
+        """Names of the currently-configured groups (reload-aware).
+
+        Read by the shard refresh loop so the ``leader_assigned`` assigner
+        always computes its mapping over the live group set, even across a
+        config reload.
+        """
+        return [g.name for g in self._config.groups]
+
+    def _owns_group(self, group_name: str) -> bool:
+        """Does this replica own ``group_name``? True for all when unsharded."""
+        if self._shard_coordinator is None:
+            return True
+        return self._shard_coordinator.owns(group_name)
+
+    def _shard_label(self) -> dict[str, str]:
+        """``{"shard_id": ...}`` in sharded mode, else ``{}``.
+
+        Spread into the handful of operational metric label dicts that are
+        built by hand rather than via :class:`SeriesPointFactory` (which folds
+        the same label in for everything it emits), so the ``shard_id`` label
+        is present consistently across every per-series output family.
+        """
+        return {"shard_id": self._shard_id} if self._shard_id else {}
+
     async def start(self) -> None:
         """Run each group once immediately, then on the configured interval."""
         # Guard against double-start: HA mode's leader-acquired callback
@@ -484,12 +533,108 @@ class Runner:
         self._stopped.clear()
         for group in self._config.groups:
             self._spawn_group_loop(group)
+        self._publish_shard_ownership()
 
     def _spawn_group_loop(self, group: GroupConfig) -> None:
-        """Create the stop event + task for one group. Idempotent per name."""
+        """Create the stop event + task for one group. Idempotent per name.
+
+        In sharded mode this is a no-op for groups this replica does not own —
+        ownership is enforced here so every spawn path (``start``, reload, and
+        shard reconciliation) funnels through one gate.
+        """
+        if not self._owns_group(group.name):
+            return
         ev = asyncio.Event()
         self._stop_events[group.name] = ev
         self._tasks[group.name] = asyncio.create_task(self._loop(group, ev))
+
+    def _publish_shard_ownership(self) -> None:
+        """Refresh the ``forecast_shard_owns_group`` gauge from current owners."""
+        if self._shard_coordinator is None:
+            return
+        owned = self._shard_coordinator.owned_groups(g.name for g in self._config.groups)
+        self._exporter.set_shard_state(shard_id=self._shard_id, owned_groups=owned)
+
+    async def reconcile_shard_ownership(self) -> None:
+        """Align running group loops with current shard ownership.
+
+        Spawns loops for newly-owned groups and drains loops for groups this
+        replica no longer owns (e.g. after a ``leader_assigned`` rebalance when
+        a replica joined). Snapshots for relinquished groups are dropped so a
+        replica stops serving stale forecasts for groups it handed off. A no-op
+        when sharding is disabled or the scheduler isn't running.
+        """
+        if self._shard_coordinator is None or self._stopped.is_set():
+            self._publish_shard_ownership()
+            return
+        owned = self._shard_coordinator.owned_groups(g.name for g in self._config.groups)
+        running = set(self._tasks)
+        to_stop = running - owned
+        to_start = owned - running
+        for name in sorted(to_stop):
+            await self._drain_group(name)
+        if to_stop:
+            self._exporter.retain_groups(set(self._tasks))
+            # Drop per-(group, query) tracker state for relinquished groups,
+            # mirroring the reload prune. Otherwise a group later reassigned
+            # back to this replica would score drift / revision against a
+            # forecast made *before* the handoff — stale, because another
+            # shard produced this group's forecasts in the interim. Prune to
+            # the (group, query) pairs this replica still owns.
+            self._prune_caches_to_groups(owned)
+        groups_by_name = {g.name: g for g in self._config.groups}
+        for name in sorted(to_start):
+            group = groups_by_name.get(name)
+            if group is not None:
+                self._spawn_group_loop(group)
+        if to_start or to_stop:
+            logger.info(
+                "shard_ownership_reconciled",
+                shard_id=self._shard_id,
+                started=sorted(to_start),
+                stopped=sorted(to_stop),
+            )
+        self._publish_shard_ownership()
+
+    def _prune_caches_to_groups(self, owned: set[str]) -> None:
+        """Forget per-(group, query) tracker state outside ``owned``.
+
+        Mirrors the reload prune (:meth:`apply_config`) but scoped to the
+        groups this shard owns, so a ``leader_assigned`` rebalance that hands a
+        group off doesn't leave a stale drift / revision baseline behind.
+        """
+        live_pairs = {
+            (g.name, q.id) for g in self._config.groups if g.name in owned for q in g.queries
+        }
+        self._drift_cache.prune_to(live_pairs)
+        self._revision_cache.prune_to(live_pairs)
+        self._band_coverage.forget(live_pairs)
+        self._drift_windows = {
+            key: window
+            for key, window in self._drift_windows.items()
+            if (key[0], key[1]) in live_pairs
+        }
+
+    async def _drain_group(self, name: str) -> None:
+        """Cooperatively stop a single group's loop and await its drain.
+
+        Same contract as :meth:`_drain_all_groups` but for one group: signal
+        the stop event, let an in-flight ``run_group`` finish and write its
+        snapshot, then hard-cancel if it overruns the grace window.
+        """
+        ev = self._stop_events.pop(name, None)
+        task = self._tasks.pop(name, None)
+        if ev is not None:
+            ev.set()
+        if task is None:
+            return
+        grace = self._drain_grace_seconds(self._config)
+        try:
+            await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), timeout=grace)
+        except TimeoutError:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
 
     async def apply_config(self, new_config: Config) -> ReloadResult:
         """Swap in a new validated config, draining in-flight runs first.
@@ -666,6 +811,11 @@ class Runner:
             await self._rebuild_integrations(old_config=old)
             for group in new_config.groups:
                 self._spawn_group_loop(group)
+            # The group list may have changed which groups this replica owns
+            # (new groups hash to this shard, removed ones drop off); refresh
+            # the ownership gauge to match. ``leader_assigned`` republishes its
+            # mapping for the new group set on the next periodic tick.
+            self._publish_shard_ownership()
 
             return ReloadResult(added=added, removed=removed, changed=changed)
 
@@ -1028,7 +1178,9 @@ class Runner:
             # /metrics on the next refresh; partial-tick refreshes still
             # publish the full set because every configured query is
             # walked here regardless of which subset actually ran.
-            threshold_action_cost_points = _build_threshold_action_cost_points(group)
+            threshold_action_cost_points = _build_threshold_action_cost_points(
+                group, shard_id=self._shard_id
+            )
             self._exporter.update(
                 GroupSnapshot(
                     group=group.name,
@@ -1934,6 +2086,7 @@ class Runner:
         for model_name in models:
             labels = {
                 **source_labels,
+                **self._shard_label(),
                 "id": query_id,
                 "group": group_name,
                 "model": model_name,
@@ -2106,6 +2259,7 @@ class Runner:
             base_labels=frame.labels,
             group=group.name,
             levels=list(d.confidence_levels),
+            shard_id=self._shard_id,
         )
         fit_result = _FitResult()
         forecast_points = [
@@ -2167,6 +2321,7 @@ class Runner:
             # confident the sibling set looked.
             quality_label = {
                 **{k: v for k, v in frame.labels.items() if k != "__name__"},
+                **self._shard_label(),
                 "id": query.id,
                 "group": group.name,
                 "model": cold_start_mod.COLD_START_MODEL_NAME,
@@ -2256,6 +2411,7 @@ class Runner:
         points = [
             IncidentRecurrencePoint(
                 labels={
+                    **self._shard_label(),
                     "group": group.name,
                     "id": query.id,
                     "day_of_week": str(bucket.day_of_week),
@@ -2443,6 +2599,7 @@ class Runner:
             base_labels=frame.labels,
             group=group_name,
             levels=levels,
+            shard_id=self._shard_id,
         )
 
         result = _FitResult()
@@ -2976,6 +3133,7 @@ class Runner:
         series_key = _series_key_from_labels(frame.labels)
         common = {
             **{k: v for k, v in frame.labels.items() if k != "__name__"},
+            **self._shard_label(),
             "id": query.id,
             "group": group_name,
         }

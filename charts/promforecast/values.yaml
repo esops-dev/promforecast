@@ -28,6 +28,29 @@ highAvailability:
     existingSecret: ""
     secretKey: password
 
+# Horizontal sharding: run multiple *active* replicas, each fitting a disjoint
+# subset of the configured groups so the aggregate fit budget scales with the
+# replica count. Distinct from highAvailability (one active leader plus hot
+# followers serving a cached snapshot) and mutually exclusive with it. The
+# `replicaCount` field above controls the shard count. See
+# docs/scaling/sharded-ha.md for the sizing guide and mode trade-offs.
+sharding:
+  enabled: false
+  # consistent_hash — each replica owns a group iff hash(group) % replicas
+  #   equals its own shard index. With this mode the chart renders a
+  #   StatefulSet so each pod's stable ordinal (<name>-0, <name>-1, …) is its
+  #   shard index; no coordination backend is required.
+  # leader_assigned — a coordination.k8s.io/v1 Lease elects one replica to
+  #   compute a balanced group→shard assignment over the live membership and
+  #   publish it to Redis; every replica reads it. Rebalances on replica
+  #   join/leave. Requires `redis.address`. Renders a Deployment (pods need no
+  #   stable ordinal — the assigner distributes by identity).
+  mode: consistent_hash
+  redis:
+    address: ""     # required for mode=leader_assigned, e.g. redis-master.redis.svc:6379
+    existingSecret: ""
+    secretKey: password
+
 # Forecaster YAML config. Either inline below, or set existingConfigMap.
 existingConfigMap: ""
 config:
@@ -174,6 +197,26 @@ config:
       address: ""
       password: ""
       snapshot_ttl: 5m
+
+  # Sharding runtime view of the top-level `sharding` switch. `helm install`
+  # populates `enabled`, `mode`, and `replica_count` from the chart fields and
+  # `replicaCount` automatically, so operators usually only edit the top-level
+  # values. `shard_index` and `shard_id` are left at their derive-from-env
+  # defaults (-1 / "") — under Kubernetes the StatefulSet pod ordinal becomes
+  # the index and the pod name becomes the id. Override the inner block to
+  # tune the leader_assigned heartbeat/Lease or to pin a shard id off-cluster.
+  sharding:
+    enabled: false
+    mode: consistent_hash
+    replica_count: 1
+    shard_index: -1
+    shard_id: ""
+    heartbeat_interval_seconds: 10
+    member_ttl_seconds: 30
+    lease_name: promforecast-shard-assigner
+    lease_duration_seconds: 30
+    renew_deadline_seconds: 20
+    retry_period_seconds: 4
 
   # Optional OpenTelemetry tracing. Disabled by default; flip
   # `telemetry.enabled` and set an `otlp.endpoint` to ship traces of the

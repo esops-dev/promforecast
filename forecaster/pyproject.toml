@@ -185,4 +185,5 @@ testpaths = ["tests"]
 asyncio_mode = "auto"
 markers = [
     "benchmark: micro-benchmarks gated out of the default run; opt in with `-m benchmark`",
+    "kind: integration tests needing a real Kubernetes cluster (kind); skipped unless PROMFORECAST_KIND_TEST is set",
 ]

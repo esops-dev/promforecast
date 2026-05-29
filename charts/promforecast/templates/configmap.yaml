@@ -27,5 +27,29 @@ data:
     {{- $_ := set $ha "redis" $redis }}
     {{- end }}
     {{- $_ := set $cfg "highAvailability" $ha }}
+    {{- /*
+        Sharding follows the same merge philosophy: the chart-level `sharding`
+        block is the easy switch, and we propagate `enabled`, `mode`, and the
+        shard count (from `replicaCount`, the single source of truth so the
+        StatefulSet replica count and the forecaster's view can't drift). The
+        inner `config.sharding` block stays available for advanced overrides.
+        For leader_assigned we also seed the query-cache Redis address (the
+        forecaster reads the membership/assignment store from there when HA is
+        off) unless the operator already set one.
+    */}}
+    {{- $sh := default dict (get $cfg "sharding") }}
+    {{- if .Values.sharding.enabled }}
+    {{- $_ := set $sh "enabled" true }}
+    {{- $_ := set $sh "mode" .Values.sharding.mode }}
+    {{- $_ := set $sh "replica_count" (.Values.replicaCount | int) }}
+    {{- if eq .Values.sharding.mode "leader_assigned" }}
+    {{- $qc := default dict (get $cfg "query_cache") }}
+    {{- if and (.Values.sharding.redis.address) (not (get $qc "redis_address")) }}
+    {{- $_ := set $qc "redis_address" .Values.sharding.redis.address }}
+    {{- $_ := set $cfg "query_cache" $qc }}
+    {{- end }}
+    {{- end }}
+    {{- end }}
+    {{- $_ := set $cfg "sharding" $sh }}
     {{- toYaml $cfg | nindent 4 }}
 {{- end }}

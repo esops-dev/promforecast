@@ -48,6 +48,11 @@ config:
 
 Defaults match the Kubernetes control plane. The forecaster rejects any config where `renew_deadline_seconds >= lease_duration_seconds`.
 
-## Why not multi-leader sharding?
+## Sharding — when one leader isn't enough
 
-True sharding (different replicas fitting different groups) is planned for a future major version. For now, followers carry zero fit cost — the simplest and safest model for v0.x deployments.
+HA scales to one well-sized leader plus hot followers; the followers carry zero
+fit cost. Once a single leader can no longer fit everything within
+`refresh_interval`, switch to **[sharded HA](../scaling/sharded-ha.md)**, where
+every replica is active and fits a disjoint subset of the groups. HA and
+sharding are mutually exclusive — pick HA for zero-downtime failover when one
+replica keeps up, sharding for horizontal fit throughput.

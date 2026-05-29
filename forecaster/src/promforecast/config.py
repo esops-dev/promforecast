@@ -1216,6 +1216,89 @@ class HighAvailabilityConfig(BaseModel):
         return self
 
 
+class ShardingConfig(BaseModel):
+    """Horizontal sharding: N *active* replicas, each fitting a disjoint
+    subset of the configured groups.
+
+    Off by default. This is a different scaling model from
+    :class:`HighAvailabilityConfig` — HA is "one active leader plus hot
+    followers serving the leader's cached snapshot", which tops out around
+    one well-sized leader's fit budget. Sharding instead spreads the fit
+    work across every replica, so horizontal scale becomes a knob (the
+    chart's ``replicas`` field). The two are mutually exclusive: HA gates
+    fitting on leadership, sharding wants every replica fitting.
+
+    Two ownership modes:
+
+    * ``consistent_hash`` — each replica computes which groups it owns from
+      a stable hash of the group name modulo the replica count, compared
+      against its own shard index. No cross-replica coordination is needed
+      beyond agreeing on the replica count and each replica knowing its own
+      index (the chart runs a StatefulSet so the pod ordinal is the index).
+    * ``leader_assigned`` — a ``coordination.k8s.io/v1`` Lease elects one
+      replica as the assigner; it computes a balanced group→shard mapping
+      over the live membership and publishes it to the shared Redis, and
+      every replica reads it to learn what it owns. Rebalances when a
+      replica joins or leaves. Requires a Redis backend (the same one HA
+      and the query cache use) for the membership registry and the
+      published assignment.
+
+    Output metrics for the groups a replica owns gain a ``shard_id`` label,
+    and a ``forecast_shard_owns_group{shard_id, group}`` gauge exposes the
+    assignment for debugging. The ``shard_id`` label is tool-private (it
+    describes which replica fit the group, not the underlying signal) so it
+    is not part of the cross-tool label contract; it is only emitted when
+    sharding is enabled, leaving single-replica labelsets unchanged.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    mode: Literal["consistent_hash", "leader_assigned"] = "consistent_hash"
+    # Total number of shards. The chart sets this from ``replicas`` so the
+    # config and the StatefulSet replica count can't drift. ``ge=1`` keeps a
+    # zero from silently disabling all ownership.
+    replica_count: int = Field(default=1, ge=1)
+    # This replica's 0-based shard index for ``consistent_hash`` ownership.
+    # ``-1`` (the default) means "derive at boot" — from the StatefulSet pod
+    # ordinal (the trailing ``-N`` of ``PROMFORECAST_POD_NAME``) or the
+    # explicit ``PROMFORECAST_SHARD_INDEX`` env var. Set a concrete value
+    # only for local/test runs where neither env var is present.
+    shard_index: int = Field(default=-1, ge=-1)
+    # Label value identifying this shard on output metrics. Empty means
+    # "derive at boot" — the pod name, else ``shard-<index>``. Operators
+    # rarely set this; it exists so a non-Kubernetes deployment can pin a
+    # stable id.
+    shard_id: str = ""
+    # ``leader_assigned`` membership: each replica writes a heartbeat key
+    # with this TTL; the assigner lists the live members from those keys.
+    # The TTL must comfortably exceed the heartbeat interval so a replica
+    # mid-GC-pause isn't dropped from the membership.
+    heartbeat_interval_seconds: int = Field(default=10, ge=1)
+    member_ttl_seconds: int = Field(default=30, ge=2)
+    # Lease parameters for ``leader_assigned`` (mirrors the HA defaults).
+    lease_name: str = "promforecast-shard-assigner"
+    lease_duration_seconds: int = Field(default=30, ge=2)
+    renew_deadline_seconds: int = Field(default=20, ge=1)
+    retry_period_seconds: int = Field(default=4, ge=1)
+
+    @model_validator(mode="after")
+    def _validate(self) -> ShardingConfig:
+        if self.shard_index >= 0 and self.shard_index >= self.replica_count:
+            raise ValueError(
+                f"sharding.shard_index ({self.shard_index}) must be < "
+                f"replica_count ({self.replica_count})"
+            )
+        if self.member_ttl_seconds <= self.heartbeat_interval_seconds:
+            raise ValueError(
+                "sharding.member_ttl_seconds must be > heartbeat_interval_seconds "
+                f"(got {self.member_ttl_seconds} <= {self.heartbeat_interval_seconds})"
+            )
+        if self.renew_deadline_seconds >= self.lease_duration_seconds:
+            raise ValueError("sharding.renew_deadline_seconds must be < lease_duration_seconds")
+        return self
+
+
 class OTLPTelemetryConfig(BaseModel):
     """OTLP exporter target for the optional OpenTelemetry tracer.
 
@@ -1614,6 +1697,7 @@ class Config(BaseModel):
     high_availability: HighAvailabilityConfig = Field(
         default_factory=HighAvailabilityConfig, alias="highAvailability"
     )
+    sharding: ShardingConfig = Field(default_factory=ShardingConfig)
     query_cache: QueryCacheConfig = QueryCacheConfig()
     telemetry: TelemetryConfig = Field(default_factory=TelemetryConfig)
     groups: list[GroupConfig]
@@ -1635,6 +1719,33 @@ class Config(BaseModel):
     # Grafana-annotations sink for forecast events. Off by default;
     # see :class:`AnnotationsConfig`.
     annotations: AnnotationsConfig = Field(default_factory=AnnotationsConfig)
+
+    @model_validator(mode="after")
+    def _validate_scaling_modes(self) -> Config:
+        # HA (single-active leader) and sharding (every replica active) are
+        # opposite scaling models — enabling both is a misconfiguration, not
+        # a richer setup. Reject it at load time so the contradiction can't
+        # ship to a cluster.
+        if self.sharding.enabled and self.high_availability.enabled:
+            raise ValueError(
+                "sharding.enabled and highAvailability.enabled are mutually exclusive: "
+                "HA gates fitting on a single leader, sharding spreads fitting across "
+                "every replica. Pick one."
+            )
+        # leader_assigned needs a Redis backend for the membership registry
+        # and the published group→shard assignment. Accept the HA Redis or a
+        # standalone query-cache Redis — main.py reuses whichever is set.
+        if (
+            self.sharding.enabled
+            and self.sharding.mode == "leader_assigned"
+            and not (self.high_availability.redis.address or self.query_cache.redis_address)
+        ):
+            raise ValueError(
+                "sharding.mode=leader_assigned requires a Redis backend; set "
+                "highAvailability.redis.address or query_cache.redis_address so "
+                "replicas can share the membership registry and assignment map"
+            )
+        return self
 
 
 def load(path: str | Path) -> Config:

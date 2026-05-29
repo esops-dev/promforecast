@@ -37,7 +37,14 @@ spec:
         configured port (default 6379); operators with a non-default Redis
         port can override via networkPolicy.redisPort.
     */}}
-    {{- if .Values.highAvailability.enabled }}
+    {{- /*
+        leader_assigned sharding has the same egress needs as HA: the Lease
+        API on the kube-apiserver plus Redis (membership registry +
+        assignment). consistent_hash sharding needs neither — its egress is
+        just DNS + the TSDB (covered by networkPolicy.egress).
+    */}}
+    {{- $needsCoordEgress := or .Values.highAvailability.enabled (and .Values.sharding.enabled (eq .Values.sharding.mode "leader_assigned")) }}
+    {{- if $needsCoordEgress }}
     - to:
         - namespaceSelector: {}
       ports:

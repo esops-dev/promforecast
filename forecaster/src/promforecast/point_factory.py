@@ -123,11 +123,21 @@ class SeriesPointFactory:
         base_labels: dict[str, str],
         group: str,
         levels: list[int],
+        shard_id: str = "",
     ) -> None:
         self._metric_id = metric_id
         self._group = group
         self._levels = levels
         self._base_common = {k: v for k, v in base_labels.items() if k != "__name__"}
+        # In sharded deployments every output point for this series carries a
+        # ``shard_id`` label identifying the replica that fit it. Folding it
+        # into ``_base_common`` propagates it uniformly through every family
+        # the factory builds (forecast, lower/upper, accuracy, deviation,
+        # quality, ensemble, contribution, growth, …) without touching each
+        # ``_build_common_labels`` / ``_common_with_id`` call site. Empty when
+        # sharding is disabled, so single-replica labelsets are unchanged.
+        if shard_id:
+            self._base_common["shard_id"] = shard_id
 
     def forecast_points(
         self,
