@@ -39,6 +39,7 @@ __all__ = [
     "AccuracyPoint",
     "BandCoveragePoint",
     "CalibrationOffsetPoint",
+    "CanaryDeviationPoint",
     "ComponentDecompositionPoint",
     "ConditionalCalibrationOffsetPoint",
     "ConditionalDeviationPoint",
@@ -98,6 +99,26 @@ class DeviationPoint:
     ``forecast_deviation_outside_band`` gauges.
     """
 
+    labels: dict[str, str]
+    ratio: float
+    outside_band: bool
+
+
+@dataclass(frozen=True)
+class CanaryDeviationPoint:
+    """A canary-vs-baseline deviation observation destined for /metrics.
+
+    Rendered as the per-id family ``<id>_canary_forecast_deviation`` (the
+    signed ratio) and ``<id>_canary_forecast_deviation_outside_band`` (0/1)
+    — the same shape as the unconditional :class:`DeviationPoint`, but the
+    band is the *baseline*-predicted forecast and the observed value is the
+    *canary* series' most recent actual. ``metric`` is the query id (so the
+    family name carries the underlying signal); ``labels`` preserve the
+    canary series' own labels (``deployment``, ``replica``, ``version``,
+    ...) plus ``model`` and ``level``.
+    """
+
+    metric: str
     labels: dict[str, str]
     ratio: float
     outside_band: bool
@@ -505,6 +526,7 @@ class GroupSnapshot:
     points: list[ForecastPoint] = field(default_factory=list)
     accuracy_points: list[AccuracyPoint] = field(default_factory=list)
     deviation_points: list[DeviationPoint] = field(default_factory=list)
+    canary_deviation_points: list[CanaryDeviationPoint] = field(default_factory=list)
     quality_points: list[QualityPoint] = field(default_factory=list)
     ensemble_weights: list[EnsembleWeightPoint] = field(default_factory=list)
     contribution_points: list[ContributionPoint] = field(default_factory=list)
@@ -714,6 +736,14 @@ class Exporter:
             "error": 0,
             "invalid_body": 0,
         }
+        # Per-(trigger name, outcome) forecast-driven webhook fire counter.
+        # ``outcome`` is bounded to {success, http_error, timeout} so the
+        # label set stays small. Always emitted (even at zero) so a
+        # dashboard renders a series from the first configured trigger.
+        self._trigger_fires: dict[tuple[str, str], int] = {}
+        # Per-(event_type, outcome) Grafana-annotation post counter.
+        # ``outcome`` bounded to {success, http_error, timeout}.
+        self._annotation_posts: dict[tuple[str, str], int] = {}
         # Per-(group, query, model, reason) decomposition-skipped counter.
         # Bumped when ``emission.decompose: true`` is set on a query but
         # the chosen model does not decompose cleanly. The ``reason`` set
@@ -929,6 +959,30 @@ class Exporter:
         with self._lock:
             self._what_if_runs[outcome] = self._what_if_runs.get(outcome, 0) + 1
 
+    def increment_trigger_fire(self, name: str, outcome: str) -> None:
+        """Bump ``forecast_trigger_fires_total{name, outcome}``.
+
+        ``outcome`` is one of ``success`` | ``http_error`` | ``timeout``;
+        an out-of-set value is collapsed to ``http_error`` so a future code
+        path can't blow the label cardinality.
+        """
+        if outcome not in ("success", "http_error", "timeout"):
+            outcome = "http_error"
+        with self._lock:
+            key = (name, outcome)
+            self._trigger_fires[key] = self._trigger_fires.get(key, 0) + 1
+
+    def increment_annotation_post(self, event_type: str, outcome: str) -> None:
+        """Bump ``forecast_annotation_posts_total{event_type, outcome}``.
+
+        ``outcome`` is one of ``success`` | ``http_error`` | ``timeout``.
+        """
+        if outcome not in ("success", "http_error", "timeout"):
+            outcome = "http_error"
+        with self._lock:
+            key = (event_type, outcome)
+            self._annotation_posts[key] = self._annotation_posts.get(key, 0) + 1
+
     def record_discovery(
         self,
         *,
@@ -1079,6 +1133,14 @@ class Exporter:
     def _what_if_runs_state(self) -> dict[str, int]:
         with self._lock:
             return dict(self._what_if_runs)
+
+    def _trigger_fires_state(self) -> dict[tuple[str, str], int]:
+        with self._lock:
+            return dict(self._trigger_fires)
+
+    def _annotation_posts_state(self) -> dict[tuple[str, str], int]:
+        with self._lock:
+            return dict(self._annotation_posts)
 
     def _discovery_state(
         self,
@@ -1444,6 +1506,8 @@ class _SnapshotCollector:
         leader_state = self._exporter._leader_state()
         cache_state = self._exporter._query_cache_state()
         what_if_runs_state = self._exporter._what_if_runs_state()
+        trigger_fires_state = self._exporter._trigger_fires_state()
+        annotation_posts_state = self._exporter._annotation_posts_state()
         discovery_state = self._exporter._discovery_state()
         season_length_state = self._exporter._season_length_state()
         decomposition_skipped_state = self._exporter._decomposition_skipped_state()
@@ -1460,6 +1524,7 @@ class _SnapshotCollector:
         yield from _component_families(groups)
         yield from _accuracy_families(groups)
         yield from _deviation_families(groups)
+        yield from _canary_deviation_families(groups)
         yield from _quality_families(groups)
         yield from _ensemble_families(groups)
         yield from _contribution_families(groups)
@@ -1488,6 +1553,8 @@ class _SnapshotCollector:
         yield from _leader_families(leader_state)
         yield from _query_cache_families(cache_state)
         yield from _what_if_runs_families(what_if_runs_state)
+        yield from _trigger_fires_families(trigger_fires_state)
+        yield from _annotation_posts_families(annotation_posts_state)
         yield from _discovery_families(discovery_state)
         yield from _season_length_families(season_length_state)
         yield from _decomposition_skipped_families(decomposition_skipped_state)
@@ -1624,6 +1691,37 @@ def _deviation_families(
         "1 if the most recent actual is outside the forecast band, else 0.",
         value_fn=lambda p: 1.0 if p.outside_band else 0.0,
     )
+
+
+def _canary_deviation_families(
+    groups: list[GroupSnapshot],
+) -> Iterator[GaugeMetricFamily]:
+    """Render the ``<id>_canary_forecast_deviation*`` family, one per id.
+
+    Mirrors :func:`_deviation_families` (ratio + outside_band) but the
+    metric name is per-id so the canary signal sits alongside the
+    underlying forecast in Grafana, and the emission shape matches what
+    Argo Rollouts / Flagger AnalysisRun templates query.
+    """
+    by_metric: dict[str, list[CanaryDeviationPoint]] = {}
+    for snap in groups:
+        for point in snap.canary_deviation_points:
+            by_metric.setdefault(point.metric, []).append(point)
+    for metric_name, points in sorted(by_metric.items()):
+        yield from _emit_gauge_family(
+            points,
+            f"{metric_name}_canary_forecast_deviation",
+            "Signed deviation of the canary actual from the baseline-predicted "
+            "forecast band, as (actual - yhat) / (yhat_upper - yhat_lower).",
+            value_fn=lambda p: p.ratio,
+            skip_fn=lambda p: not math.isfinite(p.ratio),
+        )
+        yield from _emit_gauge_family(
+            points,
+            f"{metric_name}_canary_forecast_deviation_outside_band",
+            "1 if the canary actual is outside the baseline-predicted forecast band, else 0.",
+            value_fn=lambda p: 1.0 if p.outside_band else 0.0,
+        )
 
 
 def _quality_families(
@@ -2330,6 +2428,44 @@ def _what_if_runs_families(
     )
     for outcome in ("admitted", "throttled", "error", "invalid_body"):
         counter.add_metric([outcome], float(state.get(outcome, 0)))
+    yield counter
+
+
+def _trigger_fires_families(
+    state: dict[tuple[str, str], int],
+) -> Iterator[CounterMetricFamily]:
+    """Render ``forecast_trigger_fires_total{name, outcome}``.
+
+    Bumped each time a forecast-driven webhook trigger delivers (or fails
+    to deliver) an event. ``outcome`` is bounded to
+    {success, http_error, timeout}. Emitted only once at least one trigger
+    has fired — there's no fixed name set to seed a zero baseline from.
+    """
+    counter = CounterMetricFamily(
+        "forecast_trigger_fires",
+        "Forecast-driven webhook trigger delivery count, by trigger name and outcome.",
+        labels=["name", "outcome"],
+    )
+    for (name, outcome), count in sorted(state.items()):
+        counter.add_metric([name, outcome], float(count))
+    yield counter
+
+
+def _annotation_posts_families(
+    state: dict[tuple[str, str], int],
+) -> Iterator[CounterMetricFamily]:
+    """Render ``forecast_annotation_posts_total{event_type, outcome}``.
+
+    Bumped each time the Grafana-annotations sink posts (or fails to post)
+    an annotation. ``outcome`` is bounded to {success, http_error, timeout}.
+    """
+    counter = CounterMetricFamily(
+        "forecast_annotation_posts",
+        "Grafana-annotation post count, by event type and outcome.",
+        labels=["event_type", "outcome"],
+    )
+    for (event_type, outcome), count in sorted(state.items()):
+        counter.add_metric([event_type, outcome], float(count))
     yield counter
 
 

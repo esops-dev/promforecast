@@ -14,6 +14,7 @@ semantics) is exercised in ``test_runner_v03.py``.
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import pytest
 
@@ -25,6 +26,7 @@ from promforecast.regressors import (
     prefetch_promql,
 )
 from promforecast.source import PromSource, SeriesFrame
+from promforecast.webhook import WebhookError
 
 
 class _FakeSource(PromSource):
@@ -214,3 +216,162 @@ def test_align_mixes_calendar_and_promql() -> None:
     assert out.frame is not None
     assert list(out.frame["hour_of_day"]) == [12.0, 13.0]
     assert list(out.frame["deploys"]) == [10.0, 20.0]
+
+
+# -- webhook regressors (prefetch wiring) ----------------------------------
+
+
+class _FakeWebhookClient:
+    """Returns canned frames (or raises) without touching the network."""
+
+    def __init__(self, result: object) -> None:
+        self._result = result
+        self.calls = 0
+
+    async def fetch(
+        self,
+        *,
+        reg: RegressorConfig,
+        query_id: str,
+        start: datetime,
+        end: datetime,
+    ) -> list[SeriesFrame]:
+        self.calls += 1
+        if isinstance(self._result, Exception):
+            raise self._result
+        return self._result  # type: ignore[return-value]
+
+    async def aclose(self) -> None:
+        return None
+
+
+@pytest.mark.asyncio
+async def test_prefetch_webhook_success_is_aligned() -> None:
+    timestamps = _hourly_timestamps(2)
+    frame = SeriesFrame(
+        labels={"regressor_id": "incidents"}, timestamps=timestamps, values=[1.0, 2.0]
+    )
+    client = _FakeWebhookClient([frame])
+    reg = RegressorConfig(id="incidents", type="webhook", url="https://hook/x")
+    pf = await prefetch_promql(
+        regressors=[reg],
+        source=None,
+        query_start=timestamps[0],
+        query_end=timestamps[-1],
+        step_seconds=3600,
+        query_timeout_seconds=5.0,
+        query_id="cpu",
+        webhook_client=client,  # type: ignore[arg-type]
+    )
+    assert client.calls == 1
+    out = align_for_series(regressors=[reg], prefetch=pf, timestamps=timestamps)
+    assert out.frame is not None
+    assert list(out.frame["incidents"]) == [1.0, 2.0]
+
+
+@pytest.mark.asyncio
+async def test_prefetch_webhook_optional_failure_degrades() -> None:
+    client = _FakeWebhookClient(WebhookError("webhook_failure", "boom"))
+    reg = RegressorConfig(id="incidents", type="webhook", url="https://hook/x")
+    pf = await prefetch_promql(
+        regressors=[reg],
+        source=None,
+        query_start=datetime.now(tz=UTC),
+        query_end=datetime.now(tz=UTC),
+        step_seconds=3600,
+        query_timeout_seconds=5.0,
+        query_id="cpu",
+        webhook_client=client,  # type: ignore[arg-type]
+    )
+    assert pf.fetched == {}
+    assert [f.reason for f in pf.failures] == ["webhook_failure"]
+
+
+@pytest.mark.asyncio
+async def test_prefetch_webhook_required_failure_raises() -> None:
+    client = _FakeWebhookClient(WebhookError("signature_invalid", "bad sig"))
+    reg = RegressorConfig(id="incidents", type="webhook", url="https://hook/x", required=True)
+    with pytest.raises(RegressorError) as excinfo:
+        await prefetch_promql(
+            regressors=[reg],
+            source=None,
+            query_start=datetime.now(tz=UTC),
+            query_end=datetime.now(tz=UTC),
+            step_seconds=3600,
+            query_timeout_seconds=5.0,
+            query_id="cpu",
+            webhook_client=client,  # type: ignore[arg-type]
+        )
+    assert excinfo.value.reason == "signature_invalid"
+
+
+@pytest.mark.asyncio
+async def test_prefetch_webhook_no_client_degrades() -> None:
+    reg = RegressorConfig(id="incidents", type="webhook", url="https://hook/x")
+    pf = await prefetch_promql(
+        regressors=[reg],
+        source=None,
+        query_start=datetime.now(tz=UTC),
+        query_end=datetime.now(tz=UTC),
+        step_seconds=3600,
+        query_timeout_seconds=5.0,
+        query_id="cpu",
+        webhook_client=None,
+    )
+    assert [f.reason for f in pf.failures] == ["no_source"]
+
+
+# -- calendar_file regressors (per-series alignment) -----------------------
+
+
+def _write_calendar(tmp_path: object, body: str) -> str:
+    path = Path(str(tmp_path)) / "freezes.yaml"
+    path.write_text(body)
+    return str(path)
+
+
+def test_align_calendar_file_binary(tmp_path: object) -> None:
+    path = _write_calendar(
+        tmp_path,
+        "entries:\n  - start: 2024-06-03\n    end: 2024-06-03\n    name: freeze\n",
+    )
+    # _hourly_timestamps starts 2024-06-03 12:00 UTC; 2 points same day.
+    timestamps = _hourly_timestamps(2)
+    reg = RegressorConfig(id="release_freeze", type="calendar_file", path=path)
+    out = align_for_series(
+        regressors=[reg],
+        prefetch=PromQLPrefetch(fetched={}, failures=[]),
+        timestamps=timestamps,
+    )
+    assert out.frame is not None
+    assert list(out.frame["release_freeze"]) == [1.0, 1.0]
+
+
+def test_align_calendar_file_expand_one_hot(tmp_path: object) -> None:
+    path = _write_calendar(
+        tmp_path,
+        "entries:\n"
+        "  - start: 2024-06-03\n    end: 2024-06-03\n    name: freeze-a\n"
+        "  - start: 2030-01-01\n    end: 2030-01-01\n    name: freeze-b\n",
+    )
+    timestamps = _hourly_timestamps(1)
+    reg = RegressorConfig(id="cal", type="calendar_file", path=path, expand=True)
+    out = align_for_series(
+        regressors=[reg],
+        prefetch=PromQLPrefetch(fetched={}, failures=[]),
+        timestamps=timestamps,
+    )
+    assert out.frame is not None
+    assert list(out.frame["cal__freeze_a"]) == [1.0]
+    assert list(out.frame["cal__freeze_b"]) == [0.0]
+
+
+def test_align_calendar_file_missing_file_degrades() -> None:
+    reg = RegressorConfig(id="cal", type="calendar_file", path="/nope/missing.yaml")
+    out = align_for_series(
+        regressors=[reg],
+        prefetch=PromQLPrefetch(fetched={}, failures=[]),
+        timestamps=_hourly_timestamps(2),
+    )
+    assert out.frame is None
+    assert [f.reason for f in out.failures] == ["calendar_file_error"]

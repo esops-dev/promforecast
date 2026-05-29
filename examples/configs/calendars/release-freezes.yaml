@@ -1,0 +1,28 @@
+# Example static calendar for a ``type: calendar_file`` regressor.
+#
+# Mount this file into the forecaster pod (e.g. via a ConfigMap) at the
+# path referenced by the regressor's ``path:`` field, then reference it:
+#
+#   regressors:
+#     - id: release_freeze
+#       type: calendar_file
+#       path: /etc/promforecast/calendars/release-freezes.yaml
+#       expand: false        # single binary column; true = one column per name
+#
+# Each entry is an inclusive [start, end] date window with a name. With
+# ``expand: false`` the regressor is 1 on any day inside any window; with
+# ``expand: true`` it emits one column per distinct name. The file is
+# re-read automatically when its mtime changes — no restart needed.
+entries:
+  - start: 2026-01-01
+    end: 2026-01-05
+    name: new-year-freeze
+  - start: 2026-06-30
+    end: 2026-06-30
+    name: q2-financial-close
+  - start: 2026-11-25
+    end: 2026-11-29
+    name: thanksgiving-freeze
+  - start: 2026-12-20
+    end: 2026-12-31
+    name: holiday-freeze

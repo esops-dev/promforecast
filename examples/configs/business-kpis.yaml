@@ -41,6 +41,25 @@ groups:
             type: calendar
           - id: is_weekend
             type: calendar
+          # Optional webhook regressor: pull "deploys in flight" from a
+          # CI/CD bridge that isn't in Prometheus. Optional by default, so
+          # if the bridge is down the forecast still runs (the failure is
+          # counted in forecast_regressor_failures_total). The signing
+          # block is optional — drop it if the bridge doesn't sign.
+          - id: deploys_in_flight
+            type: webhook
+            url: https://cicd-bridge.internal/deploys-in-flight
+            cache_ttl: 15m
+            headers:
+              Authorization: Bearer ${CICD_BRIDGE_TOKEN}
+            signing:
+              algorithm: hmac-sha256
+              secret_ref: ${WEBHOOK_SIGNING_SECRET}
+          # Static internal calendar mounted into the pod: 1 during a
+          # release freeze, 0 otherwise. See examples/configs/calendars/.
+          - id: release_freeze
+            type: calendar_file
+            path: /etc/promforecast/calendars/release-freezes.yaml
 
       - id: http_5xx_per_second
         promql: |

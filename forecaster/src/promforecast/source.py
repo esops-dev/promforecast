@@ -43,6 +43,14 @@ class SeriesFrame:
     values: list[float]
 
 
+@dataclass(frozen=True)
+class InstantSample:
+    """A single sample returned by an instant PromQL query."""
+
+    labels: dict[str, str]
+    value: float
+
+
 class PromSource:
     """PromQL range query client with retry and timeout.
 
@@ -128,6 +136,19 @@ class PromSource:
             await self._cache.set(cache_key, frames)
         return frames
 
+    async def query_instant(self, promql: str) -> list[InstantSample]:
+        """Run an instant PromQL query and return one sample per series.
+
+        Used by the forecast-driven trigger engine to evaluate a condition
+        against the metrics already in the TSDB (including forecast metrics
+        the sink wrote). Scalar results collapse to a single unlabelled
+        sample; vector results map one sample per series.
+        """
+        endpoint = f"{self._url}/api/v1/query"
+        async with self._semaphore:
+            payload = await self._request(endpoint, {"query": promql})
+        return _parse_instant(payload)
+
     async def _request(self, endpoint: str, params: dict[str, str]) -> dict[str, Any]:
         async for attempt in AsyncRetrying(
             stop=stop_after_attempt(3),
@@ -178,6 +199,42 @@ def _is_retryable(exc: BaseException) -> bool:
     if isinstance(exc, httpx.HTTPStatusError):
         return exc.response.status_code >= 500  # noqa: PLR2004
     return False
+
+
+def _parse_instant(payload: dict[str, Any]) -> list[InstantSample]:
+    """Parse an instant-query response (vector or scalar) into samples.
+
+    Non-finite values are dropped so a NaN sample can't masquerade as a
+    truthy condition downstream.
+    """
+    data = payload.get("data") or {}
+    result_type = data.get("resultType")
+    samples: list[InstantSample] = []
+    if result_type == "scalar":
+        ts_val = data.get("result") or [None, None]
+        value = _coerce_float(ts_val[1] if len(ts_val) == 2 else None)  # noqa: PLR2004
+        if value is not None:
+            samples.append(InstantSample(labels={}, value=value))
+        return samples
+    if result_type != "vector":
+        raise QueryError(f"unexpected resultType for instant query: {result_type!r}")
+    for series in data.get("result", []):
+        labels = dict(series.get("metric", {}))
+        point = series.get("value") or []
+        if len(point) != 2:  # noqa: PLR2004
+            continue
+        value = _coerce_float(point[1])
+        if value is not None:
+            samples.append(InstantSample(labels=labels, value=value))
+    return samples
+
+
+def _coerce_float(raw: Any) -> float | None:
+    try:
+        v = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return None if math.isnan(v) else v
 
 
 def _parse_matrix(payload: dict[str, Any]) -> list[SeriesFrame]:

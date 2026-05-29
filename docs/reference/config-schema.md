@@ -48,7 +48,7 @@ No `helm upgrade` needed; the rolling reload picks up the change via the ConfigM
 
 ## Stability commitments (from `v1` onward)
 
-- Top-level keys (`datasource`, `server`, `safety`, `defaults`, `sink`, `highAvailability`, `query_cache`, `telemetry`, `groups`) are part of the stable contract — no removals or renames.
+- Top-level keys (`datasource`, `server`, `safety`, `defaults`, `sink`, `highAvailability`, `query_cache`, `telemetry`, `groups`, `triggers`, `annotations`) are part of the stable contract — no removals or renames.
 - Field defaults may change in minor releases **only** when the new default is safer.
 - Behavioural defaults that operators rely on (e.g. `defaults.accuracy.evaluate: true`) are pinned.
 - New optional fields are additive and never bump the `apiVersion`.

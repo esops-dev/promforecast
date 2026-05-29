@@ -45,6 +45,7 @@ from typing import TYPE_CHECKING, Any
 import structlog
 
 from .config import CALENDAR_FEATURE_TYPES, RegressorConfig
+from .webhook import WebhookError
 
 # Imported lazily inside ``_apply_holidays`` so the ``holidays`` package
 # is loaded only when a config actually configures a holiday regressor.
@@ -55,6 +56,7 @@ if TYPE_CHECKING:
     import pandas as pd
 
     from .source import PromSource, SeriesFrame
+    from .webhook import WebhookRegressorClient
 
 logger = structlog.get_logger(__name__)
 
@@ -76,9 +78,10 @@ class RegressorFailure:
     """Per-regressor failure record returned from ``resolve``.
 
     ``reason`` is a bounded token (``query_error`` | ``query_timeout`` |
-    ``empty_result`` | ``invalid_type``) that the runner uses as a label on
-    ``forecast_regressor_failures_total``. We keep the cardinality small so
-    the counter doesn't explode on a runaway regressor.
+    ``empty_result`` | ``invalid_type`` | ``no_source`` | ``webhook_failure``
+    | ``signature_invalid`` | ``calendar_file_error``) that the runner uses
+    as a label on ``forecast_regressor_failures_total``. We keep the
+    cardinality small so the counter doesn't explode on a runaway regressor.
     """
 
     regressor_id: str
@@ -143,23 +146,71 @@ async def prefetch_promql(
     query_end: datetime,
     step_seconds: int,
     query_timeout_seconds: float,
+    query_id: str = "",
+    webhook_client: WebhookRegressorClient | None = None,
 ) -> PromQLPrefetch:
-    """Fan out every custom regressor's PromQL **once per primary query**.
+    """Fan out every PromQL + webhook regressor **once per primary query**.
 
-    Calendar regressors are deferred to per-series alignment — they're
-    pure functions of the timestamps and don't benefit from caching.
-    Required-regressor failures raise :class:`RegressorError` so the
-    caller (the runner's ``_run_query``) can short-circuit the entire
-    query: every series produced by that PromQL would have been skipped
-    anyway, and emitting N copies of the same failure into the per-series
-    counter would just be noise.
+    Calendar / calendar-file regressors are deferred to per-series alignment
+    — they're pure functions of the timestamps (plus a static file) and don't
+    benefit from this network-fetch phase. Webhook regressors *do* belong
+    here: a query returning 100 series must POST to the external endpoint
+    once, not 100 times (the webhook client also caches per URL+range to
+    cover repeated refresh ticks).
+
+    Required-regressor failures raise :class:`RegressorError` so the caller
+    (the runner's ``_run_query``) can short-circuit the entire query: every
+    series produced by that PromQL would have been skipped anyway, and
+    emitting N copies of the same failure into the per-series counter would
+    just be noise.
     """
     fetched: dict[str, list[SeriesFrame]] = {}
     failures: list[RegressorFailure] = []
     promql_regs = [r for r in regressors if r.type == "custom"]
-    if not promql_regs:
+    webhook_regs = [r for r in regressors if r.type == "webhook"]
+    if not promql_regs and not webhook_regs:
         return PromQLPrefetch(fetched=fetched, failures=failures)
 
+    if promql_regs:
+        await _prefetch_promql_regs(
+            promql_regs=promql_regs,
+            source=source,
+            query_start=query_start,
+            query_end=query_end,
+            step_seconds=step_seconds,
+            query_timeout_seconds=query_timeout_seconds,
+            fetched=fetched,
+            failures=failures,
+        )
+    for reg in webhook_regs:
+        await _prefetch_one_webhook(
+            reg=reg,
+            query_id=query_id,
+            query_start=query_start,
+            query_end=query_end,
+            webhook_client=webhook_client,
+            fetched=fetched,
+            failures=failures,
+        )
+    # Reduce each regressor's frames to a sorted (ds, v) frame *once* per
+    # primary query. Per-series alignment becomes a cheap merge_asof against
+    # this pre-aggregated frame instead of re-running groupby+sort N times,
+    # where N is the primary query's series count.
+    aggregated = _aggregate_fetched(fetched)
+    return PromQLPrefetch(fetched=fetched, failures=failures, aggregated=aggregated)
+
+
+async def _prefetch_promql_regs(
+    *,
+    promql_regs: list[RegressorConfig],
+    source: PromSource | None,
+    query_start: datetime,
+    query_end: datetime,
+    step_seconds: int,
+    query_timeout_seconds: float,
+    fetched: dict[str, list[SeriesFrame]],
+    failures: list[RegressorFailure],
+) -> None:
     if source is None:
         # No datasource attached (test/dry-run). Treat every PromQL
         # regressor as "no_source" so optional ones degrade gracefully and
@@ -173,7 +224,7 @@ async def prefetch_promql(
             if reg.required:
                 raise RegressorError(no_source.reason, no_source.message)
             failures.append(no_source)
-        return PromQLPrefetch(fetched=fetched, failures=failures)
+        return
 
     raw_results = await asyncio.gather(
         *(
@@ -198,12 +249,46 @@ async def prefetch_promql(
             continue
         assert isinstance(outcome, list)
         fetched[reg.id] = outcome
-    # Reduce each regressor's frames to a sorted (ds, v) frame *once* per
-    # primary query. Per-series alignment becomes a cheap merge_asof against
-    # this pre-aggregated frame instead of re-running groupby+sort N times,
-    # where N is the primary query's series count.
-    aggregated = _aggregate_fetched(fetched)
-    return PromQLPrefetch(fetched=fetched, failures=failures, aggregated=aggregated)
+
+
+async def _prefetch_one_webhook(
+    *,
+    reg: RegressorConfig,
+    query_id: str,
+    query_start: datetime,
+    query_end: datetime,
+    webhook_client: WebhookRegressorClient | None,
+    fetched: dict[str, list[SeriesFrame]],
+    failures: list[RegressorFailure],
+) -> None:
+    """Fetch one webhook regressor, recording graceful / fatal failures.
+
+    Mirrors the PromQL path: an optional regressor that fails degrades
+    gracefully (recorded in ``failures``), a ``required: true`` one raises
+    :class:`RegressorError` to short-circuit the whole query.
+    """
+    if webhook_client is None:
+        # No client wired (offline tests / dry-run). Same shape as the
+        # PromQL ``no_source`` path.
+        no_source = RegressorFailure(
+            regressor_id=reg.id,
+            reason="no_source",
+            message="webhook client is not available for regressor resolution",
+        )
+        if reg.required:
+            raise RegressorError(no_source.reason, no_source.message)
+        failures.append(no_source)
+        return
+    try:
+        frames = await webhook_client.fetch(
+            reg=reg, query_id=query_id, start=query_start, end=query_end
+        )
+    except WebhookError as exc:
+        if reg.required:
+            raise RegressorError(exc.reason, str(exc)) from exc
+        failures.append(RegressorFailure(regressor_id=reg.id, reason=exc.reason, message=str(exc)))
+        return
+    fetched[reg.id] = frames
 
 
 def _aggregate_fetched(
@@ -245,7 +330,7 @@ def _aggregate_frames(frames: list[SeriesFrame]) -> pd.DataFrame | None:
     return src_grouped.sort_values(by="ds").reset_index(drop=True)
 
 
-def align_for_series(
+def align_for_series(  # noqa: PLR0912
     *,
     regressors: list[RegressorConfig],
     prefetch: PromQLPrefetch,
@@ -285,6 +370,16 @@ def align_for_series(
                     raise RegressorError(hol_failure.reason, hol_failure.message)
                 failures.append(hol_failure)
             continue
+        if reg.type == "calendar_file":
+            cf_failure = _apply_calendar_file(reg, out)
+            if cf_failure is not None:
+                if reg.required:
+                    raise RegressorError(cf_failure.reason, cf_failure.message)
+                failures.append(cf_failure)
+            continue
+        # ``custom`` and ``webhook`` both land here: the prefetch phase
+        # populated ``aggregated`` for them, so per-series alignment is the
+        # same nearest-asof merge.
         aggregated = _resolve_aggregated(prefetch, reg.id)
         if aggregated is None:
             # Pre-fetch failed for this optional regressor — already counted
@@ -392,6 +487,47 @@ def _apply_holidays(reg: RegressorConfig, out: pd.DataFrame) -> RegressorFailure
             out[reg.id] = [0.0] * len(dates)
     else:
         out[reg.id] = [1.0 if calendar.get(d) else 0.0 for d in dates]
+    return None
+
+
+def _apply_calendar_file(reg: RegressorConfig, out: pd.DataFrame) -> RegressorFailure | None:
+    """Materialise calendar-file regressor column(s) or return a failure record.
+
+    Same binary / one-hot emission shape as :func:`_apply_holidays`:
+
+    * ``expand: false`` (default) — a single binary column named ``<id>``
+      that is ``1`` on any day inside any configured window and ``0``
+      otherwise.
+    * ``expand: true`` — one column per distinct entry ``name``, named
+      ``<id>__<name_slug>``.
+
+    The file is parsed lazily (and re-read on mtime change) by
+    :mod:`promforecast.calendar_file`. A missing / malformed file surfaces
+    as a graceful per-regressor failure with reason ``calendar_file_error``;
+    dates are resolved in UTC to match how source timestamps arrive.
+    """
+    from . import calendar_file as cf  # noqa: PLC0415
+
+    try:
+        entries = cf.get_calendar(str(reg.path))
+    except cf.CalendarFileError as exc:
+        return RegressorFailure(regressor_id=reg.id, reason="calendar_file_error", message=str(exc))
+
+    ds = out["ds"]
+    ds_utc = ds.dt.tz_localize("UTC") if ds.dt.tz is None else ds.dt.tz_convert("UTC")
+    dates = ds_utc.dt.date
+    if reg.expand:
+        names = sorted({e.name for e in entries})
+        for name in names:
+            windows = [e for e in entries if e.name == name]
+            col = f"{reg.id}__{_slugify_holiday(name)}"
+            out[col] = [1.0 if any(w.contains(d) for w in windows) else 0.0 for d in dates]
+        if not names:
+            # No entries at all — emit the binary column so the frame always
+            # carries an explicit ``0`` column rather than silently vanishing.
+            out[reg.id] = [0.0] * len(dates)
+    else:
+        out[reg.id] = [1.0 if any(e.contains(d) for e in entries) else 0.0 for d in dates]
     return None
 
 

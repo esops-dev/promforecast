@@ -26,7 +26,7 @@ CALENDAR_FEATURE_TYPES = ("hour_of_day", "day_of_week", "is_weekend")
 # Bounded set of regressor "types" the schema accepts. Stays small on purpose:
 # every new type ships its own validator and runtime path, so a Literal here
 # prevents typos from silently degrading to ``custom``.
-REGRESSOR_TYPES = ("custom", "calendar", "holidays")
+REGRESSOR_TYPES = ("custom", "calendar", "holidays", "webhook", "calendar_file")
 
 # Versioned schema. ``apiVersion`` mirrors the Kubernetes convention so a
 # config file declares which schema it conforms to and the loader can route
@@ -334,10 +334,33 @@ class DefaultsConfig(BaseModel):
     emission: EmissionConfig = EmissionConfig()
 
 
+class SigningConfig(BaseModel):
+    """HMAC payload signing for an outbound or inbound webhook.
+
+    The de-facto standard for webhook authentication: the sender computes
+    an HMAC over the raw request body and ships it in a header; the
+    receiver recomputes and compares. Both the webhook *regressor* (which
+    verifies the response it pulls in) and the webhook *trigger* (which
+    signs the request it pushes out) accept this block.
+
+    ``secret_ref`` is resolved through the same ``${ENV_VAR}`` indirection
+    the chart uses for datasource credentials — set it to ``${NAME}`` to
+    read environment variable ``NAME`` (injected from a Kubernetes Secret
+    via ``secretKeyRef``), or to a literal value for local testing. An
+    empty resolved secret is rejected at load time so a missing Secret
+    can't silently disable signing.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    algorithm: Literal["hmac-sha256"] = "hmac-sha256"
+    secret_ref: str
+
+
 class RegressorConfig(BaseModel):
     """Exogenous regressor wired into a query.
 
-    Three flavours:
+    Flavours:
 
     * ``type: calendar`` — built-in deterministic features
       (``hour_of_day``, ``day_of_week``, ``is_weekend``). ``id`` doubles as
@@ -349,6 +372,18 @@ class RegressorConfig(BaseModel):
       (e.g. US states); ``expand: true`` emits one regressor column per
       holiday name (so the model can learn that Black Friday differs from
       Thanksgiving) instead of a single ``is_holiday`` binary column.
+    * ``type: webhook`` — a signal that lives outside Prometheus (active
+      incidents from PagerDuty, deploys-in-flight from a CI/CD API). The
+      forecaster POSTs to ``url`` at fit time with the query id and the
+      timestamp range and expects a JSON time series back
+      (``{"timestamps": [...], "values": [...]}``). Results are cached per
+      URL+range for ``cache_ttl``. ``signing`` opts into HMAC verification
+      of the response.
+    * ``type: calendar_file`` — a static internal calendar (release
+      freezes, fiscal-quarter ends) read from a YAML or iCal file mounted
+      into the pod at ``path``. ``expand`` matches the ``holidays`` shape:
+      ``false`` (default) emits a single binary column, ``true`` emits one
+      column per calendar-entry name.
 
     ``required`` flips the failure mode from graceful (skip the regressor,
     keep forecasting) to fatal-per-series (the whole series is skipped if
@@ -360,7 +395,7 @@ class RegressorConfig(BaseModel):
 
     id: str
     promql: str | None = None
-    type: Literal["custom", "calendar", "holidays"] = "custom"
+    type: Literal["custom", "calendar", "holidays", "webhook", "calendar_file"] = "custom"
     required: bool = False
     # Holiday-regressor parameters. Only consulted when ``type == "holidays"``.
     # ``country`` is the ISO-3166-1 alpha-2 country code accepted by the
@@ -372,10 +407,28 @@ class RegressorConfig(BaseModel):
     # date before the holiday lookup; defaults to ``UTC`` which matches the
     # original behaviour but is wrong for localised workloads (a US holiday
     # otherwise flips at UTC-midnight rather than US-Eastern midnight).
+    #
+    # ``expand`` is shared with ``type: calendar_file`` (same binary vs
+    # one-hot semantics).
     country: str | None = None
     regions: list[str] = Field(default_factory=list)
     expand: bool = False
     timezone: str = "UTC"
+    # Webhook-regressor parameters. Only consulted when ``type == "webhook"``.
+    # ``url`` is the endpoint POSTed at fit time; ``timeout`` bounds the
+    # request; ``cache_ttl`` controls how long a successful (url, range)
+    # response is reused to avoid hammering the external service; ``headers``
+    # carry static auth (bearer tokens, shared secrets). ``signing`` opts
+    # into HMAC verification of the response body.
+    url: str | None = None
+    timeout: Duration = timedelta(seconds=5)
+    cache_ttl: Duration = timedelta(hours=1)
+    headers: dict[str, str] = Field(default_factory=dict)
+    signing: SigningConfig | None = None
+    # Calendar-file parameters. Only consulted when ``type == "calendar_file"``.
+    # ``path`` is the mounted YAML/iCal file; the runner reloads it on the
+    # same configmap-watch path as the main config.
+    path: str | None = None
 
 
 class DiscoveryVariable(BaseModel):
@@ -743,6 +796,31 @@ class ColdStartConfig(BaseModel):
     max_quality_score: float = Field(default=0.5, ge=0.0, le=1.0)
 
 
+class CanaryComparisonConfig(BaseModel):
+    """Canary-vs-baseline forecast comparison for a query.
+
+    Distinct from the group-level :class:`CanaryConfig` (which *samples* a
+    fraction of series for cheaper fits). This block models a canary
+    deploy: the query's series are split by label selector into a
+    *baseline* population (the stable pods) and a *canary* population (the
+    new version). The forecaster fits the baseline, projects what the
+    canary *should* look like, and emits ``<id>_canary_forecast_deviation``
+    — how far the canary actuals are from the baseline-predicted forecast.
+
+    ``canary_selector`` / ``baseline_selector`` are Prometheus-style label
+    matchers (``{version="canary"}``, ``{version!="canary"}``) applied to
+    the labels already attached to each returned series. Only ``=`` and
+    ``!=`` matchers are supported — the selectors partition an
+    already-fetched result set, they are not pushed down to the TSDB.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    canary_selector: str = ""
+    baseline_selector: str = ""
+
+
 class QueryConfig(BaseModel):
     """A single PromQL query plus optional per-query overrides.
 
@@ -804,6 +882,9 @@ class QueryConfig(BaseModel):
     # group can mix cheap-and-stable hourly metrics with expensive daily
     # capacity refits without forking the YAML into two groups.
     refresh_interval: Duration | None = None
+    # Per-query canary-vs-baseline comparison. Off by default; see
+    # :class:`CanaryComparisonConfig`.
+    canary: CanaryComparisonConfig = Field(default_factory=CanaryComparisonConfig)
 
 
 class CanaryConfig(BaseModel):
@@ -1419,6 +1500,89 @@ class DeploySignalsConfig(BaseModel):
     max_active_deploys: int = Field(default=8, ge=1)
 
 
+class TriggerConfig(BaseModel):
+    """A forecast-driven outbound webhook.
+
+    Distinct from a PrometheusRule alert: the payload carries forecast
+    context (predicted value, confidence band, model identity, drift
+    score). Distinct from a webhook *regressor*: the direction is inverse
+    — the forecaster pushes out rather than pulls in.
+
+    ``condition`` is a PromQL expression evaluated against the configured
+    datasource after every fit (so it can reference the forecast metrics
+    the sink wrote). The trigger POSTs to ``webhook_url`` when the
+    condition transitions from false to true; for sustained conditions it
+    re-fires no more often than ``repeat_interval``. ``payload_template``
+    is an optional ``string.Template`` (``$var``-substitution) template
+    rendered with the event fields (``$name``, ``$condition``, ``$value``,
+    ``$fired_at``, ``$samples_json``) — ``$``-style rather than
+    ``str.format`` so a JSON template's literal ``{``/``}`` need no
+    escaping; an empty template ships the default JSON event. ``headers``
+    carry static auth; ``signing`` opts into HMAC-signing the request
+    body.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    condition: str
+    webhook_url: str
+    headers: dict[str, str] = Field(default_factory=dict)
+    payload_template: str = ""
+    repeat_interval: Duration = timedelta(hours=1)
+    timeout: Duration = timedelta(seconds=5)
+    signing: SigningConfig | None = None
+
+
+# Bounded set of forecast events the Grafana-annotations sink can post.
+# Each maps to a signal the runner already computes; keeping it a Literal
+# stops a typo from silently disabling an annotation stream.
+ANNOTATION_EVENT_TYPES = (
+    "drift",
+    "change_point",
+    "deploy_risk",
+    "threshold_breach_predicted",
+    "deviation_outside_band",
+)
+
+
+class AnnotationsConfig(BaseModel):
+    """Grafana-annotations sink for significant forecast events.
+
+    When enabled, the forecaster POSTs to Grafana's annotations API every
+    time an enabled event fires, so operators can correlate forecast
+    events with the dashboards they already watch. Compatible with both
+    Grafana OSS and Grafana Cloud (same API).
+
+    ``api_token_ref`` is resolved through the same ``${ENV_VAR}``
+    indirection as datasource credentials. ``events`` selects which event
+    families post annotations; an empty list (default) means none even
+    when ``enabled: true``.
+
+    ``deploy_risk_min_score`` gates the ``deploy_risk`` event family: only
+    a deploy whose composite risk score is at or above this threshold posts
+    an annotation, so the stream reflects *elevated* risk rather than every
+    active rollout. Ignored unless ``deploy_risk`` is in ``events``.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    grafana_url: str = ""
+    api_token_ref: str = ""
+    events: list[
+        Literal[
+            "drift",
+            "change_point",
+            "deploy_risk",
+            "threshold_breach_predicted",
+            "deviation_outside_band",
+        ]
+    ] = Field(default_factory=list)
+    timeout: Duration = timedelta(seconds=5)
+    deploy_risk_min_score: float = Field(default=0.5, ge=0.0, le=1.0)
+
+
 class Config(BaseModel):
     # ``populate_by_name=True`` lets in-Python construction use ``api_version``
     # while YAML keeps the Kubernetes-idiomatic ``apiVersion`` spelling.
@@ -1465,6 +1629,12 @@ class Config(BaseModel):
     # Operator-facing recommendations (right-sizing, ...). Off by
     # default; see :class:`RecommendationsConfig`.
     recommendations: RecommendationsConfig = Field(default_factory=RecommendationsConfig)
+    # Forecast-driven outbound webhooks. Off by default (empty list);
+    # see :class:`TriggerConfig`.
+    triggers: list[TriggerConfig] = Field(default_factory=list)
+    # Grafana-annotations sink for forecast events. Off by default;
+    # see :class:`AnnotationsConfig`.
+    annotations: AnnotationsConfig = Field(default_factory=AnnotationsConfig)
 
 
 def load(path: str | Path) -> Config:
@@ -1502,11 +1672,58 @@ def load(path: str | Path) -> Config:
         for query in group.queries:
             validate_metric_name(query.id)
             _validate_query_overrides(group_name=group.name, query=query)
+            _validate_canary(group_name=group.name, query=query)
             for reg in query.regressors:
                 _validate_regressor(group_name=group.name, query_id=query.id, reg=reg)
     _validate_deploy_signals(config)
     _validate_resource_sizing(config)
+    _validate_triggers(config)
+    _validate_annotations(config)
     return config
+
+
+def _validate_canary(*, group_name: str, query: QueryConfig) -> None:
+    """A canary comparison needs both selectors when enabled."""
+    if not query.canary.enabled:
+        return
+    label = f"groups[{group_name}].queries[{query.id}].canary"
+    if not query.canary.canary_selector.strip():
+        raise ValueError(f"{label}: canary_selector is required when canary.enabled is true")
+    if not query.canary.baseline_selector.strip():
+        raise ValueError(f"{label}: baseline_selector is required when canary.enabled is true")
+
+
+def _validate_triggers(config: Config) -> None:
+    """Reject duplicate trigger names and empty condition/webhook_url.
+
+    A duplicate ``name`` would collapse two triggers onto the same
+    ``forecast_trigger_fires_total{name}`` series and make the
+    repeat-interval bookkeeping ambiguous, so it fails fast at load.
+    """
+    seen: set[str] = set()
+    for trigger in config.triggers:
+        label = f"triggers[{trigger.name}]"
+        if not trigger.name.strip():
+            raise ValueError("triggers[]: name must be non-empty")
+        if trigger.name in seen:
+            raise ValueError(f"triggers: name {trigger.name!r} appears twice; names must be unique")
+        seen.add(trigger.name)
+        if not trigger.condition.strip():
+            raise ValueError(f"{label}: condition must be a non-empty PromQL expression")
+        if not trigger.webhook_url.strip():
+            raise ValueError(f"{label}: webhook_url must be non-empty")
+
+
+def _validate_annotations(config: Config) -> None:
+    """A Grafana-annotations sink needs a URL when enabled."""
+    ann = config.annotations
+    if not ann.enabled:
+        return
+    if not ann.grafana_url.strip():
+        raise ValueError(
+            "annotations.enabled is true but annotations.grafana_url is empty; "
+            "set the Grafana base URL (e.g. https://grafana.example.com)"
+        )
 
 
 def _validate_resource_sizing(config: Config) -> None:
@@ -2052,7 +2269,7 @@ def _validate_holiday_calendar(*, label: str, reg: RegressorConfig) -> None:
         ) from exc
 
 
-def _validate_regressor(*, group_name: str, query_id: str, reg: RegressorConfig) -> None:
+def _validate_regressor(*, group_name: str, query_id: str, reg: RegressorConfig) -> None:  # noqa: PLR0912
     """Per-regressor sanity checks.
 
     * Calendar regressors must use one of the supported feature names and
@@ -2086,5 +2303,23 @@ def _validate_regressor(*, group_name: str, query_id: str, reg: RegressorConfig)
         # ``regions`` surfaces as a load-time error rather than as a
         # silent per-series ``invalid_type`` failure on every refresh.
         _validate_holiday_calendar(label=label, reg=reg)
+    elif reg.type == "webhook":
+        if not reg.url:
+            raise ValueError(f"{label}: webhook regressors require a non-empty url")
+        if reg.promql:
+            raise ValueError(f"{label}: webhook regressors must not set promql")
+        if reg.country or reg.regions:
+            raise ValueError(f"{label}: webhook regressors must not set country/regions")
+        if reg.path:
+            raise ValueError(f"{label}: webhook regressors must not set path")
+    elif reg.type == "calendar_file":
+        if not reg.path:
+            raise ValueError(f"{label}: calendar_file regressors require a non-empty path")
+        if reg.promql:
+            raise ValueError(f"{label}: calendar_file regressors must not set promql")
+        if reg.country or reg.regions:
+            raise ValueError(f"{label}: calendar_file regressors must not set country/regions")
+        if reg.url:
+            raise ValueError(f"{label}: calendar_file regressors must not set url")
     elif not reg.promql:
         raise ValueError(f"{label}: custom regressors require a non-empty promql")
