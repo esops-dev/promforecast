@@ -50,6 +50,38 @@
         }
       }
     },
+    "sharding": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "mode": { "type": "string", "enum": ["consistent_hash", "leader_assigned"] },
+        "redis": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "address": { "type": "string" },
+            "existingSecret": { "type": "string" },
+            "secretKey": { "type": "string" }
+          }
+        }
+      },
+      "if": {
+        "properties": {
+          "enabled": { "const": true },
+          "mode": { "const": "leader_assigned" }
+        },
+        "required": ["enabled", "mode"]
+      },
+      "then": {
+        "properties": {
+          "redis": {
+            "properties": { "address": { "minLength": 1 } },
+            "required": ["address"]
+          }
+        }
+      }
+    },
     "existingConfigMap": { "type": "string" },
     "config": { "type": "object" },
     "service": {

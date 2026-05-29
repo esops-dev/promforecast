@@ -1,4 +1,9 @@
-{{- if and .Values.rbac.create .Values.highAvailability.enabled }}
+{{- /*
+    The Lease API is needed by HA (leader election) and by leader_assigned
+    sharding (the assigner Lease). consistent_hash sharding needs no Lease.
+*/}}
+{{- $needsLease := or .Values.highAvailability.enabled (and .Values.sharding.enabled (eq .Values.sharding.mode "leader_assigned")) }}
+{{- if and .Values.rbac.create $needsLease }}
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:

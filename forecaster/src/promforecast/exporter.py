@@ -33,7 +33,7 @@ from .self_observability import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator
+    from collections.abc import Callable, Iterable, Iterator
 
 __all__ = [
     "AccuracyPoint",
@@ -715,6 +715,14 @@ class Exporter:
         self._leader_identity: str = ""
         self._is_leader: bool = False
         self._leader_transitions: int = 0
+        # Sharding state (set only when sharding is enabled). ``_shard_id`` is
+        # this replica's shard identity; ``_shard_owned_groups`` is the set of
+        # groups it currently owns. Rendered as
+        # ``forecast_shard_owns_group{shard_id, group} 1`` — one sample per
+        # owned group. Prometheus unioning every replica's scrape reconstructs
+        # the full assignment.
+        self._shard_id: str = ""
+        self._shard_owned_groups: frozenset[str] = frozenset()
         # Query cache counters (hits / misses / errors). Always emitted so
         # dashboards can chart a zero series before the first query runs.
         self._query_cache_events: dict[str, int] = {}
@@ -940,6 +948,17 @@ class Exporter:
                 self._leader_transitions += 1
                 self._is_leader = is_leader
 
+    def set_shard_state(self, *, shard_id: str, owned_groups: Iterable[str]) -> None:
+        """Record which groups this shard owns for the assignment gauge.
+
+        Surfaces as ``forecast_shard_owns_group{shard_id, group} 1`` (one
+        sample per owned group). Only meaningful when sharding is enabled; a
+        single-replica deployment never calls this, so the gauge is absent.
+        """
+        with self._lock:
+            self._shard_id = shard_id
+            self._shard_owned_groups = frozenset(owned_groups)
+
     def increment_query_cache_event(self, kind: str) -> None:
         """Bump a query-cache counter for ``kind`` (hit | miss | error)."""
         with self._lock:
@@ -1125,6 +1144,10 @@ class Exporter:
     def _leader_state(self) -> tuple[str, bool, int]:
         with self._lock:
             return self._leader_identity, self._is_leader, self._leader_transitions
+
+    def _shard_state(self) -> tuple[str, frozenset[str]]:
+        with self._lock:
+            return self._shard_id, self._shard_owned_groups
 
     def _query_cache_state(self) -> dict[str, int]:
         with self._lock:
@@ -1504,6 +1527,7 @@ class _SnapshotCollector:
         source_retries = self._exporter._source_retries_state()
         config_hash = self._exporter._config_hash_state()
         leader_state = self._exporter._leader_state()
+        shard_state = self._exporter._shard_state()
         cache_state = self._exporter._query_cache_state()
         what_if_runs_state = self._exporter._what_if_runs_state()
         trigger_fires_state = self._exporter._trigger_fires_state()
@@ -1551,6 +1575,7 @@ class _SnapshotCollector:
         yield from _remote_write_retries_families(remote_write_retries)
         yield from _source_retries_families(source_retries)
         yield from _leader_families(leader_state)
+        yield from _shard_owns_families(shard_state)
         yield from _query_cache_families(cache_state)
         yield from _what_if_runs_families(what_if_runs_state)
         yield from _trigger_fires_families(trigger_fires_state)
@@ -2388,6 +2413,30 @@ def _leader_families(
     )
     counter.add_metric([identity], float(transitions))
     yield counter
+
+
+def _shard_owns_families(
+    state: tuple[str, frozenset[str]],
+) -> Iterator[GaugeMetricFamily]:
+    """Render the per-shard group-ownership gauge.
+
+    ``forecast_shard_owns_group{shard_id, group}`` is 1 for every group this
+    replica owns. Emitted only when sharding is enabled (i.e. once
+    :meth:`Exporter.set_shard_state` has run with a non-empty shard id), so
+    single-replica deployments don't carry an empty series. A scrape that
+    unions every replica reconstructs the full group→shard assignment.
+    """
+    shard_id, owned_groups = state
+    if not shard_id:
+        return
+    gauge = GaugeMetricFamily(
+        "forecast_shard_owns_group",
+        "1 for each group owned (fit) by this shard in a sharded deployment.",
+        labels=["shard_id", "group"],
+    )
+    for group in sorted(owned_groups):
+        gauge.add_metric([shard_id, group], 1.0)
+    yield gauge
 
 
 def _query_cache_families(

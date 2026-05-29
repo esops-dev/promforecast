@@ -26,6 +26,7 @@ from . import diagnose as diagnose_module
 from . import ha_cache as ha_cache_module
 from . import inspect as inspect_module
 from . import preview as preview_module
+from . import sharding as sharding_module
 from . import telemetry as telemetry_module
 from . import triggers as triggers_module
 from . import tuner as tuner_module
@@ -909,9 +910,15 @@ def run(config_path: Path, log_level: str) -> None:
         else None
     )
 
-    elector = _build_elector(cfg, exporter, runner)
-    if elector is None:
-        # No HA configured — record this replica as a permanent "leader"
+    # Sharding (every replica active, each owns a slice of the groups) and HA
+    # (single active leader + cache-serving followers) are mutually exclusive —
+    # the config validator rejects both at once. When sharding is on it owns
+    # the runner lifecycle (and, for leader_assigned, its own assigner Lease),
+    # so the HA elector is not built.
+    shard_controller = _build_shard_controller(cfg, exporter, runner, redis_client)
+    elector = None if shard_controller is not None else _build_elector(cfg, exporter, runner)
+    if shard_controller is None and elector is None:
+        # No HA, no sharding — record this replica as a permanent "leader"
         # so the metric is meaningful in single-replica deployments.
         exporter.set_leader_state(identity=default_identity(), is_leader=True)
 
@@ -928,6 +935,7 @@ def run(config_path: Path, log_level: str) -> None:
         source=source,
         snapshot_cache=snapshot_cache,
         elector=elector,
+        shard_controller=shard_controller,
         tracer=tracer,
     )
     host, port = _parse_listen(cfg.server.listen)
@@ -951,23 +959,33 @@ async def _lifespan_factory(
     runner: Runner,
     watcher: ConfigMapWatcher | None,
     elector: LeaderElector | None,
+    shard_controller: _ShardController | None = None,
     tracer: telemetry_module.Tracer | None = None,
 ) -> AsyncIterator[None]:
-    """Start lifecycle, gated on leader election when HA mode is active.
+    """Start lifecycle, gated on leader election or sharding when active.
 
-    Without HA: behaves exactly as before — the runner starts immediately
-    and stops on shutdown.
+    Without HA or sharding: behaves exactly as before — the runner starts
+    immediately and stops on shutdown.
 
     With HA: the elector owns the runner. It runs in a background task and
     calls ``runner.start()`` / ``runner.stop()`` via callbacks set during
     construction; the lifespan only waits on the elector and the watcher.
+
+    With sharding: the shard controller owns the runner. Every replica is an
+    active fitter; the controller does the initial ownership refresh, starts
+    the runner (which schedules only this replica's owned groups), and — for
+    ``leader_assigned`` — runs the assigner Lease plus a periodic rebalance
+    loop. HA and sharding are mutually exclusive, so ``elector`` is ``None``
+    whenever ``shard_controller`` is set.
 
     The OTel tracer (when enabled) is shut down *last* so any spans emitted
     by the runner's final stop sequence still have a chance to flush via
     the BatchSpanProcessor before the gRPC channel is torn down.
     """
     elector_task: asyncio.Task[None] | None = None
-    if elector is None:
+    if shard_controller is not None:
+        await shard_controller.start()
+    elif elector is None:
         await runner.start()
     else:
         elector_task = asyncio.create_task(elector.run())
@@ -978,7 +996,9 @@ async def _lifespan_factory(
     finally:
         if watcher is not None:
             await watcher.stop()
-        if elector is not None:
+        if shard_controller is not None:
+            await shard_controller.stop()
+        elif elector is not None:
             await elector.stop()
             if elector_task is not None:
                 import contextlib  # noqa: PLC0415
@@ -1004,11 +1024,12 @@ def _build_app(  # noqa: PLR0915
     source: PromSource | None = None,
     snapshot_cache: ha_cache_module.SnapshotCache | None = None,
     elector: LeaderElector | None = None,
+    shard_controller: _ShardController | None = None,
     tracer: telemetry_module.Tracer | None = None,
 ) -> FastAPI:
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
-        async with _lifespan_factory(runner, watcher, elector, tracer=tracer):
+        async with _lifespan_factory(runner, watcher, elector, shard_controller, tracer=tracer):
             yield
 
     app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
@@ -1357,6 +1378,10 @@ def _redis_needed(cfg: config_module.Config) -> bool:
     """Does this config want a shared Redis client?"""
     if cfg.high_availability.enabled:
         return True
+    # leader_assigned sharding shares the membership registry + the published
+    # group→shard assignment through Redis (consistent_hash needs no backend).
+    if cfg.sharding.enabled and cfg.sharding.mode == "leader_assigned":
+        return True
     qc = cfg.query_cache
     if not qc.enabled:
         return False
@@ -1482,6 +1507,170 @@ def _build_elector(
         client=KubernetesLeaseClient(),
         on_started_leading=_on_acquired,
         on_stopped_leading=_on_lost,
+    )
+
+
+class _ShardController:
+    """Drives horizontal sharding for one replica.
+
+    Owns the runner's lifecycle in sharded mode: refreshes ownership before
+    starting the runner (so it schedules only its owned groups), and — for
+    ``leader_assigned`` — runs the assigner Lease and a periodic loop that
+    re-reads membership / republishes the assignment and reconciles the
+    running group loops with the new ownership. For ``consistent_hash`` there
+    is nothing periodic to do: ownership is a pure function of the (static)
+    replica count and index, so the controller just starts the runner.
+    """
+
+    def __init__(
+        self,
+        *,
+        coordinator: sharding_module.ShardCoordinator,
+        runner: Runner,
+        elector: LeaderElector | None,
+        refresh_interval_seconds: float,
+    ) -> None:
+        self._coordinator = coordinator
+        self._runner = runner
+        self._elector = elector
+        self._interval = max(1.0, refresh_interval_seconds)
+        self._stop = asyncio.Event()
+        self._refresh_task: asyncio.Task[None] | None = None
+        self._elector_task: asyncio.Task[None] | None = None
+
+    async def start(self) -> None:
+        if self._elector is not None:
+            self._elector_task = asyncio.create_task(self._elector.run())
+        # Resolve ownership before the runner spawns loops so it schedules the
+        # right slice from the very first tick.
+        await self._coordinator.refresh(self._runner.group_names())
+        await self._runner.start()
+        if self._coordinator.needs_periodic_refresh():
+            self._refresh_task = asyncio.create_task(self._refresh_loop())
+
+    async def _refresh_loop(self) -> None:
+        import contextlib  # noqa: PLC0415
+
+        while not self._stop.is_set():
+            # Wake either on the interval (TimeoutError → time to refresh) or
+            # early when stop() fires.
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(self._stop.wait(), timeout=self._interval)
+            if self._stop.is_set():
+                break
+            try:
+                await self._coordinator.refresh(self._runner.group_names())
+                await self._runner.reconcile_shard_ownership()
+            except Exception:
+                logger.exception("shard_refresh_failed")
+
+    async def stop(self) -> None:
+        import contextlib  # noqa: PLC0415
+
+        self._stop.set()
+        if self._refresh_task is not None:
+            self._refresh_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await self._refresh_task
+        if self._elector is not None:
+            await self._elector.stop()
+            if self._elector_task is not None:
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await self._elector_task
+        await self._coordinator.close()
+
+
+def _build_shard_controller(
+    cfg: config_module.Config,
+    exporter: Exporter,
+    runner: Runner,
+    redis_client: object | None,
+) -> _ShardController | None:
+    """Construct the shard controller for sharded mode, or ``None`` if off.
+
+    Resolves this replica's shard index / id (from config or the downward-API
+    env vars a StatefulSet provides), builds the mode-appropriate coordinator,
+    installs it on the runner, and — for ``leader_assigned`` — an assigner
+    Lease elector whose leadership drives the published assignment.
+    """
+    sh = cfg.sharding
+    if not sh.enabled:
+        return None
+
+    shard_index = sharding_module.derive_shard_index(sh.shard_index)
+    shard_id = sharding_module.derive_shard_id(sh.shard_id, shard_index)
+
+    coordinator: sharding_module.ShardCoordinator
+    elector: LeaderElector | None
+    if sh.mode == "consistent_hash":
+        if shard_index < 0:
+            raise ValueError(
+                "sharding.mode=consistent_hash could not resolve this replica's shard "
+                "index. Run the forecaster as a StatefulSet so PROMFORECAST_POD_NAME "
+                "carries an ordinal, or set sharding.shard_index / PROMFORECAST_SHARD_INDEX."
+            )
+        coordinator = sharding_module.ConsistentHashCoordinator(
+            shard_index=shard_index,
+            replica_count=sh.replica_count,
+            shard_id=shard_id,
+        )
+        # Each shard is an autonomous active fitter; reflect that on the
+        # leader gauge so a join-on-instance dashboard treats every shard as
+        # "up and fitting" rather than a follower.
+        exporter.set_leader_state(identity=shard_id, is_leader=True)
+        elector = None
+    else:  # leader_assigned
+        if redis_client is None:  # pragma: no cover - guarded by config validation
+            raise ValueError(
+                "sharding.mode=leader_assigned requires a Redis backend "
+                "(highAvailability.redis.address or query_cache.redis_address)"
+            )
+        store = sharding_module.RedisAssignmentStore(redis_client)
+        namespace = os.environ.get("PROMFORECAST_NAMESPACE", "default")
+        exporter.set_leader_state(identity=shard_id, is_leader=False)
+
+        async def _on_acquired() -> None:
+            # Assigner leadership only controls who publishes the mapping; every
+            # replica keeps fitting, so we do NOT start/stop the runner here.
+            exporter.set_leader_state(identity=shard_id, is_leader=True)
+
+        async def _on_lost() -> None:
+            exporter.set_leader_state(identity=shard_id, is_leader=False)
+
+        elector_config = LeaderElectorConfig(
+            namespace=namespace,
+            lease_name=sh.lease_name,
+            identity=shard_id,
+            lease_duration_seconds=sh.lease_duration_seconds,
+            renew_deadline_seconds=sh.renew_deadline_seconds,
+            retry_period_seconds=sh.retry_period_seconds,
+        )
+        elector = LeaderElector(
+            config=elector_config,
+            client=KubernetesLeaseClient(),
+            on_started_leading=_on_acquired,
+            on_stopped_leading=_on_lost,
+        )
+        coordinator = sharding_module.LeaderAssignedCoordinator(
+            shard_id=shard_id,
+            store=store,
+            is_leader=elector.is_leader,
+            member_ttl_seconds=sh.member_ttl_seconds,
+        )
+
+    runner.set_shard_coordinator(coordinator)
+    logger.info(
+        "sharding_enabled",
+        mode=sh.mode,
+        shard_id=shard_id,
+        shard_index=shard_index,
+        replica_count=sh.replica_count,
+    )
+    return _ShardController(
+        coordinator=coordinator,
+        runner=runner,
+        elector=elector,
+        refresh_interval_seconds=float(sh.heartbeat_interval_seconds),
     )
 
 

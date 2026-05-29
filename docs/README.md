@@ -59,6 +59,7 @@ scheduling, and serving telemetry.
 - [Cardinality budgeting](operations/cardinality.md) — per-family multipliers and the `--strict-cardinality` CI gate
 - [Scheduling](operations/scheduling.md) — per-query refresh intervals, max-concurrent-fits cap
 - [High availability](operations/ha.md) — Lease-based leader election, Redis snapshot cache
+- [Sharded HA (horizontal scaling)](scaling/sharded-ha.md) — N active replicas each fitting a disjoint slice of groups, via `consistent_hash` or `leader_assigned`; the `shard_id` label and `forecast_shard_owns_group` gauge; sizing guide
 - [Query cache](operations/cache.md) — in-memory LRU + optional Redis dedup for overlapping PromQL
 - [Telemetry](operations/telemetry.md) — internal metrics catalogue + per-series staleness + self-observability (fit success ratio, regressor stability, per-group CPU/memory)
 - [Warm-up status](operations/warmup.md) — fresh-install "what is still loading?" endpoint and CLI

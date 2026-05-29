@@ -1,3 +1,10 @@
+{{- /*
+    consistent_hash sharding renders a StatefulSet (see statefulset.yaml) for
+    stable per-replica ordinals; the Deployment covers every other case —
+    default, HA, and leader_assigned sharding (whose assigner distributes by
+    identity, so pods need no stable ordinal).
+*/}}
+{{- if not (and .Values.sharding.enabled (eq .Values.sharding.mode "consistent_hash")) }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -5,15 +12,16 @@ metadata:
   labels: {{- include "promforecast.labels" . | nindent 4 }}
 spec:
   {{- /*
-      HA mode uses RollingUpdate so a fresh leader can take over before the
-      old replica is fully torn down (the elector's best-effort release
-      shaves another few seconds off failover). Single-replica installs
-      keep Recreate to honour the stateless invariant — a brief gap during
-      pod replacement is fine because the next refit reproduces everything.
+      HA and leader_assigned sharding both run multiple replicas that must roll
+      without a full outage, so we force RollingUpdate (maxUnavailable: 0) when
+      the chart's default Recreate would otherwise drop every replica at once.
+      Single-replica installs keep Recreate to honour the stateless invariant —
+      a brief gap during pod replacement is fine because the next refit
+      reproduces everything.
   */}}
   replicas: {{ .Values.replicaCount }}
   strategy:
-    {{- if and .Values.highAvailability.enabled (eq (.Values.strategy.type | default "Recreate") "Recreate") }}
+    {{- if and (or .Values.highAvailability.enabled .Values.sharding.enabled) (eq (.Values.strategy.type | default "Recreate") "Recreate") }}
     type: RollingUpdate
     rollingUpdate:
       maxSurge: 1
@@ -83,6 +91,31 @@ spec:
                   key: {{ .Values.highAvailability.redis.secretKey }}
             {{- end }}
             {{- end }}
+            {{- /*
+                leader_assigned sharding: every replica heartbeats into the
+                shared Redis and reads the published assignment. The pod name
+                is the shard identity; the namespace scopes the assigner Lease.
+                (consistent_hash sharding renders the StatefulSet instead.)
+            */}}
+            {{- if and .Values.sharding.enabled (eq .Values.sharding.mode "leader_assigned") }}
+            - name: PROMFORECAST_SHARDING_ENABLED
+              value: "true"
+            - name: PROMFORECAST_POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: PROMFORECAST_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            {{- if .Values.sharding.redis.existingSecret }}
+            - name: PROMFORECAST_REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.sharding.redis.existingSecret }}
+                  key: {{ .Values.sharding.redis.secretKey }}
+            {{- end }}
+            {{- end }}
             {{- with .Values.extraEnv }}{{- toYaml . | nindent 12 }}{{- end }}
           volumeMounts:
             - name: config
@@ -107,3 +140,4 @@ spec:
       {{- with .Values.affinity }}
       affinity: {{- toYaml . | nindent 8 }}
       {{- end }}
+{{- end }}
