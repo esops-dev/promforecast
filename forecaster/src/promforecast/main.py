@@ -19,6 +19,7 @@ from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse, PlainTextResponse
 
 from . import adapter as adapter_module
+from . import annotations as annotations_module
 from . import backfill as backfill_module
 from . import config as config_module
 from . import diagnose as diagnose_module
@@ -26,9 +27,11 @@ from . import ha_cache as ha_cache_module
 from . import inspect as inspect_module
 from . import preview as preview_module
 from . import telemetry as telemetry_module
+from . import triggers as triggers_module
 from . import tuner as tuner_module
 from . import validate as validate_module
 from . import warmup as warmup_module
+from . import webhook as webhook_module
 from . import what_if as what_if_module
 from .cache import MemoryQueryCache, QueryCache, QueryCacheBackend, RedisQueryCache
 from .exporter import Exporter
@@ -881,7 +884,19 @@ def run(config_path: Path, log_level: str) -> None:
     # group run. The disabled tracer is free, the real one carries SDK
     # init cost only when ``telemetry.enabled`` is true.
     tracer = telemetry_module.build_tracer(cfg.telemetry)
-    runner = Runner(config=cfg, source=source, exporter=exporter, sink=sink, tracer=tracer)
+    webhook_client = _build_webhook_client(cfg)
+    trigger_engine = _build_trigger_engine(cfg, source, exporter)
+    annotation_sink = _build_annotation_sink(cfg, exporter)
+    runner = Runner(
+        config=cfg,
+        source=source,
+        exporter=exporter,
+        sink=sink,
+        tracer=tracer,
+        webhook_client=webhook_client,
+        trigger_engine=trigger_engine,
+        annotation_sink=annotation_sink,
+    )
     if snapshot_cache is not None:
         # Wire the leader's per-group snapshot hook so a successful run
         # publishes the rendered /metrics payload to Redis. Followers
@@ -1492,6 +1507,56 @@ def _build_sink(cfg: config_module.Config) -> ForecastSink | None:
         max_connections=rw.max_connections,
         max_keepalive_connections=rw.max_keepalive_connections,
     )
+
+
+def _build_webhook_client(
+    cfg: config_module.Config,
+) -> webhook_module.WebhookRegressorClient | None:
+    """Construct a webhook-regressor client iff any query configures one.
+
+    The common case (no ``type: webhook`` regressor anywhere) returns
+    ``None`` so a deployment that never uses the feature pays no idle
+    connection pool. A config reload that *adds* the first webhook regressor
+    wires the client on the fly (see :meth:`Runner._rebuild_integrations`),
+    so no restart is required.
+    """
+    has_webhook = any(
+        reg.type == "webhook"
+        for group in cfg.groups
+        for query in group.queries
+        for reg in query.regressors
+    )
+    if not has_webhook:
+        return None
+    logger.info("webhook_regressor_client_enabled")
+    return webhook_module.WebhookRegressorClient()
+
+
+def _build_trigger_engine(
+    cfg: config_module.Config,
+    source: PromSource,
+    exporter: Exporter,
+) -> triggers_module.TriggerEngine | None:
+    """Construct the forecast-driven trigger engine iff triggers are configured."""
+    if not cfg.triggers:
+        return None
+    logger.info("triggers_enabled", count=len(cfg.triggers))
+    return triggers_module.TriggerEngine(triggers=cfg.triggers, source=source, exporter=exporter)
+
+
+def _build_annotation_sink(
+    cfg: config_module.Config,
+    exporter: Exporter,
+) -> annotations_module.GrafanaAnnotationSink | None:
+    """Construct the Grafana-annotations sink iff it is enabled."""
+    if not cfg.annotations.enabled:
+        return None
+    logger.info(
+        "grafana_annotations_enabled",
+        grafana_url=cfg.annotations.grafana_url,
+        events=list(cfg.annotations.events),
+    )
+    return annotations_module.GrafanaAnnotationSink(cfg.annotations, exporter)
 
 
 def _parse_listen(listen: str) -> tuple[str, int]:

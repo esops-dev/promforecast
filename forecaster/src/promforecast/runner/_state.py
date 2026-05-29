@@ -21,6 +21,7 @@ from typing import Any, Literal
 from ..exporter import (
     AccuracyPoint,
     CalibrationOffsetPoint,
+    CanaryDeviationPoint,
     ComponentDecompositionPoint,
     ConditionalCalibrationOffsetPoint,
     ConditionalDeviationPoint,
@@ -235,6 +236,7 @@ class _RunContext:
     points: list[ForecastPoint] = field(default_factory=list)
     accuracy_points: list[AccuracyPoint] = field(default_factory=list)
     deviation_points: list[DeviationPoint] = field(default_factory=list)
+    canary_deviation_points: list[CanaryDeviationPoint] = field(default_factory=list)
     quality_points: list[QualityPoint] = field(default_factory=list)
     ensemble_weight_points: list[EnsembleWeightPoint] = field(default_factory=list)
     contribution_points: list[ContributionPoint] = field(default_factory=list)
@@ -406,6 +408,9 @@ _INHERITANCE_REGISTRY: tuple[_InheritanceSpec, ...] = (
     # Lists keyed by the point's ``id`` label.
     _InheritanceSpec("accuracy_points", "accuracy_points", "label"),
     _InheritanceSpec("deviation_points", "deviation_points", "label"),
+    # Canary deviation points carry the ``id`` label (added by the runner)
+    # so the label extractor scopes them per query.
+    _InheritanceSpec("canary_deviation_points", "canary_deviation_points", "label"),
     _InheritanceSpec("quality_points", "quality_points", "label"),
     _InheritanceSpec("ensemble_weights", "ensemble_weight_points", "label"),
     _InheritanceSpec("calibration_offsets", "calibration_offsets", "label"),

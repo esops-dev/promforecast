@@ -22,7 +22,7 @@ Everything that shapes the data flowing into the forecasting model.
 - [Change-points](inputs/change-points.md) — input-side break detection and lookback adaptation
 - [Seasonality](inputs/seasonality.md) — periodicity detection
 - [Cold-start](inputs/cold-start.md) — sparse-history behaviour and peer-sibling borrowing
-- [Regressors](inputs/regressors.md) — calendar, custom PromQL, and holiday regressors, plus conditional forecasts (baseline given the current regressor state)
+- [Regressors](inputs/regressors.md) — calendar, custom PromQL, holiday, webhook (external pull), and calendar-file regressors, plus conditional forecasts (baseline given the current regressor state) and HMAC-signed webhooks
 - [Series discovery](inputs/discovery.md) — template-driven auto-fan-out over label values
 
 ## Outputs
@@ -42,6 +42,12 @@ metrics, calibration, explainability, and ad-hoc what-if endpoints.
 - [Recurring incident patterns](outputs/incident-patterns.md) — 7 x 24 heatmap of when incidents tend to land; for queries with `data_profile: events`
 - [Canary forecasts](outputs/canary.md)
 - [Predictive autoscaling](predictive-autoscaling.md) — Kubernetes custom-metrics adapter that exposes forecast metrics to HorizontalPodAutoscaler for scaling on the projected load curve
+
+## Integrations
+
+- [Canary deploy forecast comparison](canary-analysis.md) — fit the baseline pods, project what the canary should look like, and emit `<id>_canary_forecast_deviation` for Argo Rollouts / Flagger AnalysisRun gates
+- [Forecast-driven webhook triggers](triggers.md) — push structured forecast events (predicted value, band, model, drift) to a webhook when a PromQL condition transitions true; optional HMAC signing
+- [Grafana annotations](integrations/grafana-annotations.md) — post significant forecast events (drift, change-point, deploy-risk, predicted breach, deviation) as Grafana annotations on the dashboards you already watch
 
 ## Operations
 

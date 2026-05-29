@@ -24,7 +24,9 @@ from typing import TYPE_CHECKING, Any
 
 import structlog
 
+from .. import annotations as annotations_mod
 from .. import band_coverage as band_coverage_mod
+from .. import canary as canary_mod
 from .. import capacity as capacity_mod
 from .. import cold_start as cold_start_mod
 from .. import conformal as conformal_mod
@@ -69,6 +71,7 @@ from ..config import (
 )
 from ..exporter import (
     BandCoveragePoint,
+    CanaryDeviationPoint,
     DeployRiskPoint,
     DriftPoint,
     Exporter,
@@ -127,8 +130,11 @@ from .emission.safeguards import (
 if TYPE_CHECKING:
     import pandas as pd
 
+    from ..annotations import GrafanaAnnotationSink
     from ..config import Config
     from ..selector import SelectionResult
+    from ..triggers import TriggerEngine
+    from ..webhook import WebhookRegressorClient
 
 logger = structlog.get_logger(__name__)
 
@@ -365,12 +371,25 @@ class Runner:
         executor: ThreadPoolExecutor | None = None,
         sink: ForecastSink | None = None,
         tracer: telemetry_mod.Tracer | None = None,
+        webhook_client: WebhookRegressorClient | None = None,
+        trigger_engine: TriggerEngine | None = None,
+        annotation_sink: GrafanaAnnotationSink | None = None,
     ) -> None:
         self._config = config
         self._source = source
         self._exporter = exporter
         self._executor = executor or ThreadPoolExecutor(max_workers=4)
         self._sink = sink
+        # Optional client for ``type: webhook`` regressors. ``None`` when no
+        # webhook regressor is configured (the common case) — the prefetch
+        # path then degrades any webhook regressor gracefully.
+        self._webhook_client = webhook_client
+        # Optional forecast-driven webhook triggers and Grafana-annotations
+        # sink. Both ``None`` unless the operator configured them; both are
+        # evaluated after each group run (post-snapshot, post-sink) so a
+        # delivery hiccup never delays the standard exposition.
+        self._trigger_engine = trigger_engine
+        self._annotation_sink = annotation_sink
         # Drift cache: persists across runs in the same process so
         # successive fits can be compared. HA followers don't see the
         # cache; they read the leader's rendered drift gauges via the
@@ -638,10 +657,82 @@ class Runner:
             self._what_if_throttle.update_min_interval(
                 new_config.safety.fleet_what_if_min_interval.total_seconds(),
             )
+            # Rebuild the v1.9 outbound/inbound integrations (webhook
+            # regressor client, forecast-driven trigger engine, Grafana
+            # annotations sink) so a hot reload that adds, changes, or
+            # removes ``triggers:`` / ``annotations:`` / webhook regressors
+            # takes effect without a restart — the loops are quiesced here,
+            # so swapping them is race-free.
+            await self._rebuild_integrations(old_config=old)
             for group in new_config.groups:
                 self._spawn_group_loop(group)
 
             return ReloadResult(added=added, removed=removed, changed=changed)
+
+    async def _rebuild_integrations(self, *, old_config: Config) -> None:
+        """Reconcile webhook client / trigger engine / annotation sink to config.
+
+        Called from :meth:`apply_config` after the config swap (loops already
+        drained). Each integration is only rebuilt when its slice of the
+        config actually changed, so an unrelated reload preserves the trigger
+        rising-edge state and the annotation rising-edge dedup set rather than
+        re-firing everything that is currently active.
+        """
+        new = self._config
+        # Webhook client: needed iff some query still configures a webhook
+        # regressor. The client is config-agnostic (each ``fetch`` reads the
+        # live ``reg``), so keep an existing one rather than churning its
+        # connection pool + response cache; only create / tear down on the
+        # needed-ness boundary.
+        needs_webhook = any(
+            reg.type == "webhook"
+            for group in new.groups
+            for query in group.queries
+            for reg in query.regressors
+        )
+        if needs_webhook and self._webhook_client is None:
+            from ..webhook import WebhookRegressorClient  # noqa: PLC0415
+
+            self._webhook_client = WebhookRegressorClient()
+            logger.info("webhook_regressor_client_enabled_on_reload")
+        elif not needs_webhook and self._webhook_client is not None:
+            stale_client = self._webhook_client
+            self._webhook_client = None
+            with contextlib.suppress(Exception):
+                await stale_client.aclose()
+            logger.info("webhook_regressor_client_disabled_on_reload")
+
+        # Trigger engine: rebuild only when the trigger list changed.
+        if new.triggers != old_config.triggers:
+            stale_engine = self._trigger_engine
+            if new.triggers:
+                from ..triggers import TriggerEngine  # noqa: PLC0415
+
+                self._trigger_engine = TriggerEngine(
+                    triggers=new.triggers, source=self._source, exporter=self._exporter
+                )
+                logger.info("triggers_reloaded", count=len(new.triggers))
+            else:
+                self._trigger_engine = None
+                logger.info("triggers_disabled_on_reload")
+            if stale_engine is not None:
+                with contextlib.suppress(Exception):
+                    await stale_engine.aclose()
+
+        # Annotation sink: rebuild only when the annotations block changed.
+        if new.annotations != old_config.annotations:
+            stale_sink = self._annotation_sink
+            if new.annotations.enabled:
+                from ..annotations import GrafanaAnnotationSink  # noqa: PLC0415
+
+                self._annotation_sink = GrafanaAnnotationSink(new.annotations, self._exporter)
+                logger.info("grafana_annotations_reloaded", events=list(new.annotations.events))
+            else:
+                self._annotation_sink = None
+                logger.info("grafana_annotations_disabled_on_reload")
+            if stale_sink is not None:
+                with contextlib.suppress(Exception):
+                    await stale_sink.aclose()
 
     @staticmethod
     def _drain_grace_seconds(config: Config) -> float:
@@ -944,6 +1035,7 @@ class Runner:
                     points=ctx.points,
                     accuracy_points=ctx.accuracy_points,
                     deviation_points=ctx.deviation_points,
+                    canary_deviation_points=ctx.canary_deviation_points,
                     quality_points=ctx.quality_points,
                     ensemble_weights=ctx.ensemble_weight_points,
                     contribution_points=ctx.contribution_points,
@@ -1076,6 +1168,26 @@ class Runner:
                 await self._refresh_deploy_risk(group, run_query_ids)
             except Exception:
                 log.exception("deploy_risk_refresh_failed")
+
+            # Grafana annotations + forecast-driven webhook triggers run
+            # last, after the snapshot, sink, and deploy-risk refresh, so
+            # (a) the standard exposition is never delayed by an external
+            # POST and (b) trigger conditions can read the freshest metrics
+            # (sink) and annotation events the freshest deploy-risk scores.
+            # Both swallow their own delivery errors; this wrapper guards
+            # against an unexpected defect crashing the group run.
+            if self._annotation_sink is not None:
+                try:
+                    await self._annotation_sink.post_events(
+                        self._build_annotation_events(group, ctx), scope=group.name
+                    )
+                except Exception:
+                    log.exception("annotation_post_failed")
+            if self._trigger_engine is not None:
+                try:
+                    await self._trigger_engine.evaluate()
+                except Exception:
+                    log.exception("trigger_evaluate_failed")
 
             # Recompute the service-level health composite across all
             # current group snapshots. Cheap (a single pass over the
@@ -1480,6 +1592,14 @@ class Runner:
         if frames is None:
             return
 
+        # Canary-vs-baseline deviation reads the *full* fetched population
+        # (it needs both the canary and the baseline series), so it runs
+        # before the group-level canary *sampling* and the overflow caps
+        # shrink the set. It emits its own ``<id>_canary_forecast_deviation``
+        # family and does not affect the normal forecast path below.
+        if query.canary.enabled:
+            await self._emit_canary_deviation(query, group, frames, ctx, qlog)
+
         # Canary sampling runs *before* the overflow caps so the operator's
         # opt-in population shrink happens first, and the per-query/global
         # caps then bound the sampled population. The inverse order — caps
@@ -1663,6 +1783,8 @@ class Runner:
             query_end=end,
             step_seconds=step_seconds,
             query_timeout_seconds=self._config.safety.query_timeout.total_seconds(),
+            query_id=query.id,
+            webhook_client=self._webhook_client,
         )
 
     def _merge_preprocess_stats(
@@ -3772,6 +3894,248 @@ class Runner:
         """
         self._exporter.record_fit_outcome(group=group, model=model, success=success)
 
+    def _build_annotation_events(
+        self, group: GroupConfig, ctx: _RunContext
+    ) -> list[annotations_mod.AnnotationEvent]:
+        """Translate this run's significant events into annotation events.
+
+        Reads the per-group run context (drift alerts, change points,
+        predicted breaches, outside-band deviations) plus the global
+        deploy-risk scores. The sink itself filters by configured event
+        family and dedups repeats, so this builder emits liberally for
+        every *currently firing* event.
+        """
+        events: list[annotations_mod.AnnotationEvent] = []
+        g = group.name
+        for query_id, count in ctx.drift_alerts.items():
+            if count > 0:
+                events.append(
+                    annotations_mod.AnnotationEvent(
+                        event_type="drift",
+                        dedup_key=f"{g}:{query_id}",
+                        tags=["promforecast", "drift", f"group:{g}", f"id:{query_id}"],
+                        text=f"Forecast drift threshold crossed for {query_id} in group {g}",
+                    )
+                )
+        for query_id, count in ctx.change_points.items():
+            if count > 0:
+                events.append(
+                    annotations_mod.AnnotationEvent(
+                        event_type="change_point",
+                        dedup_key=f"{g}:{query_id}",
+                        tags=["promforecast", "change_point", f"group:{g}", f"id:{query_id}"],
+                        text=f"Change-point detected in {query_id} (group {g})",
+                    )
+                )
+        for point in ctx.will_breach_points:
+            if point.value >= 1.0:
+                qid = _query_id_from_metric(point.metric)
+                name = point.labels.get("name", "")
+                events.append(
+                    annotations_mod.AnnotationEvent(
+                        event_type="threshold_breach_predicted",
+                        dedup_key=f"{g}:{qid}:{name}:{_series_key_from_labels(point.labels)}",
+                        tags=[
+                            "promforecast",
+                            "threshold_breach_predicted",
+                            f"group:{g}",
+                            f"id:{qid}",
+                        ],
+                        text=(
+                            f"Predicted threshold breach for {qid} (threshold {name!r}, group {g})"
+                        ),
+                    )
+                )
+        for dev in ctx.deviation_points:
+            if dev.outside_band:
+                qid = dev.labels.get("id", "")
+                events.append(
+                    annotations_mod.AnnotationEvent(
+                        event_type="deviation_outside_band",
+                        dedup_key=f"{g}:{qid}:{_series_key_from_labels(dev.labels)}",
+                        tags=["promforecast", "deviation_outside_band", f"group:{g}", f"id:{qid}"],
+                        text=f"Actual outside forecast band for {qid} (group {g})",
+                    )
+                )
+        min_score = self._config.annotations.deploy_risk_min_score
+        for risk in self._exporter._deploy_risk_state():
+            # Only an *elevated* deploy posts an annotation — a rollout sitting
+            # at a low risk score is steady-state, not a moment worth marking.
+            if risk.score < min_score:
+                continue
+            service = risk.labels.get("service", "")
+            deployment_id = risk.labels.get("deployment_id", "")
+            events.append(
+                annotations_mod.AnnotationEvent(
+                    event_type="deploy_risk",
+                    dedup_key=f"{service}:{deployment_id}",
+                    tags=["promforecast", "deploy_risk", f"service:{service}"],
+                    text=(
+                        f"Deploy risk score {risk.score:.2f} for {service} "
+                        f"(deployment {deployment_id})"
+                    ),
+                )
+            )
+        return events
+
+    async def _emit_canary_deviation(
+        self,
+        query: QueryConfig,
+        group: GroupConfig,
+        frames: list[SeriesFrame],
+        ctx: _RunContext,
+        qlog: structlog.stdlib.BoundLogger,
+    ) -> None:
+        """Fit the baseline population and score each canary series against it.
+
+        Splits ``frames`` into a canary and a baseline population by the
+        configured selectors, fits the first configured model on the baseline
+        aggregate, backtests one horizon to obtain a trailing forecast band,
+        and emits ``<id>_canary_forecast_deviation`` for each canary series'
+        most recent actual versus that band. Failures degrade gracefully —
+        an unfittable baseline or a missing population simply emits nothing.
+        """
+        import pandas as pd  # noqa: PLC0415
+
+        d = self._config.defaults
+        try:
+            canary_frames, baseline_frames = canary_mod.split_frames(
+                frames,
+                canary_selector=query.canary.canary_selector,
+                baseline_selector=query.canary.baseline_selector,
+            )
+        except canary_mod.CanarySelectorError as exc:
+            qlog.warning("canary_selector_invalid", error=str(exc))
+            ctx.failures["canary_selector"] = ctx.failures.get("canary_selector", 0) + 1
+            return
+        if not canary_frames or not baseline_frames:
+            qlog.info(
+                "canary_population_empty",
+                canary=len(canary_frames),
+                baseline=len(baseline_frames),
+            )
+            return
+
+        timestamps, values = canary_mod.aggregate_baseline(baseline_frames)
+        eff_step = effective_step(query, d)
+        horizon_steps = max(1, int(d.horizon.total_seconds() // eff_step.total_seconds()))
+        eval_steps = min(horizon_steps, len(values) - 1)
+        if len(values) < max(d.min_points, eval_steps + 2):
+            qlog.info("canary_baseline_too_short", points=len(values))
+            return
+
+        df = pd.DataFrame(
+            {
+                "unique_id": ["baseline"] * len(values),
+                "ds": pd.to_datetime(timestamps),
+                "y": values,
+            }
+        )
+        freq = _pandas_freq(eff_step)
+        season_length = effective_season_length(query, d, step=eff_step)
+        levels = list(d.confidence_levels)
+        spec = d.models[0]
+        summary = await self._backtest_baseline(
+            df=df,
+            spec=spec,
+            eval_steps=eval_steps,
+            freq=freq,
+            levels=levels,
+            season_length=season_length,
+            group_name=group.name,
+            query_id=query.id,
+        )
+        if summary is None:
+            qlog.info("canary_baseline_unfittable")
+            return
+        _last_actual, last_yhat, last_bands = summary
+
+        points: list[CanaryDeviationPoint] = []
+        for frame in canary_frames:
+            actual = canary_mod.latest_actual(frame)
+            if actual is None:
+                continue
+            for level in levels:
+                band = last_bands.get(level)
+                if band is None:
+                    continue
+                dev = deviation_mod.compute(actual, last_yhat, band.lower, band.upper)
+                # ``id`` mirrors the v0.2 deviation shape and lets the
+                # partial-tick inheritance registry scope these rows by query.
+                labels = {
+                    **frame.labels,
+                    "id": query.id,
+                    "model": spec.name,
+                    "level": str(level),
+                }
+                points.append(
+                    CanaryDeviationPoint(
+                        metric=query.id,
+                        labels=labels,
+                        ratio=dev.ratio,
+                        outside_band=dev.outside_band,
+                    )
+                )
+        ctx.canary_deviation_points.extend(points)
+        qlog.info(
+            "canary_deviation_emitted",
+            canary_series=len(canary_frames),
+            baseline_series=len(baseline_frames),
+            points=len(points),
+        )
+
+    async def _backtest_baseline(
+        self,
+        *,
+        df: pd.DataFrame,
+        spec: ModelSpec,
+        eval_steps: int,
+        freq: str,
+        levels: list[int],
+        season_length: int,
+        group_name: str,
+        query_id: str,
+    ) -> tuple[float, float, dict[int, Any]] | None:
+        """Run one baseline backtest in the executor; return its trailing band.
+
+        Returns ``(last_actual, last_yhat, bands)`` exactly as
+        ``_summarise_backtest`` does, or ``None`` when the fit fails or the
+        frames are degenerate.
+        """
+        loop = asyncio.get_running_loop()
+        timeout = self._config.safety.fit_timeout.total_seconds()
+        model = model_registry.build(spec.name, season_length=season_length, params=spec.params)
+        try:
+            with self._tracer.span(
+                "promforecast.fit",
+                model=spec.name,
+                kind="canary_baseline",
+                horizon=eval_steps,
+                freq=freq,
+                season_length=season_length,
+            ):
+                async with self._fits_semaphore:
+                    outcome = await asyncio.wait_for(
+                        loop.run_in_executor(
+                            self._executor,
+                            _run_backtest,
+                            model,
+                            df,
+                            eval_steps,
+                            freq,
+                            levels,
+                            None,
+                        ),
+                        timeout=timeout,
+                    )
+        except Exception:
+            logger.exception("canary_baseline_backtest_failed", group=group_name, query=query_id)
+            return None
+        if outcome is None:
+            return None
+        test, predictions = outcome
+        return _pkg._summarise_backtest(predictions=predictions, test=test, levels=levels)
+
     async def _run_backtests(
         self,
         *,
@@ -4273,3 +4637,12 @@ class Runner:
         if self._sink is not None:
             with contextlib.suppress(Exception):
                 await self._sink.aclose()
+        if self._webhook_client is not None:
+            with contextlib.suppress(Exception):
+                await self._webhook_client.aclose()
+        if self._trigger_engine is not None:
+            with contextlib.suppress(Exception):
+                await self._trigger_engine.aclose()
+        if self._annotation_sink is not None:
+            with contextlib.suppress(Exception):
+                await self._annotation_sink.aclose()
