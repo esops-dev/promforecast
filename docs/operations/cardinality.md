@@ -40,6 +40,7 @@ Notation:
 | `<id>_forecast_contribution_ratio`          | `S × N_regressors`                     | Only with regressors |
 | `forecast_band_calibration_offset`          | `S × M × L`                            | `accuracy.conformal.enabled: true` |
 | `<id>_forecast_component`                   | `S × M × 4`                            | `emission.decompose: true` (trend/seasonal/level/residual) |
+| `<id>_forecast_quantile`                    | `S × M × N_quantiles`                  | `emission.quantiles` set; add `S × M × N_quantiles` more for the per-quantile `forecast_band_calibration_offset{q}` rows when `accuracy.conformal.enabled: true` (and one extra hold-out fit) |
 | `forecast_drift_score`                      | `S × M`                                | `emission.drift.enabled: true` |
 | Threshold ETA / will_breach                 | `S × M × N_thresholds × (1 + L)`       | Only configured thresholds |
 | Drain ETA (`le_drain`)                      | `S × M × N_drain_thresholds × (1 + L)` | Charged separately from the standard ETA |

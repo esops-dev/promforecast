@@ -112,6 +112,63 @@ def compute_offsets(
     return CalibrationResult(offsets=offsets, samples=int(residuals.size))
 
 
+@dataclass(frozen=True)
+class QuantileCalibrationResult:
+    """Per-quantile *signed* additive correction for conformalised quantiles."""
+
+    offsets: dict[float, float]
+    samples: int
+
+
+def compute_quantile_offsets(
+    *,
+    calib_actuals: NDArray[np.float64],
+    calib_predictions: pd.DataFrame,
+    quantiles: list[float],
+) -> QuantileCalibrationResult:
+    """Conformalise each quantile to its empirical coverage on the holdout.
+
+    For a one-sided quantile ``q`` the calibrated prediction must satisfy
+    ``P(actual <= predicted_q + offset) = q`` on the calibration window.
+    The empirical solution is ``offset = quantile_q(actual - predicted_q)``
+    — the ``q``-quantile of the signed residuals — which is the standard
+    additive conformalised-quantile-regression correction. Unlike the
+    two-sided band offset this is *signed*: a quantile the model placed too
+    high gets a negative correction.
+
+    ``calib_predictions`` is the model's forecast over the calibration
+    window carrying the per-level band columns from which each quantile is
+    derived. Quantiles whose source band column is absent are omitted from
+    the result (the caller treats "missing quantile" as "no calibration
+    this run").
+    """
+    from . import quantiles as quantiles_mod  # noqa: PLC0415
+
+    if calib_actuals.size == 0 or calib_predictions.empty:
+        return QuantileCalibrationResult(offsets={}, samples=0)
+    n = min(calib_actuals.size, len(calib_predictions))
+    if n < 2:  # noqa: PLR2004 — two points is the bare minimum for a quantile
+        return QuantileCalibrationResult(offsets={}, samples=n)
+    actuals = calib_actuals[:n]
+    offsets: dict[float, float] = {}
+    samples = 0
+    for q in quantiles:
+        series = quantiles_mod.predicted_quantile_series(calib_predictions, q)
+        if series is None:
+            continue
+        pred = series.to_numpy(dtype=float)[:n]
+        signed = actuals - pred
+        finite = np.isfinite(signed)
+        if not finite.any():
+            continue
+        finite_signed = signed[finite]
+        offset = float(np.quantile(finite_signed, max(0.0, min(1.0, q))))
+        if math.isfinite(offset):
+            offsets[q] = offset
+            samples = max(samples, int(finite_signed.size))
+    return QuantileCalibrationResult(offsets=offsets, samples=samples)
+
+
 def apply_offsets(
     forecast: pd.DataFrame,
     offsets: dict[int, float],

@@ -31,6 +31,7 @@ Everything the forecaster emits beyond raw forecast curves — derived
 metrics, calibration, explainability, and ad-hoc what-if endpoints.
 
 - [Capacity planning](outputs/capacity.md) — damped trend, time-to-threshold ETAs, growth rate, will-breach predictive boolean, queue burn-down (drain) forecasting
+- [Arbitrary-quantile forecasts](quantile.md) — emit `<id>_forecast_quantile{q}` at any quantile for risk-based alerting and fan charts
 - [SLO error-budget forecasting](outputs/slo.md) — burn rate, exhaustion projection, multi-window alerting
 - [Maintenance window recommendations](outputs/maintenance-windows.md) — top-N lowest-load windows for scheduling reboots, rollouts, and cert rotations
 - [Conformal calibration](outputs/conformal.md) — empirical-coverage band correction

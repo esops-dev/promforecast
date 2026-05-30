@@ -43,6 +43,7 @@ from .. import maintenance as maintenance_mod
 from .. import models as model_registry
 from .. import preprocess as preprocess_mod
 from .. import quality as quality_mod
+from .. import quantiles as quantiles_mod
 from .. import regressors as regressors_mod
 from .. import revision as revision_mod
 from .. import right_sizing as right_sizing_mod
@@ -2594,6 +2595,20 @@ class Runner:
         freq = _pandas_freq(eff_step)
         horizon = max(1, int(d.horizon.total_seconds() // eff_step.total_seconds()))
         levels = list(d.confidence_levels)
+        # Arbitrary-quantile emission derives each quantile from the band
+        # of the confidence level that brackets it (see
+        # :mod:`promforecast.quantiles`). The implied levels are folded into
+        # the single forward fit's level set — ``fit_levels`` — so the band
+        # columns exist to read from without re-fitting per quantile. The
+        # factory keeps ``levels`` (the configured ``confidence_levels``) so
+        # the ``_forecast_lower``/``_forecast_upper`` family is unchanged;
+        # the extra levels only ever surface through the quantile family.
+        quantiles = list(query.emission.quantiles)
+        fit_levels = (
+            sorted(set(levels) | set(quantiles_mod.quantile_levels(quantiles)))
+            if quantiles
+            else levels
+        )
         factory = SeriesPointFactory(
             metric_id=query.id,
             base_labels=frame.labels,
@@ -2650,7 +2665,7 @@ class Runner:
                 group_name=group_name,
                 horizon=horizon,
                 freq=freq,
-                levels=levels,
+                levels=fit_levels,
                 season_length=eff_season_length,
                 backtest_results=backtest_results,
                 result=result,
@@ -2665,7 +2680,7 @@ class Runner:
                 group_name=group_name,
                 horizon=horizon,
                 freq=freq,
-                levels=levels,
+                levels=fit_levels,
                 season_length=eff_season_length,
                 backtest_results=backtest_results,
                 result=result,
@@ -2680,7 +2695,7 @@ class Runner:
                 group_name=group_name,
                 horizon=horizon,
                 freq=freq,
-                levels=levels,
+                levels=fit_levels,
                 season_length=eff_season_length,
                 result=result,
                 regressors=regressors_frame,
@@ -2803,6 +2818,36 @@ class Runner:
             result=result,
         )
 
+        # Arbitrary-quantile emission. Derives each quantile from the
+        # already-fit band columns (no extra forward fit) and appends the
+        # ``<id>_forecast_quantile`` family into the same snapshot / curve
+        # lists so it inherits the standard safeguard, inheritance and
+        # rendering paths. When conformal calibration is on, a per-quantile
+        # coverage pass widens each quantile and the offset is exposed via
+        # ``forecast_band_calibration_offset{q="..."}``.
+        if quantiles and result.capacity_inputs:
+            quantile_offsets_by_model: dict[str, dict[float, float]] = {}
+            if d.accuracy.conformal.enabled:
+                quantile_offsets_by_model = await self._compute_quantile_conformal_offsets(
+                    df=df,
+                    emitted_inputs=list(result.capacity_inputs),
+                    model_specs=model_specs,
+                    freq=freq,
+                    fit_levels=fit_levels,
+                    quantiles=quantiles,
+                    season_length=eff_season_length,
+                    regressors=regressors_frame,
+                    holdout_fraction=d.accuracy.conformal.holdout_fraction,
+                )
+            forecast_points = self._emit_quantile_forecasts(
+                emitted_inputs=list(result.capacity_inputs),
+                quantiles=quantiles,
+                factory=factory,
+                forecast_points=forecast_points,
+                result=result,
+                quantile_offsets_by_model=quantile_offsets_by_model,
+            )
+
         # Free the retained per-model dataframes — they can be MB-scale,
         # and ``_RunContext`` retains them across the per-series loop.
         result.capacity_inputs.clear()
@@ -2856,7 +2901,7 @@ class Runner:
             # ``ForecastQualityZero`` alert even when the intermittent
             # model is fitting fine.
             quality_kind: quality_mod.ScoreKind = (
-                "mase" if query.data_profile == "intermittent" else "mape"
+                "mase" if query.data_profile in ("intermittent", "count") else "mape"
             )
             result.quality = list(
                 factory.quality_points(
@@ -3760,18 +3805,20 @@ class Runner:
         regressors: pd.DataFrame | None = None,
     ) -> list[ForecastPoint]:
         d = self._config.defaults
-        # ``data_profile: intermittent`` swaps the comparator from MAPE to
-        # MASE — MAPE is undefined wherever the actual is zero, which is
-        # precisely the regime intermittent models target. The selector
-        # contract is unit-agnostic; we hand it MASE the same way we'd
-        # hand it MAPE and the lowest finite score still wins. The
-        # ``candidate_preference`` whitelist nudges the search toward the
-        # registered intermittent wrappers when any are configured, so an
-        # operator who lists ``[AutoARIMA, Croston, CrostonSBA]`` gets the
-        # Croston family preferred without removing AutoARIMA as a safety
-        # net.
+        # ``data_profile: intermittent`` and ``count`` both swap the
+        # comparator from MAPE to MASE — MAPE is undefined wherever the
+        # actual is zero, which both regimes routinely hit (sparse
+        # intermittent series; low-rate count series like error counts).
+        # The selector contract is unit-agnostic; we hand it MASE the same
+        # way we'd hand it MAPE and the lowest finite score still wins.
+        # The ``candidate_preference`` whitelist nudges the search toward
+        # the registered intermittent / count wrappers when any are
+        # configured, so an operator who lists ``[AutoARIMA, Poisson,
+        # NegativeBinomial]`` under ``data_profile: count`` gets the count
+        # family preferred without removing AutoARIMA as a safety net.
         is_intermittent = query.data_profile == "intermittent"
-        if is_intermittent:
+        is_count = query.data_profile == "count"
+        if is_intermittent or is_count:
             score_map = {
                 model_name: score
                 for model_name, results in backtest_results.items()
@@ -3783,7 +3830,12 @@ class Runner:
                 for model_name, results in backtest_results.items()
                 if (mape := overall_mape(results)) is not None
             }
-        preference = model_registry.INTERMITTENT_MODEL_NAMES if is_intermittent else None
+        if is_intermittent:
+            preference: frozenset[str] | None = model_registry.INTERMITTENT_MODEL_NAMES
+        elif is_count:
+            preference = model_registry.COUNT_MODEL_NAMES
+        else:
+            preference = None
         selection = select(
             fallback_model=d.accuracy.fallback_model,
             fallback_mape_threshold=d.accuracy.fallback_mape_threshold,
@@ -3911,11 +3963,13 @@ class Runner:
         # Compute inverse-score weights restricted to models that produced
         # a forecast this run; otherwise a backtested-but-failed-to-fit
         # model would leak into the ensemble's denominator.
-        # ``data_profile: intermittent`` swaps MAPE for MASE so a series
-        # whose actuals are mostly zero (and therefore has NaN MAPE
-        # everywhere) still produces meaningful weights instead of
+        # ``data_profile: intermittent`` / ``count`` swap MAPE for MASE so
+        # a series whose actuals are mostly zero (and therefore has NaN
+        # MAPE everywhere) still produces meaningful weights instead of
         # silently degrading to equal weights for every component.
-        score_summary = overall_mase if query.data_profile == "intermittent" else overall_mape
+        score_summary = (
+            overall_mase if query.data_profile in ("intermittent", "count") else overall_mape
+        )
         scoreable_scores = {
             name: score
             for name, results in backtest_results.items()
@@ -4562,6 +4616,127 @@ class Runner:
             if calib.offsets:
                 results[model_name] = calib.offsets
         return results
+
+    async def _compute_quantile_conformal_offsets(
+        self,
+        *,
+        df: pd.DataFrame,
+        emitted_inputs: list[_CapacityInput],
+        model_specs: list[ModelSpec],
+        freq: str,
+        fit_levels: list[int],
+        quantiles: list[float],
+        season_length: int,
+        regressors: pd.DataFrame | None,
+        holdout_fraction: float,
+    ) -> dict[str, dict[float, float]]:
+        """Per-(emitted model) signed conformal offsets for each quantile.
+
+        Mirrors :meth:`_compute_conformal_offsets` but scores each
+        quantile's *one-sided* empirical coverage on the holdout rather
+        than the two-sided band coverage. The calibration fit is at
+        ``fit_levels`` (the expanded set that carries every quantile's
+        source band column) so the quantiles can be derived from it. This
+        is one extra holdout fit per emitted model, charged only when both
+        ``emission.quantiles`` and ``accuracy.conformal.enabled`` are on;
+        the synthetic ``ensemble`` row is skipped (no underlying
+        ``fit_predict`` to recalibrate). Per-(model) failures isolate and
+        the quantile family still emits, just without the correction.
+        """
+        emitted_models: set[str] = {
+            ci.model_name for ci in emitted_inputs if ci.model_name and ci.model_name != "ensemble"
+        }
+        if not emitted_models:
+            return {}
+        split = conformal_mod.holdout_split(df, holdout_fraction=holdout_fraction)
+        if split is None:
+            return {}
+        train_df, calib_df = split
+        train_regressors: pd.DataFrame | None
+        if regressors is not None and len(regressors) >= len(train_df):
+            train_regressors = regressors.iloc[: len(train_df)].reset_index(drop=True)
+        else:
+            train_regressors = None
+        calib_actuals = calib_df["y"].to_numpy(dtype=float)
+        calib_steps = len(calib_df)
+        min_calib_for_quantile = 2
+        if calib_steps < min_calib_for_quantile:
+            return {}
+
+        spec_by_name = {spec.name: spec for spec in model_specs}
+        results: dict[str, dict[float, float]] = {}
+        for model_name in sorted(emitted_models):
+            spec = spec_by_name.get(model_name) or ModelSpec(name=model_name)
+            try:
+                calib_predictions = await self._fit_one(
+                    spec=spec,
+                    df=train_df,
+                    horizon=calib_steps,
+                    freq=freq,
+                    levels=fit_levels,
+                    season_length=season_length,
+                    regressors=train_regressors,
+                )
+            except TimeoutError:
+                logger.warning(
+                    "quantile_conformal_calibration_timeout",
+                    model=model_name,
+                    timeout_s=self._config.safety.fit_timeout.total_seconds(),
+                )
+                continue
+            except Exception as exc:
+                logger.warning(
+                    "quantile_conformal_calibration_fit_failed",
+                    model=model_name,
+                    error=str(exc),
+                )
+                continue
+            calib = conformal_mod.compute_quantile_offsets(
+                calib_actuals=calib_actuals,
+                calib_predictions=calib_predictions,
+                quantiles=quantiles,
+            )
+            if calib.offsets:
+                results[model_name] = calib.offsets
+        return results
+
+    def _emit_quantile_forecasts(
+        self,
+        *,
+        emitted_inputs: list[_CapacityInput],
+        quantiles: list[float],
+        factory: SeriesPointFactory,
+        forecast_points: list[ForecastPoint],
+        result: _FitResult,
+        quantile_offsets_by_model: dict[str, dict[float, float]],
+    ) -> list[ForecastPoint]:
+        """Derive and emit the ``<id>_forecast_quantile`` family per emitted model.
+
+        Each emitted model's forecast frame gets ``yhat_quantile_<q>``
+        columns (band-edge values plus the signed conformal correction when
+        available), then the snapshot rows are appended to
+        ``forecast_points`` and the per-step curve rows to ``result.curve``
+        so the quantile family rides the standard safeguard / inheritance /
+        rendering paths. The signed per-quantile offsets land on
+        ``result.calibration_offsets`` as
+        ``forecast_band_calibration_offset{q="..."}`` rows alongside the
+        band-level offsets. Returns the (extended) ``forecast_points``.
+        """
+        for ci in emitted_inputs:
+            forecast = ci.forecast
+            offsets = quantile_offsets_by_model.get(ci.model_name)
+            quantiles_mod.add_quantile_columns(forecast, quantiles, offsets)
+            forecast_points.extend(
+                factory.quantile_points(forecast, ci.model_name, ci.selection, quantiles)
+            )
+            result.curve.extend(
+                factory.quantile_curve_points(forecast, ci.model_name, ci.selection, quantiles)
+            )
+            if offsets:
+                result.calibration_offsets.extend(
+                    factory.quantile_calibration_offset_points(ci.model_name, offsets)
+                )
+        return forecast_points
 
     async def _compute_conditional_conformal_offsets(  # noqa: PLR0912
         self,

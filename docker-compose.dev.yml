@@ -26,7 +26,7 @@ services:
       - "--retentionPeriod=30d"
       - "--futureRetention=2d"
     ports:
-      - "8428:8428"
+      - "8429:8428"
     volumes:
       - vm-data:/storage
     healthcheck:
@@ -48,7 +48,7 @@ services:
     image: promforecast-http-demo:dev
     container_name: pf-http-demo
     ports:
-      - "8000:8000"
+      - "8001:8000"
     restart: unless-stopped
 
   http-demo-loadgen:
@@ -96,7 +96,7 @@ services:
     container_name: pf-redis
     command: ["redis-server", "--save", "", "--appendonly", "no"]
     ports:
-      - "6379:6379"
+      - "6378:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -113,7 +113,7 @@ services:
       - "--storage.tsdb.retention.time=2h"
       - "--web.enable-lifecycle"
     ports:
-      - "9090:9090"
+      - "9080:9090"
     volumes:
       - ./docker/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - prom-data:/prometheus
@@ -129,7 +129,7 @@ services:
     container_name: pf-forecaster
     command: ["--config", "/etc/promforecast/config.yaml"]
     ports:
-      - "9091:9091"
+      - "9081:9091"
     volumes:
       # Dev-tuned config: short lookback / step / min_points so the first fit
       # happens minutes after `make dev-up` instead of needing days of data.
@@ -156,7 +156,7 @@ services:
       GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
       GF_USERS_DEFAULT_THEME: dark
     ports:
-      - "3000:3000"
+      - "3001:3000"
     volumes:
       - ./docker/grafana/provisioning:/etc/grafana/provisioning:ro
       - ./dashboards/grafana:/etc/grafana/dashboards:ro

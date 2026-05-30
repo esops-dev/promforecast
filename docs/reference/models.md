@@ -1,8 +1,10 @@
 # Models
 
 promforecast ships a small set of statistical forecasters from the
-[`statsforecast`](https://github.com/Nixtla/statsforecast) library, plus a
-`SeasonalNaive` baseline.
+[`statsforecast`](https://github.com/Nixtla/statsforecast) library, a
+`SeasonalNaive` baseline, and a family of in-tree count-distribution
+models (`Poisson`, `NegativeBinomial`, `INGARCH`) for integer-valued
+metrics.
 
 Configure models via the `models:` array (under `defaults` or per group).  
 - **Explicit mode** (`accuracy.auto_select: false`): every chosen model runs and emits forecasts side-by-side.  
@@ -25,6 +27,9 @@ External models can be added via the `promforecast.models` entry-point group (se
 | **CrostonSBA**      | Syntetos-Boylan bias-corrected Croston (recommended default).                               | Sparse / intermittent demand                  | Continuous series with strong seasonality        | Negligible                       |
 | **ADIDA**           | Aggregate-Disaggregate Intermittent Demand Approach.                                        | Very sparse signals where Croston struggles   | Continuous series with strong seasonality        | Negligible                       |
 | **IMAPA**           | Intermittent Multiple Aggregation Prediction Algorithm.                                     | Noisy intermittent signals                    | Continuous series with strong seasonality        | Negligible                       |
+| **Poisson**         | Seasonal-rate Poisson model; Poisson quantile bands (non-negative, asymmetric).             | Integer counts where variance ≈ mean          | Overdispersed counts; continuous series          | Negligible                       |
+| **NegativeBinomial**| Seasonal-rate model with negative-binomial bands; overdispersion from method of moments.    | Integer counts where variance > mean (common) | Continuous series                                | Negligible                       |
+| **INGARCH**         | Integer-valued GARCH(1,1) — Poisson autoregression `λ_t = ω + α·y_{t-1} + β·λ_{t-1}` by MLE. | Autocorrelated / bursty count series          | Series with no count autocorrelation             | Sub-second per series            |
 
 ### When to choose damped
 
@@ -84,6 +89,61 @@ emission:
 - `round_to_integer` rounds to nearest integer (`forecast_emission_clipped_total{kind="rounded"}` only when fractional part ≥0.05).
 
 Applies to both `/metrics` and `remote_write`.
+
+These safeguards are a *post-processing* fix for a continuous model fit to
+count data — they correct the symptom (negative / fractional output) but
+not the mis-specified band shape. For a proper fit, use a
+count-distribution model.
+
+## Count-distribution models
+
+`Poisson`, `NegativeBinomial`, and `INGARCH` model the integer nature of
+the data directly, so the predicted bands respect the distribution: they
+cannot extend below zero and they are asymmetric where the count
+distribution is. The seasonal rate is the per-cycle-position sample mean
+(the maximum-likelihood rate of a saturated seasonal Poisson); the band
+families differ in how they spread around it.
+
+**Decision rule** — pick by the relationship between the series'
+variance and mean (and whether it is autocorrelated):
+
+| Series characteristic                              | Model              |
+|----------------------------------------------------|--------------------|
+| variance ≈ mean (pure Poisson arrivals)            | `Poisson`          |
+| variance > mean (overdispersed — the common case)  | `NegativeBinomial` |
+| counts show autocorrelation (bursty / self-exciting) | `INGARCH`        |
+
+Turn them on by adding them to `models:` and declaring the count profile on
+the query so auto-select prefers them while keeping the continuous models
+as a safety net:
+
+```yaml
+defaults:
+  models: [AutoARIMA, Poisson, NegativeBinomial, INGARCH]
+  accuracy:
+    auto_select: true            # MASE-scored for count (MAPE is undefined on zeros)
+
+groups:
+  - name: errors
+    queries:
+      - id: app_error_count
+        promql: sum by (instance) (rate(app_errors_total[5m]))
+        data_profile: count       # per-query: prefer the count family, MASE scoring
+```
+
+When `data_profile: count` is set, auto-select scores candidates by MASE
+(MAPE is undefined wherever the actual is zero — common for error counts)
+and prefers the registered count wrappers, falling back to the continuous
+models if none score finitely. The [count-aware clip-and-round
+safeguards](#count-aware-emission-safeguards) remain on by default under
+`data_profile: count` as a fallback for any continuous model that still
+wins the horse race, but they are no longer the primary handling.
+
+Count wrappers ignore `regressors`; `INGARCH` falls back to the
+seasonal-rate Poisson projection when the series is too short for a stable
+three-parameter fit or the optimiser does not converge to a stationary
+solution, so a deployment can never end up with a diverging count
+forecast.
 
 ## Cold-start seasonality borrowing
 
