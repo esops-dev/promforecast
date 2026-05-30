@@ -449,6 +449,31 @@ class SeriesPointFactory:
                 offset=float(offset),
             )
 
+    def quantile_calibration_offset_points(
+        self,
+        model_name: str,
+        offsets: dict[float, float],
+    ) -> Iterable[CalibrationOffsetPoint]:
+        """One ``forecast_band_calibration_offset`` per (model, quantile).
+
+        Mirrors :meth:`calibration_offset_points` but the discriminator is
+        the ``q`` label rather than ``level`` — the per-quantile conformal
+        correction lands in the same gauge family so operators read both
+        the band-level and per-quantile offsets from one metric name. The
+        offset is *signed* for quantiles (a quantile placed too high gets a
+        negative correction); non-finite values are skipped.
+        """
+        from . import quantiles as quantiles_mod  # noqa: PLC0415
+
+        common = self._common_with_id()
+        for q, offset in offsets.items():
+            if not math.isfinite(offset):
+                continue
+            yield CalibrationOffsetPoint(
+                labels={**common, "model": model_name, "q": quantiles_mod.format_quantile(q)},
+                offset=float(offset),
+            )
+
     def conditional_calibration_offset_points(
         self,
         model_name: str,
@@ -579,6 +604,91 @@ class SeriesPointFactory:
                     yield ForecastCurvePoint(
                         metric=metric_name,
                         labels=band_labels,
+                        value=float(v),
+                        timestamp_ms=ts_ms,
+                    )
+
+    def quantile_points(
+        self,
+        forecast: pd.DataFrame,
+        model_name: str,
+        selection: SelectionResult | None,
+        quantiles: list[float],
+    ) -> Iterable[ForecastPoint]:
+        """Convert the end-of-horizon row into ``<id>_forecast_quantile`` points.
+
+        Mirrors :meth:`forecast_points`' snapshot convention — one value
+        per (series, model, quantile) at the configured horizon. The
+        quantile columns (``yhat_quantile_<q>``) must already be present on
+        ``forecast`` (the runner derives them via
+        :func:`promforecast.quantiles.add_quantile_columns` before calling
+        this). Quantiles whose column is absent are skipped.
+        """
+        from . import quantiles as quantiles_mod  # noqa: PLC0415
+
+        if forecast.empty:
+            return
+        last = forecast.iloc[-1]
+        common = self._build_common_labels(model_name, selection)
+        metric_name = f"{self._metric_id}_forecast_quantile"
+        for q in quantiles:
+            col = quantiles_mod.quantile_column(q)
+            if col not in forecast.columns:
+                continue
+            value = float(last[col])
+            if not math.isfinite(value):
+                continue
+            yield ForecastPoint(
+                metric=metric_name,
+                labels={**common, "q": quantiles_mod.format_quantile(q)},
+                value=value,
+            )
+
+    def quantile_curve_points(
+        self,
+        forecast: pd.DataFrame,
+        model_name: str,
+        selection: SelectionResult | None,
+        quantiles: list[float],
+    ) -> Iterable[ForecastCurvePoint]:
+        """Yield every horizon step of each quantile as a sink push point.
+
+        Mirrors :meth:`forecast_curve_points` but emits under the
+        ``<id>_forecast_quantile`` metric name with a ``q`` label. Rows
+        with non-finite timestamps or values are dropped — TSDBs reject
+        NaN samples.
+        """
+        from . import quantiles as quantiles_mod  # noqa: PLC0415
+
+        if forecast.empty or "ds" not in forecast.columns:
+            return
+        import pandas as pd  # noqa: PLC0415
+
+        common = self._build_common_labels(model_name, selection)
+        metric_name = f"{self._metric_id}_forecast_quantile"
+        ds_normalised = pd.to_datetime(forecast["ds"], errors="coerce")
+        valid_ts_mask = ds_normalised.notna().to_numpy()
+        ts_ms_arr = ds_normalised.astype("int64").to_numpy() // 1_000_000
+        quantile_cols: list[tuple[dict[str, str], Any]] = []
+        for q in quantiles:
+            col = quantiles_mod.quantile_column(q)
+            if col not in forecast.columns:
+                continue
+            labels = {**common, "q": quantiles_mod.format_quantile(q)}
+            quantile_cols.append((labels, forecast[col].to_numpy(dtype=float)))
+        if not quantile_cols:
+            return
+        n = len(forecast)
+        for i in range(n):
+            if not valid_ts_mask[i]:
+                continue
+            ts_ms = int(ts_ms_arr[i])
+            for labels, arr in quantile_cols:
+                v = arr[i]
+                if math.isfinite(v):
+                    yield ForecastCurvePoint(
+                        metric=metric_name,
+                        labels=labels,
                         value=float(v),
                         timestamp_ms=ts_ms,
                     )

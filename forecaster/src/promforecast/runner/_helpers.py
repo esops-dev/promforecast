@@ -62,6 +62,7 @@ _FORECAST_METRIC_SUFFIXES: tuple[str, ...] = (
     "_forecast_conditional_upper",
     "_forecast_conditional",
     "_forecast_component",
+    "_forecast_quantile",
     "_forecast_lower",
     "_forecast_upper",
     "_forecast",

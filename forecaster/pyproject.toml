@@ -37,6 +37,11 @@ dependencies = [
     #     errors at runtime" UX when the extras aren't installed.
     "ruptures>=1.1",
     "statsmodels>=0.14",
+    # ``scipy``: count-distribution quantile functions (``scipy.stats``)
+    # and the INGARCH maximum-likelihood fit (``scipy.optimize``). Already
+    # present transitively via statsforecast/statsmodels; pinned directly
+    # because ``promforecast.models.count_distribution`` imports it.
+    "scipy>=1.13",
 ]
 
 [project.optional-dependencies]
@@ -86,6 +91,12 @@ croston            = "promforecast.models.intermittent:CrostonModel"
 croston_sba        = "promforecast.models.intermittent:CrostonSBAModel"
 adida              = "promforecast.models.intermittent:ADIDAModel"
 imapa              = "promforecast.models.intermittent:IMAPAModel"
+# Count-distribution models for integer-valued metrics (request counts,
+# queue depths, error counts). Bands respect the count distribution
+# (non-negative, asymmetric) rather than relying on clip-and-round.
+poisson            = "promforecast.models.count_distribution:PoissonModel"
+negative_binomial  = "promforecast.models.count_distribution:NegativeBinomialModel"
+ingarch            = "promforecast.models.count_distribution:INGARCHModel"
 
 [project.urls]
 Homepage      = "https://github.com/esops-dev/promforecast"
@@ -168,6 +179,16 @@ ignore_missing_imports = true
 # behind a narrow typed surface, so silencing missing imports here is
 # the pragmatic fix.
 module = ["ruptures", "statsmodels.tsa.seasonal"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+# ``scipy`` ships partial type information but not for the
+# ``scipy.stats`` distribution objects or ``scipy.optimize.minimize``
+# result attributes the count-distribution models reach into. Those
+# imports are confined to ``promforecast.models.count_distribution``
+# behind a narrow typed surface, so silencing missing imports here keeps
+# mypy --strict clean without chasing incomplete third-party stubs.
+module = ["scipy", "scipy.*"]
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]

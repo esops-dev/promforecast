@@ -72,6 +72,11 @@ class CardinalityEstimate:
     # Component decomposition: per-(series, model, component) rows for
     # queries that opt into ``emission.decompose: true``.
     decomposition_lines: int
+    # Arbitrary-quantile emission: per-(series, model, quantile) snapshot
+    # rows for queries that set ``emission.quantiles``, plus a matching
+    # per-(series, model, quantile) ``forecast_band_calibration_offset``
+    # row when conformal calibration is also on.
+    quantile_lines: int
     # Count-aware emission counter — per (query, kind=negative|rounded)
     # when a query opts in via ``data_profile: count`` or sets the
     # explicit emission toggles.
@@ -141,6 +146,7 @@ class CardinalityEstimate:
             + self.growth_rate_lines
             + self.conditional_lines
             + self.decomposition_lines
+            + self.quantile_lines
             + self.emission_clipped_lines
             + self.cold_start_lines
             + self.drift_lines
@@ -228,6 +234,7 @@ def run_validate(  # noqa: PLR0911, PLR0915
     write(f"  growth rate lines  {estimate.growth_rate_lines:>8}")
     write(f"  conditional lines  {estimate.conditional_lines:>8}")
     write(f"  decomposition lines {estimate.decomposition_lines:>8}")
+    write(f"  quantile lines     {estimate.quantile_lines:>8}")
     write(f"  emission clipped   {estimate.emission_clipped_lines:>8}")
     write(f"  cold start lines   {estimate.cold_start_lines:>8}")
     write(f"  drift lines        {estimate.drift_lines:>8}")
@@ -423,11 +430,20 @@ def _estimate_cardinality(cfg: Config) -> CardinalityEstimate:  # noqa: PLR0912,
     # — bounded to 4 lines per (series, model) per opted-in query.
     decomposition_lines = 0
     n_components = 4
+    # Arbitrary-quantile emission: per-(series, model, quantile) snapshot
+    # row for every query that sets ``emission.quantiles``, plus a matching
+    # per-(series, model, quantile) calibration offset when conformal is on.
+    quantile_lines = 0
     for group in cfg.groups:
         for q in group.queries:
             if q.emission.growth_rate.enabled:
                 n_windows = max(1, len(q.emission.growth_rate.windows))
                 growth_rate_lines += series_cap * emitted_models * n_windows
+            if q.emission.quantiles:
+                n_quantiles = len(q.emission.quantiles)
+                quantile_lines += series_cap * emitted_models * n_quantiles
+                if cfg.defaults.accuracy.conformal.enabled:
+                    quantile_lines += series_cap * emitted_models * n_quantiles
             if q.emission.conditional:
                 # Per-series snapshot: central + 2 * levels rows per model.
                 # Conditional deviation: 2 lines per (series, model, level)
@@ -649,6 +665,7 @@ def _estimate_cardinality(cfg: Config) -> CardinalityEstimate:  # noqa: PLR0912,
         growth_rate_lines=growth_rate_lines,
         conditional_lines=conditional_lines,
         decomposition_lines=decomposition_lines,
+        quantile_lines=quantile_lines,
         emission_clipped_lines=emission_clipped_lines,
         cold_start_lines=cold_start_lines,
         drift_lines=drift_lines,

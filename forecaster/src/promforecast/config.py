@@ -688,7 +688,7 @@ class BandCoverageConfig(BaseModel):
 class QueryEmissionConfig(BaseModel):
     """Per-query emission toggles.
 
-    Today six families of settings live here:
+    Several families of settings live here:
 
     * :class:`GrowthRateEmissionConfig` — forecast growth-rate metric.
     * ``clip_non_negative`` and ``round_to_integer`` — count-aware
@@ -699,6 +699,10 @@ class QueryEmissionConfig(BaseModel):
       gauges.
     * ``conditional`` — parallel ``<id>_forecast_conditional*`` family
       that re-runs the fit with regressors held at their current value.
+    * ``decompose`` — ``<id>_forecast_component`` trend/seasonal/level/
+      residual split of the predicted curve.
+    * ``quantiles`` — parallel ``<id>_forecast_quantile{q}`` family at
+      arbitrary quantiles, derived from the same fit.
 
     Every family is kept on the per-query :class:`EmissionConfig` block so
     operators opt in *per metric*: a config that mixes a count-valued
@@ -735,6 +739,19 @@ class QueryEmissionConfig(BaseModel):
     # per (series, model) per horizon step. See `models.py` for which models
     # actually decompose; non-decomposable models bump a skip counter.
     decompose: bool = False
+    # Arbitrary-quantile emission. Empty (default) emits nothing extra; a
+    # list like ``[0.1, 0.5, 0.9, 0.99]`` emits a parallel
+    # ``<id>_forecast_quantile{q="0.9"}`` family alongside the
+    # ``_forecast_lower``/``_forecast_upper`` band family (which stays for
+    # backward compatibility). Each quantile is derived from the same
+    # single fit — no re-fit per quantile — by mapping it to the
+    # statsforecast confidence level that brackets it; ``0.5`` is the
+    # central forecast. Values must be strictly between 0 and 1. When
+    # ``accuracy.conformal.enabled`` is on, a per-quantile coverage
+    # calibration widens each quantile and the offset is exposed as
+    # ``forecast_band_calibration_offset{q="..."}``. See
+    # ``docs/quantile.md``.
+    quantiles: list[float] = Field(default_factory=list)
 
 
 class ColdStartBorrowConfig(BaseModel):
@@ -2077,8 +2094,36 @@ def _validate_query_overrides(*, group_name: str, query: QueryConfig) -> None:  
                 )
     if query.refresh_interval is not None and query.refresh_interval.total_seconds() <= 0:
         raise ValueError(f"{label}.refresh_interval must be a positive duration")
+    _validate_quantiles(label=label, query=query)
     _validate_slo(label=label, query=query)
     _validate_recommended_windows(label=label, query=query)
+
+
+def _validate_quantiles(*, label: str, query: QueryConfig) -> None:
+    """Semantic checks for ``emission.quantiles``.
+
+    Pydantic accepts any list of floats; the meaningful constraints
+    (strictly inside ``(0, 1)``, no duplicates) live here so a bad
+    quantile fails at load time with a precise label rather than emitting
+    a degenerate ``q="0"`` / ``q="1"`` row (the 0th/100th percentile maps
+    to an infinite band edge) every refresh.
+    """
+    quantiles = query.emission.quantiles
+    if not quantiles:
+        return
+    seen: set[float] = set()
+    for q in quantiles:
+        if not (0.0 < q < 1.0):
+            raise ValueError(
+                f"{label}.emission.quantiles: every quantile must be strictly "
+                f"between 0 and 1 (got {q}); the 0th/100th percentile maps to an "
+                "infinite band edge"
+            )
+        if q in seen:
+            raise ValueError(
+                f"{label}.emission.quantiles: duplicate quantile {q}; each value must be unique"
+            )
+        seen.add(q)
 
 
 def _validate_slo(*, label: str, query: QueryConfig) -> None:
@@ -2194,6 +2239,8 @@ def _validate_events_profile(*, label: str, query: QueryConfig) -> None:
         rejected.append("emission.decompose")
     if query.emission.growth_rate.enabled:
         rejected.append("emission.growth_rate")
+    if query.emission.quantiles:
+        rejected.append("emission.quantiles")
     if rejected:
         raise ValueError(
             f"{label}: data_profile: events does not support "

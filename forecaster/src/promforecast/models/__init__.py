@@ -33,6 +33,12 @@ from .auto_arima_damped import AutoARIMADampedModel
 from .auto_ets import AutoETSModel
 from .auto_ets_damped import AutoETSDampedModel
 from .base import ForecastModel
+from .count_distribution import (
+    COUNT_MODEL_NAMES,
+    INGARCHModel,
+    NegativeBinomialModel,
+    PoissonModel,
+)
 from .intermittent import (
     INTERMITTENT_MODEL_NAMES,
     ADIDAModel,
@@ -228,6 +234,7 @@ def build(
 
 
 __all__ = [
+    "COUNT_MODEL_NAMES",
     "ENTRY_POINT_GROUP",
     "INTERMITTENT_MODEL_NAMES",
     "ADIDAModel",
@@ -239,8 +246,11 @@ __all__ = [
     "CrostonSBAModel",
     "ForecastModel",
     "IMAPAModel",
+    "INGARCHModel",
     "MSTLModel",
     "ModelRegistrationError",
+    "NegativeBinomialModel",
+    "PoissonModel",
     "SeasonalNaiveModel",
     "UnknownModelError",
     "available",
