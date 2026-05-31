@@ -1,11 +1,14 @@
-# Endpoints on localhost:
-#   VictoriaMetrics  :8428
-#   Prometheus       :9090
+# Endpoints on localhost (host ports are offset from the in-container ports
+# to avoid clashing with a Prometheus/VM/Grafana stack already bound to the
+# conventional ports on the dev host):
+#   VictoriaMetrics  :8429  (-> container :8428)
+#   Prometheus       :9080  (-> container :9090)
 #   node-exporter    :9100
-#   forecaster       :9091  (/metrics, /healthz, /-/reload)
-#   Redis            :6379  (query-cache backend; HA isn't wired in compose
-#                            since leader election needs a kube API server)
-#   Grafana          :3000  (admin / admin) — "load" profile only
+#   forecaster       :9081  (-> container :9091; /metrics, /healthz, /-/reload)
+#   Redis            :6378  (-> container :6379; query-cache backend; HA isn't
+#                            wired in compose since leader election needs a
+#                            kube API server)
+#   Grafana          :3001  (-> container :3000; admin / admin) — "load" profile only
 #
 # Two profiles:
 #   default (`make dev-up`)      — VM, Prometheus, Redis, node-exporter,
@@ -25,6 +28,17 @@ services:
       - "--httpListenAddr=:8428"
       - "--retentionPeriod=30d"
       - "--futureRetention=2d"
+      # Deduplicate samples sharing a (series, timestamp). The remote_write
+      # sink rewrites the full forecast curve every refit, so each future
+      # step is re-emitted by ~horizon/refresh successive runs (here 30m/5m
+      # ≈ 6x) at the *same* grid timestamp with an updated value. The sink's
+      # documented contract is last-write-wins per (labels, timestamp) (see
+      # docs/operations/backfill.md); VictoriaMetrics only honours that when
+      # dedup is enabled, otherwise the overwrites pile up as raw duplicate
+      # samples and inflate count_over_time. 15s matches the Prometheus
+      # scrape_interval in docker/prometheus.yml so raw 15s resolution on the
+      # underlying signals is preserved while the curve overwrites collapse.
+      - "--dedup.minScrapeInterval=15s"
     ports:
       - "8429:8428"
     volumes:

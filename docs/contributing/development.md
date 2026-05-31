@@ -46,7 +46,7 @@ This job is the single source of truth for chart correctness:
 ## Adding a metric
 
 1. Edit `examples/configs/<group>.yaml` (or your `values.yaml`).
-2. `make dev-up` and check `http://localhost:9091/metrics`.
+2. `make dev-up` and check `http://localhost:9081/metrics` (the dev stack offsets host ports — see the header of `docker-compose.dev.yml`).
 3. `make backtest GROUP=<name>` to review MAPE.
 4. Open a PR — CI will catch schema, kubeconform, and alert-drift issues.
 
@@ -68,7 +68,7 @@ Use the same command CI uses:
 uv run promforecast validate --config examples/configs/node-capacity.yaml
 
 # With live datasource check:
-uv run promforecast validate --config examples/configs/node-capacity.yaml --dry-run --datasource-url http://localhost:8428/
+uv run promforecast validate --config examples/configs/node-capacity.yaml --dry-run --datasource-url http://localhost:8429/
 ```
 
 `--dry-run` needs a reachable VictoriaMetrics instance (`make dev-up` is the easiest way).

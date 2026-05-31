@@ -19,6 +19,22 @@ victoria-metrics-single:
     # horizon (`defaults.horizon`).
     extraArgs:
       futureRetention: "2d"
+      # Deduplicate samples sharing a (series, timestamp). The sink rewrites
+      # the *full* forecast curve on every refit, so each future step is
+      # re-emitted by ~horizon/refresh successive runs (e.g. 24h/1h = 24x)
+      # at the same grid timestamp with an updated value. The sink's
+      # contract is last-write-wins per (labels, timestamp), but VM only
+      # honours that with dedup enabled — otherwise the overwrites pile up
+      # as raw duplicate samples, bloating storage and skewing any
+      # rate()/*_over_time() PromQL over forecast metrics.
+      #
+      # Set this to your Prometheus `scrape_interval` (15s matches the
+      # Prometheus default). VM keeps the last sample per interval, so a
+      # value at or below your scrape interval preserves raw resolution
+      # while collapsing the duplicate curve overwrites; a larger value
+      # additionally downsamples the underlying signals (acceptable on this
+      # long-term analytics plane, but tune deliberately).
+      dedup.minScrapeInterval: "15s"
     persistentVolume:
       enabled: true
       size: 20Gi

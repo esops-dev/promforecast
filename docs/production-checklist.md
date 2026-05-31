@@ -47,6 +47,7 @@ Each v1.6+ family multiplies cardinality. Always re-run `promforecast validate -
 | Quality gate on predictive autoscaling | Any HPA reading a forecast metric pairs it with `forecast_quality_score > 0.6` | [predictive-autoscaling.md](predictive-autoscaling.md) |
 | Fleet what-if disabled in small installs | `server.expose_what_if_endpoint: false` unless resource headroom exists | [what-if-fleet.md](outputs/what-if-fleet.md) |
 | `futureRetention` configured on VM | ≥ 2 d (chart default) | [promforecast-stack/values.yaml](../charts/promforecast-stack/values.yaml) |
+| VM dedup matches scrape interval | `dedup.minScrapeInterval` set to your `scrape_interval` (chart default `15s`) so refit curve overwrites collapse to last-write-wins instead of piling up as duplicate samples | [promforecast-stack/values.yaml](../charts/promforecast-stack/values.yaml) |
 | Degraded-mode alerts wired | `ForecastDatasourceUnreachable`, `ForecastSinkWriteFailing`, `ForecastSnapshotStale` mapped to on-call | [degraded-modes.md](operations/degraded-modes.md) |
 | Auto-tuner installed (optional) | Weekly CronJob from `promforecast-tuner` sub-chart | [auto-tuning.md](operations/auto-tuning.md) |
 

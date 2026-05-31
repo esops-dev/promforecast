@@ -10,7 +10,7 @@ Use it right after a fresh install (or after a TSDB volume loss) so dashboards b
 - After a TSDB restore or volume loss.
 - When extending a quality dashboard’s lookback window.
 
-Backfill is **not** for replaying missed alerts or correcting historical predictions — the sink dedupes by `(labels, timestamp)` so a second run simply overwrites the same points.
+Backfill is **not** for replaying missed alerts or correcting historical predictions — the sink relies on last-write-wins per `(labels, timestamp)` so a second run simply overwrites the same points. This requires VictoriaMetrics dedup to be enabled (`dedup.minScrapeInterval`, set by the `promforecast-stack` chart); without it the rewritten points accumulate as duplicate samples rather than overwriting. See the chart's [Deduplication](../../charts/promforecast-stack/README.md#deduplication) note.
 
 ## CLI usage
 
