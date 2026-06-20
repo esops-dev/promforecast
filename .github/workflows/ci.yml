@@ -20,7 +20,7 @@ jobs:
       run:
         working-directory: forecaster
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: astral-sh/setup-uv@v7
         with:
@@ -46,7 +46,7 @@ jobs:
       run:
         working-directory: forecaster
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: astral-sh/setup-uv@v7
         with:
@@ -77,7 +77,7 @@ jobs:
       run:
         working-directory: community/promforecast-prophet
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: astral-sh/setup-uv@v7
         with:
@@ -116,7 +116,7 @@ jobs:
     name: Lint Helm charts
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           # chart-testing diffs against the base branch to find changed
           # charts; without history its --target-branch comparison sees
@@ -370,7 +370,7 @@ jobs:
     name: Build container image
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: docker/setup-buildx-action@v4
 
