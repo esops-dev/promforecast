@@ -137,7 +137,7 @@ jobs:
         # against a kind cluster. We skip the kind-based install step here
         # because the deployment is exercised end-to-end by the
         # docker-compose dev stack and a kind run would push CI past 10min.
-        uses: helm/chart-testing-action@v2.8.0
+        uses: helm/chart-testing-action@v2.9.0
 
       - name: Register Helm repositories
         # ``ct lint`` rebuilds chart dependencies as part of its own pass
