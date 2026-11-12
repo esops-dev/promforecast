@@ -40,6 +40,20 @@ Both tools propagate the underlying time-series labels (`instance`, `pod`, `devi
 
 This is the reason `honor_labels: true` is required on the Prometheus scrape config for both tools' `/metrics` endpoints.
 
+### `day_of_week` (contracted when present, identical semantics in both tools)
+
+Emitted on recurrence-analysis metrics (`anomaly_recurrence_score` in promanomaly, incident-pattern metrics in promforecast). Represents the ISO 8601 day of week as a three-letter abbreviation: `Mon`, `Tue`, `Wed`, `Thu`, `Fri`, `Sat`, `Sun`.
+
+- Type: string, one of the seven values above.
+- Stability: label values are fixed (the seven abbreviations); adding or removing is a breaking change.
+
+### `hour_of_day` (contracted when present, identical semantics in both tools)
+
+Emitted alongside `day_of_week` on recurrence-analysis metrics. Represents the hour in UTC as a string (`"0"` through `"23"`).
+
+- Type: string, `"0"` through `"23"`.
+- Stability: same as `day_of_week`.
+
 ## Tool-private labels (NOT contracted)
 
 Either tool may add its own labels to its own output metrics without coordination, as long as they don't collide with the contracted set above.
